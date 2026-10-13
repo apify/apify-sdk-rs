@@ -33,8 +33,6 @@ const HEAD_LOCK_LIMIT: i64 = 25;
 #[derive(Default)]
 struct Head {
     ids: VecDeque<String>,
-    /// A forefront add or reclaim happened: the next listing reads the front of the queue again.
-    check_forefront: bool,
     /// From the last listing: other clients hold locks.
     queue_has_locked_requests: bool,
 }
@@ -70,30 +68,25 @@ impl ApifySharedRequestQueue {
     }
 
     async fn ensure_head_is_non_empty(&self, head: &mut Head) -> StorageResult<()> {
-        if head.ids.len() > 1 && !head.check_forefront {
+        if head.ids.len() > 1 {
             return Ok(());
         }
         self.list_and_lock_head(head, HEAD_LOCK_LIMIT).await
     }
 
     async fn list_and_lock_head(&self, head: &mut Head, limit: i64) -> StorageResult<()> {
-        // After a forefront insert, the local buffer no longer starts at the front of the queue:
-        // read the front again and keep the requests already locked for afterwards.
-        let leftovers: Vec<String> =
-            if std::mem::take(&mut head.check_forefront) { head.ids.drain(..).collect() } else { Vec::new() };
         let lock_secs = self.lock_secs.load(Ordering::Relaxed) as i64;
         let listed = self.client.list_and_lock_head(lock_secs, Some(limit)).await.map_err(backend_error)?;
         head.queue_has_locked_requests = listed.queue_has_locked_requests.unwrap_or(false);
         let mut state = self.state.lock();
         for item in listed.items {
             let Some(id) = item.id else { continue };
-            if state.in_progress.contains(&id) || head.ids.contains(&id) || leftovers.contains(&id) {
+            if state.in_progress.contains(&id) || head.ids.contains(&id) {
                 continue;
             }
             state.known.put(id.clone(), false);
             head.ids.push_back(id);
         }
-        head.ids.extend(leftovers);
         Ok(())
     }
 
@@ -160,9 +153,6 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
                     state.known.put(processed.request_id.clone(), processed.was_already_handled);
                 }
             }
-            if forefront {
-                self.head.lock().await.check_forefront = true;
-            }
         }
         result.processed_requests.extend(already_present);
         self.state.lock().estimated_total += newly_added(&result);
@@ -223,7 +213,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
             self.state.lock().in_progress.remove(&id);
             return Ok(None);
         }
-        let mut head = self.head.lock().await;
+        let _head = self.head.lock().await;
         let mut reclaimed = request.clone();
         reclaimed.id = Some(id.clone());
         reclaimed.handled_at = None;
@@ -235,9 +225,6 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         let mut state = self.state.lock();
         state.in_progress.remove(&id);
         state.known.put(id, false);
-        if forefront {
-            head.check_forefront = true;
-        }
         if info.was_already_handled {
             state.estimated_handled = state.estimated_handled.saturating_sub(1);
         }

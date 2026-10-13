@@ -344,3 +344,19 @@ async fn a_reclaimed_shared_request_is_unlocked_for_others() {
     assert!(second.is_finished().await.unwrap());
     assert!(first.is_finished().await.unwrap());
 }
+
+#[tokio::test]
+async fn a_shared_queue_leaves_forefront_ordering_to_the_platform() {
+    let api = FakeApi::start().await;
+    let queue = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let requests: Vec<crawlee::Request> = (0..3).map(|n| format!("https://a.test/{n}").into()).collect();
+    queue.add_requests(requests, false).await.unwrap();
+
+    let first = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(first.url, "https://a.test/0");
+    queue.add_requests(vec!["https://a.test/front".into()], true).await.unwrap();
+
+    // The locked head is drained before the forefront request is looked at: the SDK does not re-read the head.
+    let next = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(next.url, "https://a.test/1");
+}

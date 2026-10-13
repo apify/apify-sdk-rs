@@ -230,9 +230,13 @@ impl ProxyConfiguration {
     }
 
     fn apify_url(&self, session_id: &str) -> Url {
+        self.apify_url_with_username(&self.username(session_id))
+    }
+
+    fn apify_url_with_username(&self, username: &str) -> Url {
         let Kind::Apify { password, .. } = &self.kind else { unreachable!("an Apify Proxy configuration") };
         let mut url = Url::parse(&format!("http://{}:{}", self.hostname, self.port)).expect("a valid proxy URL");
-        let _ = url.set_username(&self.username(session_id));
+        let _ = url.set_username(username);
         let _ = url.set_password(Some(password));
         url
     }
@@ -295,6 +299,24 @@ impl ProxySource for ProxyConfiguration {
             Kind::Custom(custom) => custom.new_proxy_info(session_id),
         }
     }
+
+    /// A restored Apify Proxy session (its username carries `session-…`) moves to the current
+    /// endpoint and password, keeping the username and with it the proxy session. Other proxies are
+    /// returned unchanged.
+    fn restored_proxy_info(&self, session_id: &str, restored: ProxyInfo) -> Option<ProxyInfo> {
+        match &self.kind {
+            Kind::Apify { .. } if has_proxy_session(&restored.username) => {
+                Some(ProxyInfo::from_url(self.apify_url_with_username(&restored.username)))
+            }
+            Kind::Apify { .. } => Some(restored),
+            Kind::Custom(custom) => custom.restored_proxy_info(session_id, restored),
+        }
+    }
+}
+
+/// Whether a proxy username has a `session-…` part (`SESSION_USERNAME_REGEX` in JS).
+fn has_proxy_session(username: &str) -> bool {
+    username.split(',').any(|part| part.strip_prefix("session-").is_some_and(|id| !id.is_empty()))
 }
 
 #[cfg(test)]
@@ -303,6 +325,26 @@ mod tests {
 
     fn options(value: serde_json::Value) -> ProxyConfigurationOptions {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_restored_apify_proxy_session_moves_to_the_current_endpoint() {
+        let configuration = Configuration::default();
+        let proxy = ProxyConfiguration::from_options(
+            &configuration,
+            &options(serde_json::json!({ "apifyProxyGroups": ["RESIDENTIAL"] })),
+        )
+        .unwrap();
+
+        let old = ProxyInfo::from_url(
+            Url::parse("http://groups-DATACENTER,session-abc,country-US:old@old-host.apify.net:8000").unwrap(),
+        );
+        let moved = proxy.restored_proxy_info("s", old).unwrap();
+        assert_eq!((moved.hostname.as_str(), moved.port), ("proxy.apify.com", Some(8000)));
+        assert_eq!(moved.username, "groups-DATACENTER,session-abc,country-US", "the proxy session is kept");
+
+        let other = ProxyInfo::from_url(Url::parse("http://user:pass@elsewhere:8000").unwrap());
+        assert_eq!(proxy.restored_proxy_info("s", other).unwrap().hostname, "elsewhere");
     }
 
     #[test]

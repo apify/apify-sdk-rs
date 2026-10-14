@@ -64,7 +64,7 @@ pub(crate) fn relay(message: &str, events: &EventManager, memory_limit_bytes: Op
 /// connection closes. As in the JS SDK, a closed connection is not reopened.
 pub(crate) async fn connect(url: &str, events: EventManager, memory_limit_bytes: Option<u64>) -> JoinHandle<()> {
     let connection = tokio_tungstenite::connect_async(url).await;
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         let mut socket = match connection {
             Ok((socket, _)) => socket,
             Err(err) => {
@@ -93,16 +93,16 @@ pub(crate) async fn connect(url: &str, events: EventManager, memory_limit_bytes:
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use crawlee::core::EventKind;
-    use parking_lot::Mutex;
+    use std::cell::RefCell;
 
     use super::*;
 
-    fn recorder(events: &EventManager) -> Arc<Mutex<Vec<Event>>> {
-        let seen = Arc::new(Mutex::new(Vec::new()));
+    fn recorder(events: &EventManager) -> Rc<RefCell<Vec<Event>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
         for kind in [
             EventKind::PersistState,
             EventKind::SystemInfo,
@@ -112,14 +112,14 @@ mod tests {
         ] {
             let seen = seen.clone();
             events.on(kind, move |event| {
-                seen.lock().push(event);
+                seen.borrow_mut().push(event);
                 async {}
             });
         }
         seen
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn platform_messages_become_crawlee_events() {
         let events = EventManager::new(Duration::from_secs(60));
         let seen = recorder(&events);
@@ -128,17 +128,17 @@ mod tests {
             "isCpuOverloaded":true,"memCurrentBytes":1024}}"#;
         assert!(relay(info, &events, Some(4096)));
         events.wait_for_all_listeners_to_complete().await;
-        let Event::SystemInfo(info) = seen.lock()[0].clone() else { panic!("{:?}", seen.lock()) };
+        let Event::SystemInfo(info) = seen.borrow_mut()[0].clone() else { panic!("{:?}", seen.borrow_mut()) };
         assert_eq!((info.cpu_current_usage, info.is_cpu_overloaded), (42.5, true));
         assert_eq!((info.mem_current_bytes, info.mem_total_bytes), (Some(1024), Some(4096)));
         assert_eq!(info.created_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
 
-        seen.lock().clear();
+        seen.borrow_mut().clear();
         assert!(relay(r#"{"name":"migrating","data":null}"#, &events, None));
         assert!(relay(r#"{"name":"cpuInfo","data":{"isCpuOverloaded":false}}"#, &events, None));
         assert!(!relay("not json", &events, None));
         events.wait_for_all_listeners_to_complete().await;
-        let seen = seen.lock().clone();
+        let seen = seen.borrow_mut().clone();
         assert!(seen.contains(&Event::Migrating));
         assert!(seen.contains(&Event::PersistState { is_migrating: true }));
         assert!(seen.contains(&Event::Custom {
@@ -147,13 +147,13 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn websocket_messages_are_relayed() {
         use futures_util::SinkExt as _;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             socket.send(Message::text(r#"{"name":"aborting","data":null}"#)).await.unwrap();
@@ -164,6 +164,6 @@ mod tests {
         let seen = recorder(&events);
         connect(&url, events.clone(), None).await.await.unwrap();
         events.wait_for_all_listeners_to_complete().await;
-        assert_eq!(*seen.lock(), [Event::Aborting]);
+        assert_eq!(*seen.borrow_mut(), [Event::Aborting]);
     }
 }

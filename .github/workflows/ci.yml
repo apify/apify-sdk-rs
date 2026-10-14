@@ -44,7 +44,7 @@ jobs:
       # Against this checkout of the SDK instead of the git dependency.
       - run: >-
           cargo clippy --manifest-path templates/actor/Cargo.toml
-          --config 'patch."https://github.com/apify-projects/apify-sdk-rs".apify.path="."'
+          --config 'patch."https://github.com/apify/apify-sdk-rs".apify.path="."'
 
   # The golden files still match what the JS SDK (at the pinned commit) does.
   conformance:

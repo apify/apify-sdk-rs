@@ -7,7 +7,7 @@ mod request_queue;
 mod request_queue_shared;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify_client::models::Extra;
 use apify_client::{ApifyClient, ApifyClientError};
@@ -84,12 +84,12 @@ fn random_id(length: usize) -> String {
 ///   reopens the same storages.
 pub struct ApifyStorageBackend {
     client: ApifyClient,
-    configuration: Arc<Configuration>,
+    configuration: Rc<Configuration>,
     request_queue_access: RequestQueueAccess,
     credentials_hash: String,
     rate_limits: RateLimitCounter,
     client_key: String,
-    aliases: tokio::sync::Mutex<AliasCache>,
+    aliases: crawlee::core::local::Mutex<AliasCache>,
 }
 
 #[derive(Default)]
@@ -108,13 +108,13 @@ impl std::fmt::Debug for ApifyStorageBackend {
 
 impl ApifyStorageBackend {
     /// Storages of the API and account `configuration` points to.
-    pub fn new(configuration: Arc<Configuration>) -> Self {
+    pub fn new(configuration: Rc<Configuration>) -> Self {
         let token = configuration.token.clone();
         Self::with_token(configuration, token)
     }
 
     /// Storages accessed with `token` instead of [`Configuration::token`].
-    pub fn with_token(configuration: Arc<Configuration>, token: Option<String>) -> Self {
+    pub fn with_token(configuration: Rc<Configuration>, token: Option<String>) -> Self {
         let rate_limits = RateLimitCounter::default();
         let client = new_client(&configuration, token.as_deref(), rate_limits.clone());
         // `publicBaseUrl` of the JS client: without the trailing slash, plus `/v2`.
@@ -131,7 +131,7 @@ impl ApifyStorageBackend {
             credentials_hash,
             rate_limits,
             client_key,
-            aliases: tokio::sync::Mutex::default(),
+            aliases: crawlee::core::local::Mutex::default(),
         }
     }
 
@@ -272,30 +272,27 @@ async fn persist_alias_id(
     Ok(mapping)
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl StorageBackend for ApifyStorageBackend {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>> {
         let id = self.resolve_id(id, StorageKind::Dataset).await?;
-        Ok(Arc::new(dataset::ApifyDataset { client: self.client.dataset(id) }))
+        Ok(Rc::new(dataset::ApifyDataset { client: self.client.dataset(id) }))
     }
 
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>> {
         let id = self.resolve_id(id, StorageKind::KeyValueStore).await?;
-        Ok(Arc::new(key_value_store::ApifyKeyValueStore { client: self.client.key_value_store(id) }))
+        Ok(Rc::new(key_value_store::ApifyKeyValueStore { client: self.client.key_value_store(id) }))
     }
 
-    async fn create_request_queue_backend(
-        &self,
-        id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>> {
         let id = self.resolve_id(id, StorageKind::RequestQueue).await?;
         let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
         Ok(match self.request_queue_access {
-            RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client)),
-            RequestQueueAccess::Shared => Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client)),
+            RequestQueueAccess::Single => Rc::new(request_queue::ApifySingleRequestQueue::new(client)),
+            RequestQueueAccess::Shared => Rc::new(request_queue_shared::ApifySharedRequestQueue::new(client)),
         })
     }
 
@@ -314,37 +311,33 @@ impl StorageBackend for ApifyStorageBackend {
 /// The storage backend of an Actor: [`ApifyStorageBackend`] on the platform, `local` elsewhere,
 /// except for storages opened with `force_cloud`.
 pub struct SmartStorageBackend {
-    cloud: Arc<dyn StorageBackend>,
-    local: Arc<dyn StorageBackend>,
-    configuration: Arc<Configuration>,
+    cloud: Rc<dyn StorageBackend>,
+    local: Rc<dyn StorageBackend>,
+    configuration: Rc<Configuration>,
 }
 
 impl SmartStorageBackend {
-    pub fn new(
-        configuration: Arc<Configuration>,
-        cloud: Arc<dyn StorageBackend>,
-        local: Arc<dyn StorageBackend>,
-    ) -> Self {
+    pub fn new(configuration: Rc<Configuration>, cloud: Rc<dyn StorageBackend>, local: Rc<dyn StorageBackend>) -> Self {
         SmartStorageBackend { cloud, local, configuration }
     }
 
     /// The local backend of an Actor: files under the storage directory (see
     /// [`crawlee::Configuration::storage_dir`]) with the input adopted from `INPUT` or
     /// `INPUT.json` and kept on purge, or memory when storage is not persisted.
-    pub fn local_backend(configuration: &Configuration) -> Arc<dyn StorageBackend> {
+    pub fn local_backend(configuration: &Configuration) -> Rc<dyn StorageBackend> {
         if configuration.crawlee.persist_storage {
-            Arc::new(
+            Rc::new(
                 crawlee::core::FileSystemStorageBackend::new(configuration.crawlee.storage_dir.clone())
                     .with_input_keys(["INPUT", configuration.input_key.as_str()]),
             )
         } else {
-            Arc::new(crawlee::core::MemoryStorageBackend::new())
+            Rc::new(crawlee::core::MemoryStorageBackend::new())
         }
     }
 
     /// The backend of an Actor configured by `configuration`.
-    pub fn for_configuration(configuration: Arc<Configuration>) -> Self {
-        let cloud = Arc::new(ApifyStorageBackend::new(configuration.clone()));
+    pub fn for_configuration(configuration: Rc<Configuration>) -> Self {
+        let cloud = Rc::new(ApifyStorageBackend::new(configuration.clone()));
         let local = Self::local_backend(&configuration);
         SmartStorageBackend::new(configuration, cloud, local)
     }
@@ -373,23 +366,20 @@ impl SmartStorageBackend {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl StorageBackend for SmartStorageBackend {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>> {
         self.current().create_dataset_backend(id).await
     }
 
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>> {
         self.current().create_key_value_store_backend(id).await
     }
 
-    async fn create_request_queue_backend(
-        &self,
-        id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>> {
         self.current().create_request_queue_backend(id).await
     }
 
@@ -417,7 +407,7 @@ mod tests {
     #[test]
     fn credentials_hash_matches_the_js_sdk() {
         // createHash('sha256').update('https://api.apify.com/v2' + 'token').digest('hex').slice(0, 8)
-        let configuration = Arc::new(Configuration { token: Some("token".to_owned()), ..Configuration::default() });
+        let configuration = Rc::new(Configuration { token: Some("token".to_owned()), ..Configuration::default() });
         let backend = ApifyStorageBackend::new(configuration);
         assert_eq!(backend.credentials_hash, "8659e64f");
         assert_eq!(backend.client_key.len(), MAX_CLIENT_KEY_LENGTH);

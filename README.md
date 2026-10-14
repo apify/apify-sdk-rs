@@ -4,6 +4,12 @@ Run [crawlee-rs](https://github.com/apify-projects/crawlee-rs) crawlers as Actor
 [Apify platform](https://apify.com). A port of the [JS SDK](https://github.com/apify/apify-sdk-js),
 using the Rust [Apify API client](https://github.com/apify/apify-client-rust).
 
+> **Branch `single-threaded`:** an experiment, on the `single-threaded` branch of crawlee-rs.
+> Actors run on tokio's local runtime (`#[tokio::main(flavor = "local")]`), and the SDK's state
+> uses `Rc`, `Cell` and `RefCell` instead of `Arc`, atomics and mutexes. Left as they were: the
+> HTTP backend of the API client (apify-client requires it to be `Send + Sync`) and the watchdog
+> thread that ends a run whose exit hangs.
+
 **Status: feature-complete port, not yet published or run on the platform.** See
 [docs/plan.md](docs/plan.md) for the scope, and
 [docs/allowed-differences.md](docs/allowed-differences.md) for deliberate differences from the JS
@@ -26,7 +32,7 @@ Use crawlee-rs through `apify::crawlee`, so that the SDK and your crawler share 
 use apify::crawlee::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
 use apify::{Actor, ExitOptions, InitOptions};
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
     Actor::init(InitOptions::default()).await?;
     match run().await {

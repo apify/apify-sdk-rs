@@ -19,7 +19,7 @@ use crawlee::core::storage::backend::{
     UnprocessedRequest,
 };
 use lru::LruCache;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use super::{backend_error, date, extra_date, extra_u64, unsupported};
 
@@ -185,15 +185,15 @@ impl State {
 /// requests.
 pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
-    state: Mutex<State>,
-    caches_initialized: tokio::sync::OnceCell<()>,
+    state: RefCell<State>,
+    caches_initialized: crawlee::core::local::OnceCell<()>,
 }
 
 impl ApifySingleRequestQueue {
     pub(crate) fn new(client: RequestQueueClient) -> Self {
         ApifySingleRequestQueue {
             client,
-            state: Mutex::new(State {
+            state: RefCell::new(State {
                 head: VecDeque::new(),
                 cached: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
                 handled: HashSet::new(),
@@ -201,7 +201,7 @@ impl ApifySingleRequestQueue {
                 estimated_total: 0,
                 estimated_handled: 0,
             }),
-            caches_initialized: tokio::sync::OnceCell::new(),
+            caches_initialized: crawlee::core::local::OnceCell::new(),
         }
     }
 
@@ -226,7 +226,7 @@ impl ApifySingleRequestQueue {
                 return;
             }
         };
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         for request in page.items {
             let Ok(request) = from_api_request(request) else { continue };
             let Some(id) = request.id.clone() else { continue };
@@ -240,7 +240,7 @@ impl ApifySingleRequestQueue {
 
     async fn ensure_head_is_non_empty(&self) -> StorageResult<()> {
         let limit = {
-            let state = self.state.lock();
+            let state = self.state.borrow_mut();
             if state.head.len() > 1 {
                 return Ok(());
             }
@@ -248,7 +248,7 @@ impl ApifySingleRequestQueue {
             MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + state.in_progress.len())
         };
         let head = self.client.list_head(Some(limit as i64)).await.map_err(backend_error)?;
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         for item in head.items {
             let Some(id) = item.id else { continue };
             if state.in_progress.contains(&id) || state.handled.contains(&id) || state.head.contains(&id) {
@@ -262,7 +262,7 @@ impl ApifySingleRequestQueue {
     /// Whether the queue has the request, asking the platform only when this client does not know it.
     async fn is_known_or_exists(&self, id: &str) -> StorageResult<bool> {
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             if state.in_progress.contains(id) || state.handled.contains(id) || state.cached.get(id).is_some() {
                 return Ok(true);
             }
@@ -271,11 +271,11 @@ impl ApifySingleRequestQueue {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestQueueBackend for ApifySingleRequestQueue {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
         let (estimated_total, estimated_handled) = {
-            let state = self.state.lock();
+            let state = self.state.borrow_mut();
             (state.estimated_total, state.estimated_handled)
         };
         queue_metadata(&self.client, estimated_total, estimated_handled).await
@@ -301,7 +301,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         let mut already_present = Vec::new();
         let mut new_requests = Vec::new();
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             for request in requests {
                 let id = unique_key_to_request_id(&request.unique_key);
                 if state.handled.contains(&id) {
@@ -332,7 +332,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
             // earlier run, beyond the prefetch limit) must not enter the head again.
             let processed_by_key: HashMap<&str, &ProcessedRequest> =
                 result.processed_requests.iter().map(|processed| (processed.unique_key.as_str(), processed)).collect();
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             for mut request in new_requests {
                 let Some(processed) = processed_by_key.get(request.unique_key.as_str()) else { continue };
                 if processed.was_already_handled {
@@ -346,17 +346,17 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         }
 
         result.processed_requests.extend(already_present);
-        self.state.lock().estimated_total += newly_added(&result);
+        self.state.borrow_mut().estimated_total += newly_added(&result);
         Ok(result)
     }
 
     async fn get_request(&self, unique_key: &str) -> StorageResult<Option<Request>> {
         let id = unique_key_to_request_id(unique_key);
-        if let Some(cached) = self.state.lock().cached.get(&id) {
+        if let Some(cached) = self.state.borrow_mut().cached.get(&id) {
             return Ok(Some(cached.clone()));
         }
         let Some(request) = self.get_request_by_id(&id).await? else { return Ok(None) };
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         // Requests in progress are known to this client already.
         if !state.in_progress.contains(&id) {
             if request.handled_at.is_some() {
@@ -372,7 +372,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         self.ensure_head_is_non_empty().await?;
         loop {
             let (id, cached) = {
-                let mut state = self.state.lock();
+                let mut state = self.state.borrow_mut();
                 let Some(id) = state.head.pop_front() else { return Ok(None) };
                 if state.in_progress.contains(&id) || state.handled.contains(&id) {
                     continue;
@@ -386,7 +386,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
                 Some(request) => Some(request),
                 None => self.get_request_by_id(&id).await?,
             };
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             let Some(request) = request else {
                 state.in_progress.remove(&id);
                 continue;
@@ -406,7 +406,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         let id = unique_key_to_request_id(&request.unique_key);
         // Marking a request the queue does not have is a no-op: the update endpoint would add it.
         if !self.is_known_or_exists(&id).await? {
-            self.state.lock().in_progress.remove(&id);
+            self.state.borrow_mut().in_progress.remove(&id);
             return Ok(None);
         }
         let mut handled = request.clone();
@@ -414,7 +414,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         handled.handled_at.get_or_insert_with(crawlee::core::now_iso);
         let info = self.update_request(&handled, false).await?;
 
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.in_progress.remove(&id);
         state.handled.insert(id.clone());
         state.cached.pop(&id);
@@ -427,7 +427,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
         let id = unique_key_to_request_id(&request.unique_key);
         if !self.is_known_or_exists(&id).await? {
-            self.state.lock().in_progress.remove(&id);
+            self.state.borrow_mut().in_progress.remove(&id);
             return Ok(None);
         }
         let mut reclaimed = request.clone();
@@ -435,7 +435,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
         reclaimed.handled_at = None;
         let info = self.update_request(&reclaimed, forefront).await?;
 
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.in_progress.remove(&id);
         state.handled.remove(&id);
         state.cache(reclaimed);
@@ -452,10 +452,10 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
 
     async fn is_empty(&self) -> StorageResult<bool> {
         self.ensure_head_is_non_empty().await?;
-        Ok(self.state.lock().head.is_empty())
+        Ok(self.state.borrow_mut().head.is_empty())
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
-        Ok(self.is_empty().await? && self.state.lock().in_progress.is_empty())
+        Ok(self.is_empty().await? && self.state.borrow_mut().in_progress.is_empty())
     }
 }

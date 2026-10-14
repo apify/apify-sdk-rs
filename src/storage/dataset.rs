@@ -47,7 +47,7 @@ fn chunk_by_size(items: &[DatasetItem], limit: usize) -> Vec<String> {
     chunks
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DatasetBackend for ApifyDataset {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
         let dataset = self

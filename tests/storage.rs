@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify::{ApifyStorageBackend, Configuration, SmartStorageBackend};
 use crawlee::core::storage::backend::StorageKind;
@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use common::{DEFAULT_DATASET, DEFAULT_QUEUE, DEFAULT_STORE, FakeApi, TOKEN};
 
-fn configuration(api: &FakeApi, is_at_home: bool) -> Arc<Configuration> {
-    Arc::new(Configuration {
+fn configuration(api: &FakeApi, is_at_home: bool) -> Rc<Configuration> {
+    Rc::new(Configuration {
         is_at_home,
         token: Some(TOKEN.to_owned()),
         api_base_url: api.url.clone(),
@@ -26,10 +26,10 @@ fn configuration(api: &FakeApi, is_at_home: bool) -> Arc<Configuration> {
 }
 
 fn services(api: &FakeApi) -> Services {
-    Services::new(Arc::new(ApifyStorageBackend::new(configuration(api, true))))
+    Services::new(Rc::new(ApifyStorageBackend::new(configuration(api, true))))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn dataset_items_are_pushed_in_order() {
     let api = FakeApi::start().await;
     let dataset = services(&api).open_dataset(&StorageIdentifier::Default).await.unwrap();
@@ -50,7 +50,7 @@ async fn dataset_items_are_pushed_in_order() {
     assert!(dataset.backend().purge().await.is_err(), "purging is not supported on the platform");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn key_value_store_records_keep_their_bytes_and_content_type() {
     let api = FakeApi::start().await;
     let store = services(&api).open_key_value_store(&StorageIdentifier::Default).await.unwrap();
@@ -74,11 +74,11 @@ async fn key_value_store_records_keep_their_bytes_and_content_type() {
     assert_eq!(url, format!("{}/v2/key-value-stores/{DEFAULT_STORE}/records/OUTPUT", api.url));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn names_and_aliases_resolve_to_platform_storages() {
     let api = FakeApi::start().await;
     let backend = ApifyStorageBackend::new(configuration(&api, true));
-    let services = Services::new(Arc::new(backend));
+    let services = Services::new(Rc::new(backend));
 
     let named = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
     let again = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
@@ -97,13 +97,13 @@ async fn names_and_aliases_resolve_to_platform_storages() {
     let (mapping, _) = api.record(DEFAULT_STORE, "__STORAGE_ALIASES_MAPPING").unwrap();
     let mapping: Value = serde_json::from_slice(&mapping).unwrap();
     assert_eq!(mapping.as_object().unwrap().len(), 1);
-    let migrated = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, true))));
+    let migrated = Services::new(Rc::new(ApifyStorageBackend::new(configuration(&api, true))));
     let after = migrated.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
     assert_eq!(after.get_info().await.unwrap().id, scratch_id);
 
     // Unless the storage was deleted in the meantime.
     api.delete_dataset(&scratch_id);
-    let fresh = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, true))));
+    let fresh = Services::new(Rc::new(ApifyStorageBackend::new(configuration(&api, true))));
     let recreated = fresh.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
     assert_ne!(recreated.get_info().await.unwrap().id, scratch_id);
 
@@ -112,19 +112,19 @@ async fn names_and_aliases_resolve_to_platform_storages() {
     assert_eq!(default.get_info().await.unwrap().id, DEFAULT_DATASET);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
     let api = FakeApi::start().await;
-    let declared = Arc::new(Configuration {
+    let declared = Rc::new(Configuration {
         actor_storages_json: Some(format!(r#"{{"datasets": {{"products": "{DEFAULT_DATASET}"}}}}"#)),
         ..(*configuration(&api, true)).clone()
     });
-    let services = Services::new(Arc::new(ApifyStorageBackend::new(declared)));
+    let services = Services::new(Rc::new(ApifyStorageBackend::new(declared)));
     let products = services.open_dataset(&StorageIdentifier::alias("products")).await.unwrap();
     assert_eq!(products.get_info().await.unwrap().id, DEFAULT_DATASET);
 
     // Off the platform (a `force_cloud` storage), aliases are not remembered.
-    let local = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, false))));
+    let local = Services::new(Rc::new(ApifyStorageBackend::new(configuration(&api, false))));
     local.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
     assert!(api.record(DEFAULT_STORE, "__STORAGE_ALIASES_MAPPING").is_none());
 
@@ -134,7 +134,7 @@ async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
     assert!(!backend.storage_exists("nope", StorageKind::Dataset).await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn request_queue_serves_its_own_requests_from_the_local_cache() {
     let api = FakeApi::start().await;
     let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
@@ -169,7 +169,7 @@ async fn fetched_id(queue: &crawlee::RequestQueue, unique_key: &str) -> String {
     queue.get_request(unique_key).await.unwrap().unwrap().id.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_lagging_head_does_not_finish_the_queue_early() {
     let api = FakeApi::start().await;
     api.set_head_lag(3);
@@ -191,7 +191,7 @@ async fn a_lagging_head_does_not_finish_the_queue_early() {
     assert!(queue.is_finished().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn requests_of_other_producers_come_through_the_head() {
     let api = FakeApi::start().await;
     let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
@@ -213,7 +213,7 @@ async fn requests_of_other_producers_come_through_the_head() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_resurrected_run_deduplicates_from_the_prefetched_queue() {
     let api = FakeApi::start().await;
     {
@@ -237,10 +237,10 @@ async fn a_resurrected_run_deduplicates_from_the_prefetched_queue() {
     assert!(queue.is_finished().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn rate_limited_calls_are_retried_and_counted() {
     let api = FakeApi::start().await;
-    let backend = Arc::new(ApifyStorageBackend::new(configuration(&api, true)));
+    let backend = Rc::new(ApifyStorageBackend::new(configuration(&api, true)));
     let services = Services::new(backend.clone());
     let dataset = services.open_dataset(&StorageIdentifier::Default).await.unwrap();
 
@@ -251,7 +251,7 @@ async fn rate_limited_calls_are_retried_and_counted() {
     assert_eq!(backend.rate_limit_errors(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn the_smart_backend_is_local_off_the_platform() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -261,9 +261,9 @@ async fn the_smart_backend_is_local_off_the_platform() {
 
     let mut local = (*configuration(&api, false)).clone();
     local.crawlee.storage_dir = dir.path().to_owned();
-    let local = Arc::new(local);
+    let local = Rc::new(local);
     let smart = SmartStorageBackend::for_configuration(local.clone());
-    let services = Services::new(Arc::new(smart));
+    let services = Services::new(Rc::new(smart));
     services.purge_on_start().await.unwrap();
     let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
     assert_eq!(
@@ -277,12 +277,12 @@ async fn the_smart_backend_is_local_off_the_platform() {
 
     let smart = SmartStorageBackend::for_configuration(local.clone());
     assert!(smart.suitable(true).is_ok());
-    let no_token = Arc::new(Configuration { token: None, ..(*local).clone() });
+    let no_token = Rc::new(Configuration { token: None, ..(*local).clone() });
     let smart = SmartStorageBackend::for_configuration(no_token);
     assert!(smart.suitable(true).err().unwrap().to_string().contains("APIFY_TOKEN"));
 
     let at_home = SmartStorageBackend::for_configuration(configuration(&api, true));
-    let services = Services::new(Arc::new(at_home));
+    let services = Services::new(Rc::new(at_home));
     let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
     store.set_value("OUTPUT", &json!(2)).await.unwrap();
     assert!(api.record(DEFAULT_STORE, "OUTPUT").is_some());
@@ -290,12 +290,12 @@ async fn the_smart_backend_is_local_off_the_platform() {
 
 fn shared_services(api: &FakeApi, run_id: &str) -> Services {
     let configuration =
-        Arc::new(Configuration { actor_run_id: Some(run_id.to_owned()), ..(*configuration(api, true)).clone() });
+        Rc::new(Configuration { actor_run_id: Some(run_id.to_owned()), ..(*configuration(api, true)).clone() });
     let backend = ApifyStorageBackend::new(configuration).request_queue_access(apify::RequestQueueAccess::Shared);
-    Services::new(Arc::new(backend))
+    Services::new(Rc::new(backend))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn shared_queues_hand_each_request_to_one_consumer() {
     let api = FakeApi::start().await;
     let first = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();
@@ -324,7 +324,7 @@ async fn shared_queues_hand_each_request_to_one_consumer() {
     assert_eq!(first.get_info().await.unwrap().handled_request_count, 60);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_reclaimed_shared_request_is_unlocked_for_others() {
     let api = FakeApi::start().await;
     let first = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();
@@ -345,7 +345,7 @@ async fn a_reclaimed_shared_request_is_unlocked_for_others() {
     assert!(first.is_finished().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_shared_queue_leaves_forefront_ordering_to_the_platform() {
     let api = FakeApi::start().await;
     let queue = shared_services(&api, "run-a").open_request_queue(&StorageIdentifier::Default).await.unwrap();

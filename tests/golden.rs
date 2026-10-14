@@ -4,7 +4,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify::charging::{ChargeOptions, ChargeResult, ChargingManager};
 use apify::{Configuration, ProxyConfiguration, ProxyConfigurationOptions};
@@ -84,7 +84,7 @@ fn charge_result(result: ChargeResult) -> Value {
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn charging() {
     let api = common::FakeApi::start().await;
     for case in golden("charging") {
@@ -92,7 +92,7 @@ async fn charging() {
         configuration.api_base_url = api.url.clone();
         configuration.token = Some(common::TOKEN.to_owned());
         let client = apify::new_client(&configuration, None, Default::default());
-        let manager = ChargingManager::new(Arc::new(configuration), client);
+        let manager = ChargingManager::new(Rc::new(configuration), client);
         manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();
 
         let operations = case["operations"].as_array().unwrap();
@@ -115,7 +115,7 @@ async fn charging() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn proxy_urls() {
     for case in golden("proxy") {
         let configuration = configuration_from(&json!({ "APIFY_PROXY_PASSWORD": "env-password" }));

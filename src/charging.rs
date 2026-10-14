@@ -8,7 +8,7 @@
 //! to the platform without holding anything: concurrent charges and pushes do not wait for each
 //! other's API calls, and cannot together spend more than the budget.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify_client::{ApifyClient, ApifyClientError, RunChargeOptions};
 use async_trait::async_trait;
@@ -20,8 +20,8 @@ use crawlee::core::storage::backend::{
 };
 use crawlee::{Dataset, StorageIdentifier};
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 use serde_json::Value;
+use std::cell::RefCell;
 
 use crate::configuration::Configuration;
 use crate::storage::DEFAULT_STORAGE_ALIAS;
@@ -146,10 +146,10 @@ tokio::task_local! {
 
 /// Tracks the charges of a run and makes them.
 pub struct ChargingManager {
-    configuration: Arc<Configuration>,
+    configuration: Rc<Configuration>,
     client: ApifyClient,
-    state: Mutex<State>,
-    log_dataset: tokio::sync::OnceCell<Dataset>,
+    state: RefCell<State>,
+    log_dataset: crawlee::core::local::OnceCell<Dataset>,
 }
 
 impl std::fmt::Debug for ChargingManager {
@@ -159,13 +159,13 @@ impl std::fmt::Debug for ChargingManager {
 }
 
 impl ChargingManager {
-    pub fn new(configuration: Arc<Configuration>, client: ApifyClient) -> Self {
+    pub fn new(configuration: Rc<Configuration>, client: ApifyClient) -> Self {
         let max_total_charge_usd = configuration.max_total_charge_usd;
         ChargingManager {
             configuration,
             client,
-            state: Mutex::new(State { max_total_charge_usd, ..State::default() }),
-            log_dataset: tokio::sync::OnceCell::new(),
+            state: RefCell::new(State { max_total_charge_usd, ..State::default() }),
+            log_dataset: crawlee::core::local::OnceCell::new(),
         }
     }
 
@@ -190,7 +190,7 @@ impl ChargingManager {
 
         let (pricing_info, charged_counts, max_total_charge_usd) = self.fetch_pricing_info().await?;
         let is_ppe = {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             let run_model = pricing_info.get("pricingModel").and_then(Value::as_str).map(str::to_owned);
             state.pricing_model =
                 if configuration.test_pay_per_event { Some(PAY_PER_EVENT.to_owned()) } else { run_model.clone() };
@@ -262,15 +262,15 @@ impl ChargingManager {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.state.lock().initialized
+        self.state.borrow_mut().initialized
     }
 
     pub fn is_pay_per_event(&self) -> bool {
-        self.state.lock().pricing_model.as_deref() == Some(PAY_PER_EVENT)
+        self.state.borrow_mut().pricing_model.as_deref() == Some(PAY_PER_EVENT)
     }
 
     pub fn pricing_info(&self) -> Result<ActorPricingInfo, ChargingError> {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if !state.initialized {
             return Err(ChargingError::NotInitialized);
         }
@@ -283,14 +283,14 @@ impl ChargingManager {
     }
 
     pub fn charged_event_count(&self, event_name: &str) -> u64 {
-        self.state.lock().charged.get(event_name).map_or(0, |(count, _)| *count)
+        self.state.borrow_mut().charged.get(event_name).map_or(0, |(count, _)| *count)
     }
 
     /// Charges for `count` events, as far as the budget allows. When it allows fewer, one more is
     /// charged, so that the platform notices and stops the run.
     pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
         if !self.is_pay_per_event() {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             if !state.not_ppe_warning_printed {
                 tracing::warn!(
                     "Ignored attempt to charge for an event - the Actor does not use the pay-per-event pricing"
@@ -318,7 +318,7 @@ impl ChargingManager {
                  {charged_count} events were charged"
             );
         }
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         Ok(ChargeResult {
             event_charge_limit_reached: if charged_count == 0 {
                 count > 0
@@ -333,7 +333,7 @@ impl ChargingManager {
     /// Counts up to `count` events as charged, as far as the budget allows (one more when it
     /// allows fewer, unless already over it), and returns how many.
     fn reserve(&self, event_name: &str, count: u64) -> u64 {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let max = self.max_event_charge_count_of(&state, event_name);
         let charged_count = if (count as f64) <= max {
             count
@@ -366,7 +366,7 @@ impl ChargingManager {
     /// `is_default_dataset`. Returns how many items to store. All the charges are counted at
     /// once, so that concurrent pushes cannot together spend more than the budget.
     pub(crate) fn reserve_items(&self, items_count: usize, events: &[&str], is_default_dataset: bool) -> usize {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let limit = self.push_data_limit_of(&state, items_count, events, is_default_dataset);
         if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
             for event in Self::item_events(events, is_default_dataset) {
@@ -379,7 +379,7 @@ impl ChargingManager {
     /// Takes back a reservation of [`reserve_items`](Self::reserve_items) for items that were
     /// not stored.
     pub(crate) fn unreserve_items(&self, events: &[&str], is_default_dataset: bool, items_count: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
             for event in Self::item_events(events, is_default_dataset) {
                 self.add_charged(&mut state, event, -(items_count as i64));
@@ -422,7 +422,7 @@ impl ChargingManager {
         idempotency_key: Option<String>,
     ) -> Result<(), ChargingError> {
         let (known, title, price) = {
-            let state = self.state.lock();
+            let state = self.state.borrow_mut();
             match state.prices.get(event_name) {
                 Some(pricing) => (true, pricing.title.clone(), pricing.price),
                 None => (
@@ -491,22 +491,22 @@ impl ChargingManager {
 
     /// How many more `event_name` events the budget allows; `None` is no limit.
     pub fn max_event_charge_count_within_limit(&self, event_name: &str) -> Option<u64> {
-        limit(self.max_event_charge_count_of(&self.state.lock(), event_name))
+        limit(self.max_event_charge_count_of(&self.state.borrow_mut(), event_name))
     }
 
     pub fn is_event_charge_limit_reached(&self, event_name: &str) -> bool {
-        self.is_event_charge_limit_reached_of(&self.state.lock(), event_name)
+        self.is_event_charge_limit_reached_of(&self.state.borrow_mut(), event_name)
     }
 
     pub fn chargeable_within_limit(&self) -> IndexMap<String, Option<u64>> {
-        self.chargeable_within_limit_of(&self.state.lock())
+        self.chargeable_within_limit_of(&self.state.borrow_mut())
     }
 
     /// How many of `items_count` items can be pushed within the budget, each charged as
     /// `event_name` (if set) plus the default dataset item event (if `is_default_dataset`).
     pub fn push_data_limit(&self, items_count: usize, event_name: Option<&str>, is_default_dataset: bool) -> usize {
         let events: Vec<&str> = event_name.into_iter().collect();
-        self.push_data_limit_of(&self.state.lock(), items_count, &events, is_default_dataset)
+        self.push_data_limit_of(&self.state.borrow_mut(), items_count, &events, is_default_dataset)
     }
 
     fn push_data_limit_of(
@@ -538,11 +538,11 @@ impl ChargingManager {
 
 /// The default dataset, charging the default dataset item event for what it stores.
 struct ChargingDataset {
-    inner: Arc<dyn DatasetBackend>,
-    charging: Arc<ChargingManager>,
+    inner: Rc<dyn DatasetBackend>,
+    charging: Rc<ChargingManager>,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DatasetBackend for ChargingDataset {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
         self.inner.get_metadata().await
@@ -586,8 +586,8 @@ impl DatasetBackend for ChargingDataset {
 
 /// A storage backend whose default dataset charges for its items.
 pub(crate) struct ChargingStorageBackend {
-    pub(crate) inner: Arc<dyn StorageBackend>,
-    pub(crate) charging: Arc<ChargingManager>,
+    pub(crate) inner: Rc<dyn StorageBackend>,
+    pub(crate) charging: Rc<ChargingManager>,
     pub(crate) default_dataset_id: String,
 }
 
@@ -602,27 +602,24 @@ impl ChargingStorageBackend {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl StorageBackend for ChargingStorageBackend {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>> {
         let backend = self.inner.create_dataset_backend(id).await?;
         if !self.is_default_dataset(id) {
             return Ok(backend);
         }
-        Ok(Arc::new(ChargingDataset { inner: backend, charging: self.charging.clone() }))
+        Ok(Rc::new(ChargingDataset { inner: backend, charging: self.charging.clone() }))
     }
 
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>> {
         self.inner.create_key_value_store_backend(id).await
     }
 
-    async fn create_request_queue_backend(
-        &self,
-        id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>> {
         self.inner.create_request_queue_backend(id).await
     }
 
@@ -688,10 +685,10 @@ mod tests {
             ..Configuration::default()
         };
         let client = crate::new_client(&configuration, None, Default::default());
-        ChargingManager::new(Arc::new(configuration), client)
+        ChargingManager::new(Rc::new(configuration), client)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn budget_limits_and_restored_counts() {
         let manager = manager(10.0, &[("page", 1.0), ("apify-default-dataset-item", 0.5)], &[("page", 3)]);
         manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();

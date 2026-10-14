@@ -6,10 +6,10 @@ rust-version = "1.88"
 publish = false
 
 [dependencies]
-apify = { git = "https://github.com/apify-projects/apify-sdk-rs" }
+apify = { git = "https://github.com/apify/apify-sdk-rs", branch = "single-threaded" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

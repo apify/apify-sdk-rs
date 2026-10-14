@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify::{ApifyStorageBackend, Configuration};
 use axum::Router;
@@ -23,15 +23,15 @@ async fn serve_site() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::task::spawn_local(async move { axum::serve(listener, app).await.unwrap() });
     url
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_crawl_stores_its_queue_and_results_on_the_platform() {
     let api = FakeApi::start().await;
     let site = serve_site().await;
-    let configuration = Arc::new(Configuration {
+    let configuration = Rc::new(Configuration {
         is_at_home: true,
         token: Some(TOKEN.to_owned()),
         api_base_url: api.url.clone(),
@@ -41,7 +41,7 @@ async fn a_crawl_stores_its_queue_and_results_on_the_platform() {
         default_request_queue_id: DEFAULT_QUEUE.to_owned(),
         ..Configuration::default()
     });
-    let services = Services::new(Arc::new(ApifyStorageBackend::new(configuration)));
+    let services = Services::new(Rc::new(ApifyStorageBackend::new(configuration)));
 
     let crawler = HtmlCrawler::builder()
         .services(services)

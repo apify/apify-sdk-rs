@@ -63,7 +63,7 @@ fn terminal_messages(api: &FakeApi) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn input_and_output_on_the_platform() {
     let api = FakeApi::start().await;
     api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
@@ -76,7 +76,7 @@ async fn input_and_output_on_the_platform() {
     assert!(!dir.path().join("storage").exists(), "nothing is stored locally");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_failing_user_function_exits_with_91() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -88,7 +88,7 @@ async fn a_failing_user_function_exits_with_91() {
 }
 
 /// `Actor::init` and `exit` without `Actor::main`, and the functions of the Actor in between.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn an_actor_initialized_and_exited_explicitly() {
     let api = FakeApi::start().await;
     api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
@@ -100,7 +100,7 @@ async fn an_actor_initialized_and_exited_explicitly() {
     assert_eq!(terminal_messages(&api), ["Echoed"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn the_actor_panics_before_init() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("before-init", &[], dir.path()).await;
@@ -111,7 +111,7 @@ async fn the_actor_panics_before_init() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn an_aborted_run_exits_gracefully_after_saving_its_state() {
     let api = FakeApi::start().await;
     let events =
@@ -126,7 +126,7 @@ async fn an_aborted_run_exits_gracefully_after_saving_its_state() {
     assert_eq!(serde_json::from_slice::<Value>(&state).unwrap(), json!({ "count": 1 }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_migrating_run_saves_its_state_and_reboots() {
     let api = FakeApi::start().await;
     // Once the user function has registered its state.
@@ -145,7 +145,7 @@ async fn a_migrating_run_saves_its_state_and_reboots() {
     assert!(saved < reboot, "the state is saved before the reboot: {calls:?}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_local_run_reads_its_input_from_the_working_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("INPUT.json"), r#"{"greeting":"hello"}"#).unwrap();
@@ -173,7 +173,7 @@ async fn a_local_run_reads_its_input_from_the_working_directory() {
     assert!(!dir.path().join("storage/datasets/default/000000002.json").exists(), "the dataset was purged");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn missing_input_and_late_init_are_errors() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("echo", &[], dir.path()).await;
@@ -189,7 +189,7 @@ async fn missing_input_and_late_init_are_errors() {
     assert_exit(&run_child("late-init", &[], dir.path()).await, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn the_platform_api() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -228,7 +228,7 @@ async fn the_platform_api() {
     assert_eq!(serde_json::from_slice::<Value>(&state).unwrap(), json!({ "calls": 5 }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn pay_per_event_charges_stay_within_the_budget() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -253,7 +253,7 @@ async fn pay_per_event_charges_stay_within_the_budget() {
     assert_eq!(charges, [json!({ "eventName": "page", "count": 1 })]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -278,7 +278,7 @@ async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
     assert_eq!(pages, 21, "each stored item is charged once");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
     let vars = [
@@ -297,7 +297,7 @@ async fn local_pay_per_event_runs_log_their_charges() {
     assert_eq!(log["chargedCount"], 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn secret_input_fields_are_decrypted() {
     let api = FakeApi::start().await;
     let fixture: Value = serde_json::from_str(include_str!("fixtures/input_secrets.json")).unwrap();
@@ -324,7 +324,7 @@ async fn secret_input_fields_are_decrypted() {
 fn child() {
     let Ok(scenario) = std::env::var(SCENARIO) else { return };
     tracing_subscriber::fmt().with_writer(std::io::stdout).init();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build_local(Default::default()).unwrap();
     runtime.block_on(async move {
         match scenario.as_str() {
             "echo" => {
@@ -398,7 +398,9 @@ fn child() {
                 Actor::main(|| async move {
                     let started = std::time::Instant::now();
                     let pushes = (0..30).map(|n| {
-                        tokio::spawn(async move { Actor::push_data_and_charge(&json!({ "n": n }), "page").await })
+                        tokio::task::spawn_local(async move {
+                            Actor::push_data_and_charge(&json!({ "n": n }), "page").await
+                        })
                     });
                     let mut stored = 0;
                     for push in pushes.collect::<Vec<_>>() {

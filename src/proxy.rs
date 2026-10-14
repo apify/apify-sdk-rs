@@ -1,7 +1,7 @@
 //! Apify Proxy for crawlee-rs crawlers: a [`ProxySource`] that composes Apify Proxy URLs (or uses
 //! custom proxy URLs), like `ProxyConfiguration` of the JS SDK.
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use apify_client::ApifyClient;
@@ -109,14 +109,14 @@ impl ProxyConfiguration {
         configuration: &Configuration,
         client: &ApifyClient,
         options: ProxyConfigurationOptions,
-    ) -> Result<Option<Arc<Self>>, ProxyConfigurationError> {
+    ) -> Result<Option<Rc<Self>>, ProxyConfigurationError> {
         if options.use_apify_proxy == Some(false) && options.proxy_urls.is_empty() {
             return Ok(None);
         }
         let uses_apify = options.proxy_urls.is_empty();
         let mut proxy = ProxyConfiguration::from_options(configuration, &options)?;
         if !uses_apify {
-            return Ok(Some(Arc::new(proxy)));
+            return Ok(Some(Rc::new(proxy)));
         }
 
         let mut password = options.password.clone().or_else(|| configuration.proxy_password.clone());
@@ -149,7 +149,7 @@ impl ProxyConfiguration {
         if options.check_access != Some(false) && !proxy.check_access(configuration).await? {
             return Ok(None);
         }
-        Ok(Some(Arc::new(proxy)))
+        Ok(Some(Rc::new(proxy)))
     }
 
     /// The configuration without the password lookup and the access check.
@@ -286,7 +286,7 @@ impl crate::Actor {
     /// [`ProxyConfiguration::new`]). The options are often the `proxy` field of the input.
     pub async fn create_proxy_configuration(
         options: ProxyConfigurationOptions,
-    ) -> Result<Option<Arc<ProxyConfiguration>>, ProxyConfigurationError> {
+    ) -> Result<Option<Rc<ProxyConfiguration>>, ProxyConfigurationError> {
         ProxyConfiguration::new(Self::configuration(), Self::client(), options).await
     }
 }
@@ -389,7 +389,7 @@ mod tests {
         assert!(error(serde_json::json!({ "groups": ["A"], "proxyUrls": ["http://p:1"] })).contains("Cannot combine"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn disabled_and_custom_proxies() {
         let configuration = Configuration::default();
         let client = crate::new_client(&configuration, None, Default::default());

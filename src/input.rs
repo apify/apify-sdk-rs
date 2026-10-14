@@ -198,7 +198,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn input_files_in_the_working_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_input_file(dir.path(), "INPUT").await.unwrap(), None);

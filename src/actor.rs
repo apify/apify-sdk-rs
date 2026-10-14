@@ -1,19 +1,19 @@
 //! [`Actor`]: the lifecycle of an Actor run, and access to its storages, input and platform.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
 use std::time::Duration;
 
 use apify_client::ApifyClient;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
 use crawlee::{Dataset, KeyValueStore, RequestQueue, Services, StorageIdentifier};
-use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::cell::RefCell;
 
 use crate::charging::{
     ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend, DEFAULT_DATASET_ITEM_EVENT,
@@ -40,7 +40,7 @@ pub struct InitOptions {
     pub configuration: Option<Configuration>,
     /// A storage backend used instead of the platform storages (on the platform) or the local
     /// files (elsewhere).
-    pub storage: Option<Arc<dyn StorageBackend>>,
+    pub storage: Option<Rc<dyn StorageBackend>>,
     /// How request queues on the platform are consumed.
     pub request_queue_access: RequestQueueAccess,
     /// Exit when the run is aborted, and reboot when it is migrated. Default `true`.
@@ -113,16 +113,16 @@ struct Handlers {
 }
 
 struct Inner {
-    configuration: Arc<Configuration>,
+    configuration: Rc<Configuration>,
     client: ApifyClient,
-    storage: Arc<dyn StorageBackend>,
-    smart: Option<Arc<SmartStorageBackend>>,
-    charging: Arc<ChargingManager>,
+    storage: Rc<dyn StorageBackend>,
+    smart: Option<Rc<SmartStorageBackend>>,
+    charging: Rc<ChargingManager>,
     services: Services,
-    exiting: AtomicBool,
-    rebooting: AtomicBool,
-    handlers: Mutex<Handlers>,
-    websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    exiting: Cell<bool>,
+    rebooting: Cell<bool>,
+    handlers: RefCell<Handlers>,
+    websocket: RefCell<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
@@ -149,11 +149,15 @@ struct Inner {
 /// code, not a condition to handle.
 pub enum Actor {}
 
-static STATE: OnceLock<Inner> = OnceLock::new();
+thread_local! {
+    /// The initialized Actor. Everything runs on one thread, so it is the process's. Leaked once,
+    /// so that it can be handed out as `&'static`.
+    static STATE: std::cell::OnceCell<&'static Inner> = const { std::cell::OnceCell::new() };
+}
 
 /// The state of the initialized Actor.
 fn state() -> &'static Inner {
-    STATE.get().expect("Actor::init() must be called before the other functions of Actor")
+    STATE.with(|state| state.get().copied()).expect("Actor::init() must be called before the other functions of Actor")
 }
 
 /// Initialization failed.
@@ -223,7 +227,7 @@ impl Actor {
     /// crawlee-rs services, connects to the platform events, and purges the local default
     /// storages. Later calls do nothing.
     pub async fn init(options: InitOptions) -> Result<(), InitError> {
-        if STATE.get().is_some() {
+        if STATE.with(|state| state.get().is_some()) {
             tracing::debug!("The Actor was already initialized");
             return Ok(());
         }
@@ -231,7 +235,7 @@ impl Actor {
             return Err(InitError::ServicesAlreadySet);
         }
 
-        let configuration = Arc::new(options.configuration.unwrap_or_else(Configuration::from_env));
+        let configuration = Rc::new(options.configuration.unwrap_or_else(Configuration::from_env));
         // How much the runtime runs in parallel: the CPUs Rust sees (cgroup quotas included) and
         // the tokio worker threads.
         let runtime = tokio::runtime::Handle::current();
@@ -247,24 +251,24 @@ impl Actor {
         );
 
         let client = new_client(&configuration, None, RateLimitCounter::default());
-        let charging = Arc::new(ChargingManager::new(configuration.clone(), client.clone()));
-        let (storage, smart): (Arc<dyn StorageBackend>, _) = match options.storage {
+        let charging = Rc::new(ChargingManager::new(configuration.clone(), client.clone()));
+        let (storage, smart): (Rc<dyn StorageBackend>, _) = match options.storage {
             Some(storage) => (storage, None),
             None => {
-                let cloud: Arc<dyn StorageBackend> = Arc::new(
+                let cloud: Rc<dyn StorageBackend> = Rc::new(
                     ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access),
                 );
                 let local = SmartStorageBackend::local_backend(&configuration);
                 // The default datasets charge for their items under pay-per-event pricing.
-                let charged = |inner| -> Arc<dyn StorageBackend> {
-                    Arc::new(ChargingStorageBackend {
+                let charged = |inner| -> Rc<dyn StorageBackend> {
+                    Rc::new(ChargingStorageBackend {
                         inner,
                         charging: charging.clone(),
                         default_dataset_id: configuration.default_dataset_id.clone(),
                     })
                 };
                 let (cloud, local) = (charged(cloud), charged(local));
-                let smart = Arc::new(SmartStorageBackend::new(configuration.clone(), cloud, local));
+                let smart = Rc::new(SmartStorageBackend::new(configuration.clone(), cloud, local));
                 (smart.clone(), Some(smart))
             }
         };
@@ -286,12 +290,12 @@ impl Actor {
             smart,
             charging,
             services,
-            exiting: AtomicBool::new(false),
-            rebooting: AtomicBool::new(false),
-            handlers: Mutex::default(),
-            websocket: Mutex::default(),
+            exiting: Cell::new(false),
+            rebooting: Cell::new(false),
+            handlers: RefCell::default(),
+            websocket: RefCell::default(),
         };
-        if STATE.set(inner).is_err() {
+        if STATE.with(|state| state.set(Box::leak(Box::new(inner)))).is_err() {
             return Err(InitError::ServicesAlreadySet);
         }
         let state = state();
@@ -306,14 +310,14 @@ impl Actor {
                 Self::update_run_status_message(&status.message, status.is_terminal).await;
             }
         });
-        state.handlers.lock().status_forwarder = Some(forwarder);
+        state.handlers.borrow_mut().status_forwarder = Some(forwarder);
 
         // Connected once the listeners are in place, so that no early event is missed.
         if configuration.is_at_home {
             match &configuration.actor_events_ws_url {
                 Some(url) => {
                     let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
-                    *state.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
+                    *state.websocket.borrow_mut() = Some(crate::events::connect(url, events.clone(), memory).await);
                 }
                 None => tracing::debug!(
                     "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."
@@ -337,14 +341,14 @@ impl Actor {
     fn register_graceful_shutdown(delay: Duration) {
         let events = Self::events();
         let aborting = events.on(EventKind::Aborting, move |_| {
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 tokio::time::sleep(delay).await;
                 Self::exit(ExitOptions::default()).await;
             });
             async {}
         });
         let migrating = events.on(EventKind::Migrating, move |_| {
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 tokio::time::sleep(delay).await;
                 if let Err(err) = Self::reboot().await {
                     tracing::error!("Failed to reboot on migration: {err}");
@@ -352,10 +356,10 @@ impl Actor {
             });
             async {}
         });
-        state().handlers.lock().graceful = vec![aborting, migrating];
+        state().handlers.borrow_mut().graceful = vec![aborting, migrating];
     }
 
-    pub fn configuration() -> &'static Arc<Configuration> {
+    pub fn configuration() -> &'static Rc<Configuration> {
         &state().configuration
     }
 
@@ -387,12 +391,12 @@ impl Actor {
     /// [`ExitOptions::exit_code`]. If this takes longer than [`ExitOptions::timeout`], the process
     /// exits anyway. Returns only with [`ExitOptions::exit`] set to `false`, or when already exiting.
     pub async fn exit(options: ExitOptions) {
-        if state().exiting.swap(true, Ordering::AcqRel) {
+        if state().exiting.replace(true) {
             tracing::debug!("Actor::exit() called while already exiting, skipping");
             return;
         }
         let events = Self::events().clone();
-        for id in std::mem::take(&mut state().handlers.lock().graceful) {
+        for id in std::mem::take(&mut state().handlers.borrow_mut().graceful) {
             events.off(id);
         }
 
@@ -413,7 +417,7 @@ impl Actor {
         let teardown = async {
             events.wait_for_all_listeners_to_complete().await;
             // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
-            if let Some(id) = state().handlers.lock().status_forwarder.take() {
+            if let Some(id) = state().handlers.borrow_mut().status_forwarder.take() {
                 events.off(id);
             }
             if let Err(err) = state().storage.teardown().await {
@@ -430,11 +434,11 @@ impl Actor {
                 options.timeout.as_secs()
             );
         }
-        if let Some(websocket) = state().websocket.lock().take() {
+        if let Some(websocket) = state().websocket.borrow_mut().take() {
             websocket.abort();
         }
 
-        state().exiting.store(false, Ordering::Release);
+        state().exiting.set(false);
         if options.exit {
             flush_and_exit(options.exit_code);
         }
@@ -475,7 +479,7 @@ impl Actor {
             tracing::warn!("Actor::reboot() is only supported when running on the Apify platform.");
             return Ok(());
         }
-        if state().rebooting.swap(true, Ordering::AcqRel) {
+        if state().rebooting.replace(true) {
             tracing::debug!("Actor is already rebooting, skipping the additional reboot call.");
             return Ok(());
         }
@@ -520,7 +524,7 @@ impl Actor {
     }
 
     /// The pay-per-event charges of the run.
-    pub fn charging_manager() -> &'static Arc<ChargingManager> {
+    pub fn charging_manager() -> &'static Rc<ChargingManager> {
         &state().charging
     }
 

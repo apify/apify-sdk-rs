@@ -154,7 +154,7 @@ impl RequestTransform {
     }
 
     /// For [`EnqueueLinksOptions::transform`](crawlee::EnqueueLinksOptions::transform).
-    pub fn into_fn(self) -> impl Fn(Request) -> Option<Request> + Send + Sync + 'static {
+    pub fn into_fn(self) -> impl Fn(Request) -> Option<Request> + 'static {
         move |request| self.apply(request)
     }
 }

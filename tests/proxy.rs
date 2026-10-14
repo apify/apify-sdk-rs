@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use apify::{Configuration, ProxyConfiguration, ProxyConfigurationOptions};
 use axum::Router;
@@ -10,7 +10,6 @@ use axum::http::{HeaderMap, Uri};
 use axum::routing::get;
 use base64::Engine as _;
 use crawlee::basic::proxy::ProxySource as _;
-use parking_lot::Mutex;
 
 use common::{FakeApi, TOKEN};
 
@@ -28,7 +27,7 @@ async fn serve_proxy(connected: bool) -> (u16, Arc<Mutex<Vec<(String, String)>>>
                 .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
                 .map(|v| String::from_utf8(v).unwrap())
                 .unwrap_or_default();
-            recorded.lock().push((uri.to_string(), credentials));
+            recorded.lock().unwrap().push((uri.to_string(), credentials));
             let status = if connected {
                 serde_json::json!({ "connected": true, "isManInTheMiddle": true })
             } else {
@@ -39,7 +38,7 @@ async fn serve_proxy(connected: bool) -> (u16, Arc<Mutex<Vec<(String, String)>>>
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::task::spawn_local(async move { axum::serve(listener, app).await.unwrap() });
     (port, seen)
 }
 
@@ -55,7 +54,7 @@ fn configuration(api: &FakeApi, port: u16, is_at_home: bool) -> Configuration {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn the_password_comes_from_the_account_and_access_is_checked() {
     let api = FakeApi::start().await;
     let (port, seen) = serve_proxy(true).await;
@@ -65,7 +64,7 @@ async fn the_password_comes_from_the_account_and_access_is_checked() {
 
     let proxy = ProxyConfiguration::new(&configuration, &client, options).await.unwrap().unwrap();
     assert!(proxy.is_man_in_the_middle);
-    let (target, credentials) = seen.lock()[0].clone();
+    let (target, credentials) = seen.lock().unwrap()[0].clone();
     assert_eq!(target, "http://proxy.apify.com/?format=json");
     let (username, password) = credentials.split_once(':').unwrap();
     assert!(username.starts_with("groups-RESIDENTIAL,session-"), "{username}");
@@ -77,7 +76,7 @@ async fn the_password_comes_from_the_account_and_access_is_checked() {
     assert_eq!(first.password, "proxy-secret");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn no_access_is_an_error_on_the_platform_and_no_proxy_locally() {
     let api = FakeApi::start().await;
     let (port, _) = serve_proxy(false).await;

@@ -1,9 +1,10 @@
 //! A request queue consumed by any number of clients: fetched requests are locked on the
 //! platform (`listAndLockHead`), a port of `ApifyRequestQueueSharedBackend` of the JS SDK.
 
+use crawlee::core::local::CellExt as _;
+use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use apify_client::clients::request_queue::RequestQueueClient;
@@ -15,7 +16,7 @@ use crawlee::core::storage::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
 };
 use lru::LruCache;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use super::backend_error;
 use super::request_queue::{
@@ -47,23 +48,23 @@ struct State {
 
 pub(crate) struct ApifySharedRequestQueue {
     client: RequestQueueClient,
-    head: tokio::sync::Mutex<Head>,
-    state: Mutex<State>,
-    lock_secs: AtomicU64,
+    head: crawlee::core::local::Mutex<Head>,
+    state: RefCell<State>,
+    lock_secs: Cell<u64>,
 }
 
 impl ApifySharedRequestQueue {
     pub(crate) fn new(client: RequestQueueClient) -> Self {
         ApifySharedRequestQueue {
             client,
-            head: tokio::sync::Mutex::default(),
-            state: Mutex::new(State {
+            head: crawlee::core::local::Mutex::default(),
+            state: RefCell::new(State {
                 known: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
                 in_progress: HashSet::new(),
                 estimated_total: 0,
                 estimated_handled: 0,
             }),
-            lock_secs: AtomicU64::new(DEFAULT_REQUEST_LOCK_SECS),
+            lock_secs: Cell::new(DEFAULT_REQUEST_LOCK_SECS),
         }
     }
 
@@ -75,10 +76,10 @@ impl ApifySharedRequestQueue {
     }
 
     async fn list_and_lock_head(&self, head: &mut Head, limit: i64) -> StorageResult<()> {
-        let lock_secs = self.lock_secs.load(Ordering::Relaxed) as i64;
+        let lock_secs = self.lock_secs.get() as i64;
         let listed = self.client.list_and_lock_head(lock_secs, Some(limit)).await.map_err(backend_error)?;
         head.queue_has_locked_requests = listed.queue_has_locked_requests.unwrap_or(false);
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         for item in listed.items {
             let Some(id) = item.id else { continue };
             if state.in_progress.contains(&id) || head.ids.contains(&id) {
@@ -92,7 +93,7 @@ impl ApifySharedRequestQueue {
 
     async fn is_known_or_exists(&self, id: &str) -> StorageResult<bool> {
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             if state.in_progress.contains(id) || state.known.get(id).is_some() {
                 return Ok(true);
             }
@@ -101,11 +102,11 @@ impl ApifySharedRequestQueue {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestQueueBackend for ApifySharedRequestQueue {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
         let (total, handled) = {
-            let state = self.state.lock();
+            let state = self.state.borrow_mut();
             (state.estimated_total, state.estimated_handled)
         };
         queue_metadata(&self.client, total, handled).await
@@ -129,7 +130,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         let mut already_present = Vec::new();
         let mut new_requests = Vec::new();
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             for request in requests {
                 let id = unique_key_to_request_id(&request.unique_key);
                 match state.known.get(&id) {
@@ -148,14 +149,14 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         if !new_requests.is_empty() {
             result = send_batch(&self.client, &new_requests, forefront).await?;
             {
-                let mut state = self.state.lock();
+                let mut state = self.state.borrow_mut();
                 for processed in &result.processed_requests {
                     state.known.put(processed.request_id.clone(), processed.was_already_handled);
                 }
             }
         }
         result.processed_requests.extend(already_present);
-        self.state.lock().estimated_total += newly_added(&result);
+        self.state.borrow_mut().estimated_total += newly_added(&result);
         Ok(result)
     }
 
@@ -177,7 +178,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
             tracing::debug!("Request fetched from the queue head was not found (id: {id}), will be retried later");
             return Ok(None);
         };
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if request.handled_at.is_some() {
             // Handled by another client in the meantime.
             state.known.put(id, true);
@@ -190,7 +191,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
     async fn mark_request_as_handled(&self, request: &Request) -> StorageResult<Option<QueueOperationInfo>> {
         let id = unique_key_to_request_id(&request.unique_key);
         if !self.is_known_or_exists(&id).await? {
-            self.state.lock().in_progress.remove(&id);
+            self.state.borrow_mut().in_progress.remove(&id);
             return Ok(None);
         }
         let mut handled = request.clone();
@@ -198,7 +199,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         handled.handled_at.get_or_insert_with(crawlee::core::now_iso);
         let info = update_request(&self.client, &handled, false).await?;
 
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.in_progress.remove(&id);
         state.known.put(id, true);
         if !info.was_already_handled {
@@ -210,7 +211,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
         let id = unique_key_to_request_id(&request.unique_key);
         if !self.is_known_or_exists(&id).await? {
-            self.state.lock().in_progress.remove(&id);
+            self.state.borrow_mut().in_progress.remove(&id);
             return Ok(None);
         }
         let _head = self.head.lock().await;
@@ -222,7 +223,7 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         if let Err(err) = self.client.delete_request_lock(&id, forefront).await {
             tracing::debug!("Failed to delete the lock of a reclaimed request (id: {id}): {err}");
         }
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.in_progress.remove(&id);
         state.known.put(id, false);
         if info.was_already_handled {
@@ -252,13 +253,13 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
 
     /// Only ever raised: a short-lived consumer must not cut the locks of a long-running one short.
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
-        self.lock_secs.fetch_max(duration.as_secs(), Ordering::Relaxed);
+        self.lock_secs.fetch_max(duration.as_secs());
         Ok(())
     }
 
     /// Prolongs the lock of a request being processed (the JS SDK never does).
     async fn extend_request_processing_time(&self, request_id: &str, duration: Duration) -> StorageResult<bool> {
-        if !self.state.lock().in_progress.contains(request_id) {
+        if !self.state.borrow_mut().in_progress.contains(request_id) {
             return Ok(false);
         }
         let lock_secs = duration.as_secs().max(1) as i64;

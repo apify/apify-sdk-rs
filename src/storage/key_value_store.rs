@@ -20,7 +20,7 @@ pub(crate) struct ApifyKeyValueStore {
     pub(crate) client: KeyValueStoreClient,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl KeyValueStoreBackend for ApifyKeyValueStore {
     async fn get_metadata(&self) -> StorageResult<KeyValueStoreInfo> {
         let store = self

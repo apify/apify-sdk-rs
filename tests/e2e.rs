@@ -63,7 +63,7 @@ async fn wait_for_status(client: &ApifyClient, run_id: &str, wanted: &str) {
     panic!("run {run_id} did not reach {wanted}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn the_template_runs_on_the_platform_and_survives_a_reboot() {
     let Some(client) = client() else { return };
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
@@ -117,7 +117,7 @@ async fn the_template_runs_on_the_platform_and_survives_a_reboot() {
             assert!(total - urls.len() <= 10, "{} duplicates", total - urls.len());
         }
     };
-    let outcome = tokio::spawn(result).await;
+    let outcome = tokio::task::spawn_local(result).await;
     actor_client.delete().await.unwrap();
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());

@@ -1,7 +1,7 @@
 //! The platform API of an Actor: running other Actors and tasks, metamorphing, webhooks, the run
 //! environment and the persisted state.
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use apify_client::models::{ActorRun, Webhook};
@@ -283,12 +283,9 @@ impl Actor {
     /// A state saved in the default key-value store on every `PersistState` event and restored
     /// when the run restarts (after a migration, for example). `key` defaults to
     /// `APIFY_GLOBAL_STATE`. Calls with the same key share the state.
-    pub async fn use_state<T>(
-        key: Option<&str>,
-        default: impl Fn() -> T + Send + Sync + 'static,
-    ) -> StorageResult<Arc<SerdeState<T>>>
+    pub async fn use_state<T>(key: Option<&str>, default: impl Fn() -> T + 'static) -> StorageResult<Rc<SerdeState<T>>>
     where
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + 'static,
     {
         Self::services().auto_saved_value(key.unwrap_or(DEFAULT_STATE_KEY), default).await
     }

@@ -5,20 +5,20 @@
 //! APIFY_TOKEN=... cargo test --test live -- --nocapture
 //! ```
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use apify::{ApifyStorageBackend, Configuration, RequestQueueAccess};
 use crawlee::{Request, RequestManager, Services, StorageIdentifier};
 use serde_json::{Value, json};
 
 /// The configuration of a local run with the token of the environment, or `None` to skip.
-fn configuration() -> Option<Arc<Configuration>> {
+fn configuration() -> Option<Rc<Configuration>> {
     let configuration = Configuration { is_at_home: false, ..Configuration::from_env() };
     if configuration.token.is_none() {
         eprintln!("APIFY_TOKEN is not set; skipping the live test");
         return None;
     }
-    Some(Arc::new(configuration))
+    Some(Rc::new(configuration))
 }
 
 fn unique_name(kind: &str) -> String {
@@ -26,11 +26,11 @@ fn unique_name(kind: &str) -> String {
     format!("apify-sdk-rs-test-{kind}-{millis}-{}", std::process::id())
 }
 
-fn services(configuration: &Arc<Configuration>, access: RequestQueueAccess) -> Services {
-    Services::new(Arc::new(ApifyStorageBackend::new(configuration.clone()).request_queue_access(access)))
+fn services(configuration: &Rc<Configuration>, access: RequestQueueAccess) -> Services {
+    Services::new(Rc::new(ApifyStorageBackend::new(configuration.clone()).request_queue_access(access)))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn dataset_and_key_value_store() {
     let Some(configuration) = configuration() else { return };
     let services = services(&configuration, RequestQueueAccess::Single);
@@ -56,7 +56,7 @@ async fn dataset_and_key_value_store() {
     store.drop_storage().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn single_consumer_request_queue() {
     let Some(configuration) = configuration() else { return };
     let services = services(&configuration, RequestQueueAccess::Single);
@@ -77,13 +77,13 @@ async fn single_consumer_request_queue() {
     queue.drop_storage().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn shared_request_queue_with_two_consumers() {
     let Some(configuration) = configuration() else { return };
     let name = unique_name("rq-shared");
     let first = services(&configuration, RequestQueueAccess::Shared);
     // Another client key, as another run would have.
-    let other = Arc::new(Configuration { actor_run_id: Some(unique_name("run")), ..(*configuration).clone() });
+    let other = Rc::new(Configuration { actor_run_id: Some(unique_name("run")), ..(*configuration).clone() });
     let second = services(&other, RequestQueueAccess::Shared);
     let a = first.open_request_queue(&StorageIdentifier::name(name.clone())).await.unwrap();
     let b = second.open_request_queue(&StorageIdentifier::name(name)).await.unwrap();

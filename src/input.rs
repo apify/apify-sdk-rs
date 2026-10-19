@@ -1,5 +1,5 @@
 //! The input of an Actor run: the `INPUT` record of the default key-value store, or locally an
-//! `INPUT` / `INPUT.json` file in the working directory.
+//! `INPUT` / `INPUT.json` file in the working or storage directory.
 
 use std::path::Path;
 
@@ -78,8 +78,12 @@ pub(crate) fn parse_input(value: Bytes, content_type: Option<&str>, source: &str
     Ok(Input::Binary(value))
 }
 
-/// The input file in `directory`: `<key>` or `<key>.json`, not both.
-pub(crate) async fn read_input_file(directory: &Path, input_key: &str) -> Result<Option<Input>, ActorInputError> {
+/// The input file in `directory` (described as `label` in messages): `<key>` or `<key>.json`, not both.
+pub(crate) async fn read_input_file(
+    directory: &Path,
+    label: &str,
+    input_key: &str,
+) -> Result<Option<Input>, ActorInputError> {
     let candidates = [(input_key.to_owned(), BINARY_CONTENT_TYPE), (format!("{input_key}.json"), JSON_CONTENT_TYPE)];
     let mut found = Vec::new();
     for (filename, content_type) in candidates {
@@ -92,18 +96,14 @@ pub(crate) async fn read_input_file(directory: &Path, input_key: &str) -> Result
         let names: Vec<String> = found.iter().map(|(filename, _, _)| format!("\"{filename}\"")).collect();
         return Err(ActorInputError::new(
             ActorInputErrorCode::MultipleFiles,
-            format!(
-                "Found multiple input files in the working directory: {}. Keep only one of them.",
-                names.join(", ")
-            ),
+            format!("Found multiple input files in the {label}: {}. Keep only one of them.", names.join(", ")),
         ));
     }
     let Some((filename, content_type, path)) = found.pop() else { return Ok(None) };
     let value = tokio::fs::read(&path).await.map_err(|err| {
         ActorInputError::new(ActorInputErrorCode::NotFound, format!("Failed to read {}", path.display())).caused_by(err)
     })?;
-    parse_input(Bytes::from(value), Some(content_type), &format!("the \"{filename}\" file in the working directory"))
-        .map(Some)
+    parse_input(Bytes::from(value), Some(content_type), &format!("the \"{filename}\" file in the {label}")).map(Some)
 }
 
 /// Where the input schema is looked for when `.actor/actor.json` does not say.
@@ -201,13 +201,16 @@ mod tests {
     #[tokio::test]
     async fn input_files_in_the_working_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_input_file(dir.path(), "INPUT").await.unwrap(), None);
+        assert_eq!(read_input_file(dir.path(), "working directory", "INPUT").await.unwrap(), None);
 
         std::fs::write(dir.path().join("INPUT.json"), r#"{"a":1}"#).unwrap();
-        assert_eq!(read_input_file(dir.path(), "INPUT").await.unwrap(), Some(Input::Json(json!({"a": 1}))));
+        assert_eq!(
+            read_input_file(dir.path(), "working directory", "INPUT").await.unwrap(),
+            Some(Input::Json(json!({"a": 1})))
+        );
 
         std::fs::write(dir.path().join("INPUT"), "x").unwrap();
-        let err = read_input_file(dir.path(), "INPUT").await.unwrap_err();
+        let err = read_input_file(dir.path(), "working directory", "INPUT").await.unwrap_err();
         assert_eq!(err.code, ActorInputErrorCode::MultipleFiles);
         assert_eq!(
             err.to_string(),

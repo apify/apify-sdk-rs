@@ -628,7 +628,8 @@ impl Actor {
     }
 
     /// The input of the run, as it was stored. Locally, an `INPUT` or `INPUT.json` file in the
-    /// working directory is used when the default key-value store has no input.
+    /// working directory, then in the storage directory, is used when the default key-value
+    /// store has no input.
     pub async fn get_input_raw() -> Result<Input, ActorInputError> {
         let configuration = &state().configuration;
         let key = &configuration.input_key;
@@ -644,13 +645,21 @@ impl Actor {
             .map_err(|err| ActorInputError::new(ActorInputErrorCode::NotFound, err.to_string()).caused_by(err))?;
         let input = match record {
             Some(record) => Some(crate::input::parse_input(record.value, record.content_type.as_deref(), &source)?),
-            None if !configuration.is_at_home => crate::input::read_input_file(&working_directory(), key).await?,
+            None if !configuration.is_at_home => {
+                match crate::input::read_input_file(&working_directory(), "working directory", key).await? {
+                    Some(input) => Some(input),
+                    None => {
+                        crate::input::read_input_file(&configuration.crawlee.storage_dir, "storage directory", key)
+                            .await?
+                    }
+                }
+            }
             None => None,
         };
         let Some(input) = input else {
             let mut locations = vec![source];
             if !configuration.is_at_home {
-                locations.push(format!("a \"{key}\" or \"{key}.json\" file in the working directory"));
+                locations.push(format!("a \"{key}\" or \"{key}.json\" file in the working or storage directory"));
             }
             return Err(ActorInputError::new(
                 ActorInputErrorCode::NotFound,

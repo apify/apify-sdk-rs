@@ -174,6 +174,26 @@ async fn a_local_run_reads_its_input_from_the_working_directory() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn a_local_run_falls_back_to_the_storage_directory_after_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("storage")).unwrap();
+    std::fs::write(dir.path().join("storage/INPUT.json"), r#"{"from":"storage"}"#).unwrap();
+    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
+    let read_item = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("storage/datasets/default/000000001.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(read_item(), json!({ "echo": { "from": "storage" } }));
+
+    std::fs::write(dir.path().join("INPUT.json"), r#"{"from":"cwd"}"#).unwrap();
+    std::fs::remove_dir_all(dir.path().join("storage/key_value_stores")).unwrap();
+    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
+    assert_eq!(read_item(), json!({ "echo": { "from": "cwd" } }));
+}
+
+#[tokio::test(flavor = "local")]
 async fn missing_input_and_late_init_are_errors() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("echo", &[], dir.path()).await;
@@ -181,7 +201,7 @@ async fn missing_input_and_late_init_are_errors() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working directory."#
+            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working or storage directory."#
         ),
         "{stdout}"
     );

@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use apify_client::ApifyClient;
+use crawlee::core::events::ListenerId;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
 use crawlee::{Dataset, KeyValueStore, RequestQueue, Services, StorageIdentifier};
@@ -150,6 +151,23 @@ struct Inner {
 pub enum Actor {}
 
 static STATE: OnceLock<Inner> = OnceLock::new();
+
+/// A listener added with [`Actor::on`], to remove with [`Actor::off`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActorListenerId(u64);
+
+/// Adds a listener to the run's events.
+type PendingListener = Box<dyn FnOnce(&EventManager) -> ListenerId + Send>;
+
+/// The listeners added with [`Actor::on`]: queued before [`Actor::init`], which attaches them.
+#[derive(Default)]
+struct Listeners {
+    next_id: u64,
+    pending: Vec<(ActorListenerId, PendingListener)>,
+    attached: Vec<(ActorListenerId, ListenerId)>,
+}
+
+static LISTENERS: Mutex<Listeners> = Mutex::new(Listeners { next_id: 0, pending: Vec::new(), attached: Vec::new() });
 
 /// The state of the initialized Actor.
 fn state() -> &'static Inner {
@@ -309,6 +327,17 @@ impl Actor {
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
+        {
+            let mut listeners = LISTENERS.lock();
+            let pending = std::mem::take(&mut listeners.pending);
+            if !pending.is_empty() {
+                tracing::debug!("Attached {} listener(s) registered before Actor::init()", pending.len());
+            }
+            for (id, attach) in pending {
+                let attached = attach(&events);
+                listeners.attached.push((id, attached));
+            }
+        }
 
         // Connected once the listeners are in place, so that no early event is missed.
         if configuration.is_at_home {
@@ -380,6 +409,36 @@ impl Actor {
     /// The services of the run, which crawlers use by default.
     pub fn services() -> &'static Services {
         &state().services
+    }
+
+    /// Adds a listener to the run's events. Before [`init`](Self::init), the listener is queued
+    /// and `init` adds it, before the platform events are connected.
+    pub fn on<F, Fut>(kind: EventKind, listener: F) -> ActorListenerId
+    where
+        F: Fn(Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut listeners = LISTENERS.lock();
+        let id = ActorListenerId(listeners.next_id);
+        listeners.next_id += 1;
+        match STATE.get() {
+            Some(state) => {
+                let attached = state.services.events.on(kind, listener);
+                listeners.attached.push((id, attached));
+            }
+            None => listeners.pending.push((id, Box::new(move |events: &EventManager| events.on(kind, listener)))),
+        }
+        id
+    }
+
+    /// Removes a listener added with [`on`](Self::on).
+    pub fn off(id: ActorListenerId) {
+        let mut listeners = LISTENERS.lock();
+        listeners.pending.retain(|(pending, _)| *pending != id);
+        if let Some(index) = listeners.attached.iter().position(|(attached, _)| *attached == id) {
+            let (_, attached) = listeners.attached.remove(index);
+            state().services.events.off(attached);
+        }
     }
 
     pub fn events() -> &'static EventManager {

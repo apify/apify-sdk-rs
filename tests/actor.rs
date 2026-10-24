@@ -109,6 +109,16 @@ async fn an_actor_initialized_and_exited_explicitly() {
 }
 
 #[tokio::test]
+async fn listeners_registered_before_init_are_attached_by_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("listen-before-init", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("EXIT LISTENER kept"), "{stdout}");
+    assert!(!stdout.contains("EXIT LISTENER removed"), "{stdout}");
+}
+
+#[tokio::test]
 async fn the_actor_panics_before_init() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("before-init", &[], dir.path()).await;
@@ -479,6 +489,18 @@ fn child() {
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 let exit_code = if scenario == "fail-code" { 3 } else { apify::exit_codes::SUCCESS };
                 Actor::fail(apify::ExitOptions { exit_code, ..apify::ExitOptions::default() }).await;
+            }
+            "listen-before-init" => {
+                let listener = |name: &'static str| {
+                    move |_| async move {
+                        println!("EXIT LISTENER {name}");
+                    }
+                };
+                Actor::on(crawlee::core::EventKind::Exit, listener("kept"));
+                let removed = Actor::on(crawlee::core::EventKind::Exit, listener("removed"));
+                Actor::off(removed);
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                Actor::exit(apify::ExitOptions::default()).await;
             }
             "before-init" => {
                 Actor::is_at_home();

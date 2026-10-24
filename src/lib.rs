@@ -15,7 +15,9 @@ pub mod proxy;
 pub mod storage;
 pub mod url_filters;
 
-pub use crate::actor::{Actor, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes};
+pub use crate::actor::{
+    Actor, ActorListenerId, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes,
+};
 pub use crate::client::{RateLimitCounter, new_client};
 pub use crate::configuration::Configuration;
 pub use crate::input::{ActorInputError, ActorInputErrorCode, Input};

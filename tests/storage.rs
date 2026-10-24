@@ -238,7 +238,7 @@ async fn a_resurrected_run_deduplicates_from_the_prefetched_queue() {
 }
 
 #[tokio::test]
-async fn rate_limited_calls_are_retried_and_counted() {
+async fn rate_limited_calls_are_retried_and_counted_by_attempt() {
     let api = FakeApi::start().await;
     let backend = Arc::new(ApifyStorageBackend::new(configuration(&api, true)));
     let services = Services::new(backend.clone());
@@ -247,8 +247,11 @@ async fn rate_limited_calls_are_retried_and_counted() {
     api.rate_limit_next(2);
     dataset.push_data(&json!({ "a": 1 })).await.unwrap();
     assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 1);
+    assert_eq!(backend.rate_limits().by_attempt(), [1, 1]);
+    // As in the JS SDK, whose `ApifyStorageBackend` has no `stats`: the storage load signal of
+    // autoscaling sees no rate limits.
     use crawlee::core::StorageBackend as _;
-    assert_eq!(backend.rate_limit_errors(), 2);
+    assert_eq!(backend.rate_limit_errors(), 0);
 }
 
 #[tokio::test]

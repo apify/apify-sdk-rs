@@ -145,6 +145,13 @@ impl ApifyStorageBackend {
         &self.client
     }
 
+    /// The rate-limited calls of [`client`](Self::client) (`client.stats.rateLimitErrors` in JS).
+    /// Not reported to autoscaling as [`StorageBackend::rate_limit_errors`]: the JS SDK's backend
+    /// has no `stats`, so its storage load signal never sees a rate limit.
+    pub fn rate_limits(&self) -> &RateLimitCounter {
+        &self.rate_limits
+    }
+
     async fn get_exists(&self, id: &str, kind: StorageKind) -> StorageResult<Option<String>> {
         let found = match kind {
             StorageKind::Dataset => self.client.dataset(id).get().await.map_err(backend_error)?.map(|s| s.id),
@@ -305,10 +312,7 @@ impl StorageBackend for ApifyStorageBackend {
     }
 
     // `purge` keeps the default no-op: the platform gives every run empty default storages.
-
-    fn rate_limit_errors(&self) -> u64 {
-        self.rate_limits.get()
-    }
+    // `rate_limit_errors` keeps the default 0, see `rate_limits`.
 }
 
 /// The storage backend of an Actor: [`ApifyStorageBackend`] on the platform, `local` elsewhere,

@@ -80,7 +80,7 @@ input schema. Copy it and `apify push`.
 | **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |
 | **Charging** | Pay-per-event: budget limits, the `apify-default-dataset-item` event charged as items are stored, `push_data_and_charge`, the local charging log |
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
-| **Autoscaling** | Rate-limited API calls (429) count toward the storage load signal |
+| **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 
 ## Testing
 

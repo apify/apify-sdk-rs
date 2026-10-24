@@ -60,8 +60,8 @@ pub struct Configuration {
     pub proxy_status_url: String,
     /// `APIFY_USER_ID`.
     pub user_id: Option<String>,
-    /// `APIFY_USER_IS_PAYING`.
-    pub user_is_paying: Option<String>,
+    /// `APIFY_USER_IS_PAYING`: whether the user who started the run is paying.
+    pub user_is_paying: bool,
     /// `ACTOR_PERMISSION_LEVEL`.
     pub actor_permission_level: Option<String>,
     /// `APIFY_INPUT_SECRETS_PRIVATE_KEY_PASSPHRASE`.
@@ -92,7 +92,7 @@ impl Default for Configuration {
 }
 
 /// `'0'` and `'false'` (any case) are false; any other value is true (`coerceBoolean` in JS).
-fn parse_bool(value: &str) -> bool {
+pub(crate) fn parse_bool(value: &str) -> bool {
     !matches!(value.to_ascii_lowercase().as_str(), "0" | "false")
 }
 
@@ -244,7 +244,7 @@ impl Configuration {
                 "http://proxy.apify.com",
             ),
             user_id: sources.string(&["APIFY_USER_ID"], "userId"),
-            user_is_paying: sources.string(&["APIFY_USER_IS_PAYING"], "userIsPaying"),
+            user_is_paying: sources.bool_or(&["APIFY_USER_IS_PAYING"], "userIsPaying", false),
             actor_permission_level: sources.string(&["ACTOR_PERMISSION_LEVEL"], "actorPermissionLevel"),
             input_secrets_private_key_passphrase: sources
                 .string(&["APIFY_INPUT_SECRETS_PRIVATE_KEY_PASSPHRASE"], "inputSecretsPrivateKeyPassphrase"),

@@ -61,9 +61,9 @@ const CONFIGURATION_FIELDS = [
 
 const configurationCases: Record<string, string>[] = [
     {},
-    { APIFY_IS_AT_HOME: '1', ACTOR_MEMORY_MBYTES: '4096', ACTOR_RUN_ID: 'run', APIFY_TOKEN: 'secret' },
+    { APIFY_IS_AT_HOME: '1', ACTOR_MEMORY_MBYTES: '4096', ACTOR_RUN_ID: 'run', APIFY_TOKEN: 'secret', APIFY_USER_IS_PAYING: '1' },
     { APIFY_IS_AT_HOME: '1', CRAWLEE_AVAILABLE_MEMORY_RATIO: '0.5' },
-    { APIFY_IS_AT_HOME: 'false' },
+    { APIFY_IS_AT_HOME: 'false', APIFY_USER_IS_PAYING: 'false' },
     { APIFY_IS_AT_HOME: '0', APIFY_AVAILABLE_MEMORY_RATIO: '0.8', CRAWLEE_AVAILABLE_MEMORY_RATIO: '0.3' },
     {
         ACTOR_DEFAULT_DATASET_ID: 'actor-ds', APIFY_DEFAULT_DATASET_ID: 'apify-ds',

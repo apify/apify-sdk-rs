@@ -50,7 +50,7 @@ jobs:
   conformance:
     runs-on: ubuntu-latest
     env:
-      APIFY_SDK_JS_REV: a57cfb86429368561a9db2787cc647c808450ae0
+      APIFY_SDK_JS_REV: fbcdc9c2742f61cd45eb56ad504337b4ce3e6695
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

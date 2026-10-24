@@ -114,7 +114,8 @@ pub struct ApifyEnv {
     pub timeout_at: Option<DateTime<Utc>>,
     pub token: Option<String>,
     pub user_id: Option<String>,
-    pub user_is_paying: Option<String>,
+    /// Whether the user who started the run is paying. `false` when not set.
+    pub user_is_paying: bool,
 }
 
 impl ApifyEnv {
@@ -160,7 +161,8 @@ impl ApifyEnv {
             timeout_at: date(&["ACTOR_TIMEOUT_AT", "APIFY_TIMEOUT_AT"]),
             token: var(&["APIFY_TOKEN"]),
             user_id: var(&["APIFY_USER_ID"]),
-            user_is_paying: var(&["APIFY_USER_IS_PAYING"]),
+            user_is_paying: var(&["APIFY_USER_IS_PAYING"])
+                .is_some_and(|value| crate::configuration::parse_bool(&value)),
         }
     }
 }
@@ -313,6 +315,7 @@ mod tests {
                 "ACTOR_MEMORY_MBYTES" => Some("4096"),
                 "ACTOR_TIMEOUT_AT" => Some("2026-01-01T10:00:00.000Z"),
                 "APIFY_IS_AT_HOME" => Some("1"),
+                "APIFY_USER_IS_PAYING" => Some("true"),
                 _ => None,
             }
             .map(str::to_owned)
@@ -322,6 +325,9 @@ mod tests {
         assert_eq!(env.memory_mbytes, Some(4096));
         assert_eq!(env.timeout_at.unwrap().to_rfc3339(), "2026-01-01T10:00:00+00:00");
         assert!(env.is_at_home);
+        assert!(env.user_is_paying);
         assert_eq!(env.token, None);
+        assert!(!ApifyEnv::from_vars(|_| None).user_is_paying, "false when not set");
+        assert!(!ApifyEnv::from_vars(|name| (name == "APIFY_USER_IS_PAYING").then(|| "0".to_owned())).user_is_paying);
     }
 }

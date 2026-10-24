@@ -122,8 +122,11 @@ fn storage_error(err: crawlee::core::StorageError) -> ApifyClientError {
 /// The child runs of this run (`ChildRunTracker` in JS).
 pub(crate) struct ChildRunTracker {
     services: Services,
-    /// Loaded from the default key-value store on first use; the lock also orders the writes.
-    tracked: tokio::sync::Mutex<Option<IndexMap<String, TrackedChildRun>>>,
+    /// The tracked runs loaded so far.
+    runs: Mutex<IndexMap<String, TrackedChildRun>>,
+    /// Whether the runs were loaded from the default key-value store; held while they are loaded
+    /// or written, so that they are loaded once and written in order.
+    io: tokio::sync::Mutex<bool>,
     /// The client each name was last started or resumed with in this process, to keep a token.
     clients: Mutex<HashMap<String, ApifyClient>>,
     /// One start or resume at a time per name.
@@ -134,7 +137,8 @@ impl ChildRunTracker {
     pub(crate) fn new(services: Services) -> Self {
         ChildRunTracker {
             services,
-            tracked: tokio::sync::Mutex::default(),
+            runs: Mutex::default(),
+            io: tokio::sync::Mutex::default(),
             clients: Mutex::default(),
             locks: Mutex::default(),
         }
@@ -142,38 +146,36 @@ impl ChildRunTracker {
 
     /// Loads the tracked runs from the default key-value store, once.
     pub(crate) async fn load(&self) -> ApifyClientResult<()> {
-        let mut tracked = self.tracked.lock().await;
-        self.loaded(&mut tracked).await?;
+        let mut loaded = self.io.lock().await;
+        self.ensure_loaded(&mut loaded).await
+    }
+
+    async fn ensure_loaded(&self, loaded: &mut bool) -> ApifyClientResult<()> {
+        if *loaded {
+            return Ok(());
+        }
+        let store = self.services.open_key_value_store(&StorageIdentifier::Default).await.map_err(storage_error)?;
+        let stored: Option<Value> = store.get_value(CHILD_RUNS_KVS_KEY).await.map_err(storage_error)?;
+        let runs =
+            serde_json::from_value(stored.unwrap_or_else(|| Value::Object(Default::default()))).map_err(|err| {
+                ApifyClientError::InvalidResponse(format!(
+                    "The child runs stored under the \"{CHILD_RUNS_KVS_KEY}\" key in the default key-value store are \
+                 malformed: {err}"
+                ))
+            })?;
+        *self.runs.lock() = runs;
+        *loaded = true;
         Ok(())
     }
 
-    async fn loaded<'a>(
-        &self,
-        tracked: &'a mut Option<IndexMap<String, TrackedChildRun>>,
-    ) -> ApifyClientResult<&'a mut IndexMap<String, TrackedChildRun>> {
-        if tracked.is_none() {
-            let store = self.services.open_key_value_store(&StorageIdentifier::Default).await.map_err(storage_error)?;
-            let stored: Option<Value> = store.get_value(CHILD_RUNS_KVS_KEY).await.map_err(storage_error)?;
-            let runs =
-                serde_json::from_value(stored.unwrap_or_else(|| Value::Object(Default::default()))).map_err(|err| {
-                    ApifyClientError::InvalidResponse(format!(
-                        "The child runs stored under the \"{CHILD_RUNS_KVS_KEY}\" key in the default key-value store \
-                         are malformed: {err}"
-                    ))
-                })?;
-            *tracked = Some(runs);
-        }
-        Ok(tracked.as_mut().expect("loaded"))
-    }
-
-    async fn persist(&self, tracked: &IndexMap<String, TrackedChildRun>) -> ApifyClientResult<()> {
+    async fn persist(&self, runs: &IndexMap<String, TrackedChildRun>) -> ApifyClientResult<()> {
         let store = self.services.open_key_value_store(&StorageIdentifier::Default).await.map_err(storage_error)?;
-        store.set_value(CHILD_RUNS_KVS_KEY, tracked).await.map_err(storage_error)
+        store.set_value(CHILD_RUNS_KVS_KEY, runs).await.map_err(storage_error)
     }
 
     async fn get(&self, run_name: &str) -> ApifyClientResult<Option<TrackedChildRun>> {
-        let mut tracked = self.tracked.lock().await;
-        Ok(self.loaded(&mut tracked).await?.get(run_name).cloned())
+        self.load().await?;
+        Ok(self.runs.lock().get(run_name).cloned())
     }
 
     /// Returns the run tracked under `run_name` when it is in progress or succeeded, resurrects it
@@ -242,41 +244,49 @@ impl ChildRunTracker {
         request: &ChildRunRequest,
         replaced_status: String,
     ) -> ApifyClientResult<()> {
-        let mut tracked = self.tracked.lock().await;
-        let runs = self.loaded(&mut tracked).await?;
-        let history = match runs.get(run_name) {
-            Some(previous) => {
-                let mut history = previous.history.clone();
-                history.push(ChildRunInfo { status: replaced_status, ..previous.run.clone() });
-                history
-            }
-            None => Vec::new(),
+        let mut loaded = self.io.lock().await;
+        self.ensure_loaded(&mut loaded).await?;
+        let runs = {
+            let mut runs = self.runs.lock();
+            let history = match runs.get(run_name) {
+                Some(previous) => {
+                    let mut history = previous.history.clone();
+                    history.push(ChildRunInfo { status: replaced_status, ..previous.run.clone() });
+                    history
+                }
+                None => Vec::new(),
+            };
+            let tracked = TrackedChildRun { run: info(run), checksum: request.checksum(), history };
+            runs.insert(run_name.to_owned(), tracked);
+            runs.clone()
         };
-        runs.insert(run_name.to_owned(), TrackedChildRun { run: info(run), checksum: request.checksum(), history });
-        self.persist(runs).await
+        self.persist(&runs).await
     }
 
     /// Records the latest state of the run tracked under `run_name`.
     pub(crate) async fn update(&self, run_name: &str, run: &ActorRun) -> ApifyClientResult<()> {
-        let mut tracked = self.tracked.lock().await;
-        let runs = self.loaded(&mut tracked).await?;
-        let Some(current) = runs.get_mut(run_name) else { return Ok(()) };
-        let status = status(run);
-        if current.run.run_id != run.id || current.run.status == status {
-            return Ok(());
-        }
-        current.run.status = status.to_owned();
-        self.persist(runs).await
+        let mut loaded = self.io.lock().await;
+        self.ensure_loaded(&mut loaded).await?;
+        let runs = {
+            let mut runs = self.runs.lock();
+            let Some(current) = runs.get_mut(run_name) else { return Ok(()) };
+            let status = status(run);
+            if current.run.run_id != run.id || current.run.status == status {
+                return Ok(());
+            }
+            current.run.status = status.to_owned();
+            runs.clone()
+        };
+        self.persist(&runs).await
     }
 
     /// A client of the current run under each name loaded so far: the client the name was last
     /// started or resumed with in this process, or `default_client`.
-    pub(crate) async fn run_clients(&self, default_client: &ApifyClient) -> IndexMap<String, RunClient> {
-        let tracked = self.tracked.lock().await;
+    pub(crate) fn run_clients(&self, default_client: &ApifyClient) -> IndexMap<String, RunClient> {
         let clients = self.clients.lock();
-        tracked
+        self.runs
+            .lock()
             .iter()
-            .flatten()
             .map(|(name, tracked)| {
                 let client = clients.get(name).unwrap_or(default_client);
                 (name.clone(), client.run(tracked.run.run_id.clone()))

@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::actor::Actor;
 use crate::child_runs::ChildRunRequest;
+use crate::run_log::StreamedLog;
 
 /// The shortest run timeout `RunTimeout::Inherit` gives, as in JS.
 const MINIMUM_API_TIMEOUT_SECS: i64 = 1;
@@ -46,6 +47,19 @@ pub struct CallOptions {
     /// Actor, task or input is an error, unless the tracked run is replaced. See
     /// [`Actor::child_runs`].
     pub run_name: Option<String>,
+    /// Where `call` puts the log of the Actor run it started.
+    pub log: RunLog,
+}
+
+/// Where [`Actor::call`] puts the log of the run it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunLog {
+    /// Into this run's log while the run is waited for, each message prefixed with the name of the
+    /// Actor and the run id.
+    #[default]
+    Redirect,
+    /// Nowhere (`log: null` in JS).
+    Off,
 }
 
 /// Options of [`Actor::resurrect`]. Options left out keep the values of the original run.
@@ -230,13 +244,14 @@ impl Actor {
         start
     }
 
-    /// Starts an Actor or a task (`kind`), or with a run name, the run tracked under it.
+    /// Starts an Actor or a task (`kind`), or with a run name, the run tracked under it. Also
+    /// returns whether that run was resumed rather than started.
     async fn start_run<T: Serialize>(
         kind: &'static str,
         id: &str,
         input: Option<&T>,
         options: &CallOptions,
-    ) -> ApifyClientResult<ActorRun> {
+    ) -> ApifyClientResult<(ActorRun, bool)> {
         let client = Self::client_for(options.token.as_deref());
         let start = Self::start_options(options);
         let start_new = |start: ActorStartOptions| async {
@@ -245,7 +260,7 @@ impl Actor {
                 _ => client.actor(id).start(input, start).await,
             }
         };
-        let Some(run_name) = &options.run_name else { return start_new(start).await };
+        let Some(run_name) = &options.run_name else { return Ok((start_new(start).await?, false)) };
         let request = ChildRunRequest { kind, id: id.to_owned(), input: input.map(serde_json::to_value).transpose()? };
         let resurrect = RunResurrectOptions {
             build: start.build.clone(),
@@ -256,8 +271,7 @@ impl Actor {
             restart_on_error: start.restart_on_error,
         };
         let tracker = Self::child_run_tracker();
-        let (run, _) = tracker.start_or_resume(&client, run_name, request, resurrect, || start_new(start)).await?;
-        Ok(run)
+        tracker.start_or_resume(&client, run_name, request, resurrect, || start_new(start)).await
     }
 
     /// Starts an Actor or a task and waits for its run to finish.
@@ -269,16 +283,27 @@ impl Actor {
     ) -> ApifyClientResult<ActorRun> {
         let client = Self::client_for(options.token.as_deref());
         let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        let Some(run_name) = &options.run_name else {
-            let start = Self::start_options(&options);
-            return match kind {
-                "task" => client.task(id).call(input, start, wait).await,
-                _ => client.actor(id).call(input, start, wait).await,
-            };
+        if kind == "task" && options.run_name.is_none() {
+            return client.task(id).call(input, Self::start_options(&options), wait).await;
+        }
+        let (run, resumed) = Self::start_run(kind, id, input, &options).await?;
+        // As the JS client's `call` does for an Actor (not a task); the earlier part of a resumed
+        // run's log was redirected before this run restarted.
+        let streamed_log = match (kind, options.log) {
+            ("actor", RunLog::Redirect) => {
+                let token = options.token.as_deref().or(Self::configuration().token.as_deref());
+                Some(StreamedLog::start(&client, token, &run.id, !resumed).await?)
+            }
+            _ => None,
         };
-        let run = Self::start_run(kind, id, input, &options).await?;
-        let finished = client.run(run.id).wait_for_finish(wait).await?;
-        Self::child_run_tracker().update(run_name, &finished).await?;
+        let finished = client.run(run.id).wait_for_finish(wait).await;
+        if let Some(streamed_log) = streamed_log {
+            streamed_log.stop().await;
+        }
+        let finished = finished?;
+        if let Some(run_name) = &options.run_name {
+            Self::child_run_tracker().update(run_name, &finished).await?;
+        }
         Ok(finished)
     }
 
@@ -297,7 +322,7 @@ impl Actor {
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        Self::start_run("actor", actor_id, input, &options).await
+        Ok(Self::start_run("actor", actor_id, input, &options).await?.0)
     }
 
     /// Runs a task, with `input` overriding the task's input, and waits for the run to finish.
@@ -316,7 +341,7 @@ impl Actor {
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        Self::start_run("task", task_id, input, &options).await
+        Ok(Self::start_run("task", task_id, input, &options).await?.0)
     }
 
     /// Resurrects a finished run (`SUCCEEDED`, `FAILED`, `ABORTED` or `TIMED-OUT`): it goes back
@@ -335,14 +360,14 @@ impl Actor {
     /// current run under its name, with the token it was started with in this process. The
     /// tracked runs, with the runs replaced under each name, are kept in the default key-value
     /// store under `__ACTOR_CHILD_RUNS`.
-    pub async fn child_runs() -> IndexMap<String, RunClient> {
-        Self::child_run_tracker().run_clients(Self::client()).await
+    pub fn child_runs() -> IndexMap<String, RunClient> {
+        Self::child_run_tracker().run_clients(Self::client())
     }
 
     /// Aborts a run. The status message goes to the aborted run.
     pub async fn abort(run_id: &str, options: AbortOptions) -> ApifyClientResult<ActorRun> {
         let client = Self::client_for(options.token.as_deref());
-        if let Some(message) = &options.status_message {
+        if let Some(message) = options.status_message.as_ref().filter(|message| !message.is_empty()) {
             let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": true });
             client.run(run_id).update(&body).await?;
         }

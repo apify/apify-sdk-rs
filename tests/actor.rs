@@ -283,7 +283,16 @@ async fn the_platform_api() {
     let dir = tempfile::tempdir().unwrap();
     let mut vars = platform_env(&api, None);
     vars.push(("ACTOR_TIMEOUT_AT", (chrono::Utc::now() + chrono::Duration::seconds(100)).to_rfc3339()));
-    assert_exit(&run_child("platform", &vars, dir.path()).await, 0);
+    let log = "2026-01-01T00:00:00.000Z Hello from the child\n  with a second line\n2026-01-01T00:00:01.000Z Done";
+    api.set_run_log("child-1", log);
+    let output = run_child("platform", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    // The log of a called run is redirected into this run's log.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in ["2026-01-01T00:00:00.000Z Hello from the child\n  with a second line", "2026-01-01T00:00:01.000Z Done"]
+    {
+        assert!(stdout.contains(&format!("hello-world runId:child-1 -> {line}")), "{stdout}");
+    }
 
     let calls = api.platform_calls();
     let paths: Vec<&str> = calls.iter().map(|(path, _, _)| path.as_str()).collect();
@@ -295,6 +304,7 @@ async fn the_platform_api() {
             "/v2/actor-tasks/user~task/runs",
             "/v2/actor-runs/old-run/resurrect",
             "/v2/actor-runs/other-run/abort",
+            "/v2/actor-runs/quiet-run/abort",
             "/v2/webhooks",
             "/v2/actor-runs/run-1/metamorph",
         ]
@@ -308,12 +318,12 @@ async fn the_platform_api() {
     assert_eq!((&calls[3].1["timeout"], &calls[3].1["memory"]), (&"60".to_owned(), &"256".to_owned()));
     assert_eq!(calls[4].1["gracefully"], "1");
     assert_eq!(
-        calls[5].2,
+        calls[6].2,
         json!({ "eventTypes": ["ACTOR.RUN.SUCCEEDED"], "requestUrl": "https://example.com/hook", "isAdHoc": true,
                 "condition": { "actorRunId": "run-1" } })
     );
-    assert_eq!(calls[6].1["targetActorId"], "apify~other");
-    // The status message of an aborted run goes to that run.
+    assert_eq!(calls[7].1["targetActorId"], "apify~other");
+    // The status message of an aborted run goes to that run; an empty one is not set.
     let updates = api.run_updates();
     assert_eq!(updates, [json!({ "statusMessage": "Stopped by the parent", "isStatusMessageTerminal": true })]);
     let (state, _) = api.record(DEFAULT_STORE, "APIFY_GLOBAL_STATE").expect("state saved");
@@ -473,6 +483,8 @@ fn child() {
                         ..Default::default()
                     };
                     Actor::abort("other-run", abort).await?;
+                    let quiet = apify::AbortOptions { status_message: Some(String::new()), ..Default::default() };
+                    Actor::abort("quiet-run", quiet).await?;
                     let webhook = apify::WebhookOptions {
                         event_types: vec!["ACTOR.RUN.SUCCEEDED".to_owned()],
                         request_url: "https://example.com/hook".to_owned(),
@@ -571,7 +583,7 @@ fn child() {
                 {
                     println!("REUSED {message}");
                 }
-                let mut names: Vec<String> = Actor::child_runs().await.into_keys().collect();
+                let mut names: Vec<String> = Actor::child_runs().into_keys().collect();
                 names.sort();
                 println!("CHILD RUNS {names:?}");
                 Actor::exit(apify::ExitOptions::default()).await;

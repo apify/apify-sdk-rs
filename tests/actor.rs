@@ -83,8 +83,16 @@ async fn a_failing_user_function_exits_with_91() {
     let output = run_child("fail", &platform_env(&api, None), dir.path()).await;
     assert_exit(&output, 91);
     assert!(String::from_utf8_lossy(&output.stdout).contains("boom"));
-    // The exit options of `main_with` are kept (the JS SDK drops them).
+    // The exit options of `main_with` are kept.
     assert_eq!(terminal_messages(&api), ["Done"]);
+}
+
+#[tokio::test]
+async fn fail_exits_with_1_or_the_code_given() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("fail-default", &platform_env(&api, None), dir.path()).await, 1);
+    assert_exit(&run_child("fail-code", &platform_env(&api, None), dir.path()).await, 3);
 }
 
 /// `Actor::init` and `exit` without `Actor::main`, and the functions of the Actor in between.
@@ -98,6 +106,59 @@ async fn an_actor_initialized_and_exited_explicitly() {
     assert_exit(&output, 0);
     assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "echo": { "greeting": "hi" } })]);
     assert_eq!(terminal_messages(&api), ["Echoed"]);
+}
+
+#[tokio::test]
+async fn listeners_registered_before_init_are_attached_by_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("listen-before-init", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The listeners of the exit see its options.
+    assert!(stdout.contains(r#"EXIT LISTENER kept Some("Bye")"#), "{stdout}");
+    assert!(!stdout.contains("EXIT LISTENER removed"), "{stdout}");
+}
+
+#[tokio::test]
+async fn status_messages_are_logged_at_their_level_and_return_the_updated_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("status-local", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[Status message]: at info by default"), "{stdout}");
+    assert!(!stdout.contains("[Status message]: at debug"), "{stdout}");
+}
+
+#[tokio::test]
+async fn named_child_runs_are_reused_resurrected_or_replaced_after_a_restart() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let vars = platform_env(&api, None);
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-1 child-2 child-3"), "{stdout}");
+    assert!(stdout.contains(r#"The run name "a" was already used for a different Actor, task or input."#), "{stdout}");
+    assert!(stdout.contains(r#"CHILD RUNS ["a", "b", "c"]"#), "{stdout}");
+    let starts = |api: &FakeApi| -> Vec<String> { api.platform_calls().into_iter().map(|(path, _, _)| path).collect() };
+    assert_eq!(starts(&api), ["/v2/actors/user~a/runs", "/v2/actor-tasks/user~b/runs", "/v2/actors/user~c/runs"]);
+
+    // After a restart: the aborted run is resurrected, the failed one replaced and the succeeded one kept.
+    api.set_run_status("child-1", "ABORTED");
+    api.set_run_status("child-2", "FAILED");
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-1 child-4 child-3"), "{stdout}");
+    assert_eq!(starts(&api)[3..], ["/v2/actor-runs/child-1/resurrect", "/v2/actor-tasks/user~b/runs"]);
+    let (stored, _) = api.record(DEFAULT_STORE, "__ACTOR_CHILD_RUNS").unwrap();
+    let stored: Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(stored["a"]["status"], "RUNNING");
+    assert_eq!(stored["b"]["runId"], "child-4");
+    assert_eq!(
+        stored["b"]["history"],
+        json!([{ "runId": "child-2", "status": "FAILED", "startedAt": "2026-01-01T00:00:00.000Z" }])
+    );
 }
 
 #[tokio::test]
@@ -174,23 +235,30 @@ async fn a_local_run_reads_its_input_from_the_working_directory() {
 }
 
 #[tokio::test]
-async fn a_local_run_falls_back_to_the_storage_directory_after_the_working_directory() {
+async fn a_local_run_reads_the_default_store_directory_but_not_next_to_a_working_directory_file() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("storage")).unwrap();
-    std::fs::write(dir.path().join("storage/INPUT.json"), r#"{"from":"storage"}"#).unwrap();
-    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
-    let read_item = || -> Value {
-        serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("storage/datasets/default/000000001.json")).unwrap(),
-        )
-        .unwrap()
-    };
-    assert_eq!(read_item(), json!({ "echo": { "from": "storage" } }));
+    // Where `apify run` writes the input; the in-memory backend never reads it.
+    let in_memory = [("CRAWLEE_PERSIST_STORAGE", "false".to_owned())];
+    std::fs::create_dir_all(dir.path().join("storage/key_value_stores/default")).unwrap();
+    std::fs::write(dir.path().join("storage/key_value_stores/default/INPUT.json"), r#"{"from":"storage"}"#).unwrap();
+    // The storage root is not looked at.
+    std::fs::write(dir.path().join("storage/INPUT.json"), r#"{"from":"root"}"#).unwrap();
+    let output = run_child("echo-stdout", &in_memory, dir.path()).await;
+    assert_exit(&output, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains(r#"ECHO {"from":"storage"}"#));
 
     std::fs::write(dir.path().join("INPUT.json"), r#"{"from":"cwd"}"#).unwrap();
-    std::fs::remove_dir_all(dir.path().join("storage/key_value_stores")).unwrap();
-    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
-    assert_eq!(read_item(), json!({ "echo": { "from": "cwd" } }));
+    for vars in [&in_memory[..], &[]] {
+        let output = run_child("echo-stdout", vars, dir.path()).await;
+        assert_exit(&output, 91);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(
+                r#"Found the input both in the default key-value store and in a "INPUT" or "INPUT.json" file in the working directory. Keep only one of them."#
+            ),
+            "{stdout}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -201,7 +269,7 @@ async fn missing_input_and_late_init_are_errors() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working or storage directory."#
+            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working or default key-value store directory."#
         ),
         "{stdout}"
     );
@@ -215,7 +283,16 @@ async fn the_platform_api() {
     let dir = tempfile::tempdir().unwrap();
     let mut vars = platform_env(&api, None);
     vars.push(("ACTOR_TIMEOUT_AT", (chrono::Utc::now() + chrono::Duration::seconds(100)).to_rfc3339()));
-    assert_exit(&run_child("platform", &vars, dir.path()).await, 0);
+    let log = "2026-01-01T00:00:00.000Z Hello from the child\n  with a second line\n2026-01-01T00:00:01.000Z Done";
+    api.set_run_log("child-1", log);
+    let output = run_child("platform", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    // The log of a called run is redirected into this run's log.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in ["2026-01-01T00:00:00.000Z Hello from the child\n  with a second line", "2026-01-01T00:00:01.000Z Done"]
+    {
+        assert!(stdout.contains(&format!("hello-world runId:child-1 -> {line}")), "{stdout}");
+    }
 
     let calls = api.platform_calls();
     let paths: Vec<&str> = calls.iter().map(|(path, _, _)| path.as_str()).collect();
@@ -224,7 +301,10 @@ async fn the_platform_api() {
         [
             "/v2/actors/apify~hello-world/runs",
             "/v2/actor-tasks/user~task/runs",
+            "/v2/actor-tasks/user~task/runs",
+            "/v2/actor-runs/old-run/resurrect",
             "/v2/actor-runs/other-run/abort",
+            "/v2/actor-runs/quiet-run/abort",
             "/v2/webhooks",
             "/v2/actor-runs/run-1/metamorph",
         ]
@@ -234,14 +314,16 @@ async fn the_platform_api() {
     let timeout: i64 = query["timeout"].parse().unwrap();
     assert!((95..=100).contains(&timeout), "the remaining time of this run: {timeout}");
     assert_eq!(calls[1].1["memory"], "512");
-    assert_eq!(calls[2].1["gracefully"], "1");
+    assert_eq!((&calls[2].1["timeout"], &calls[2].2), (&"60".to_owned(), &json!({ "b": 2 })));
+    assert_eq!((&calls[3].1["timeout"], &calls[3].1["memory"]), (&"60".to_owned(), &"256".to_owned()));
+    assert_eq!(calls[4].1["gracefully"], "1");
     assert_eq!(
-        calls[3].2,
+        calls[6].2,
         json!({ "eventTypes": ["ACTOR.RUN.SUCCEEDED"], "requestUrl": "https://example.com/hook", "isAdHoc": true,
                 "condition": { "actorRunId": "run-1" } })
     );
-    assert_eq!(calls[4].1["targetActorId"], "apify~other");
-    // The status message of an aborted run goes to that run.
+    assert_eq!(calls[7].1["targetActorId"], "apify~other");
+    // The status message of an aborted run goes to that run; an empty one is not set.
     let updates = api.run_updates();
     assert_eq!(updates, [json!({ "statusMessage": "Stopped by the parent", "isStatusMessageTerminal": true })]);
     let (state, _) = api.record(DEFAULT_STORE, "APIFY_GLOBAL_STATE").expect("state saved");
@@ -356,6 +438,14 @@ fn child() {
                 })
                 .await
             }
+            "echo-stdout" => {
+                Actor::main(|| async move {
+                    let input: Value = Actor::get_input().await?;
+                    println!("ECHO {input}");
+                    Ok(())
+                })
+                .await
+            }
             "fail" => {
                 let exit = apify::ExitOptions::message("Done");
                 Actor::main_with(apify::InitOptions::default(), exit, || async { anyhow::bail!("boom") }).await
@@ -380,12 +470,21 @@ fn child() {
                     let mut options = apify::CallOptions::default();
                     options.start.memory_mbytes = Some(512);
                     Actor::call_task("user/task", None::<&Value>, options).await?;
+                    let minute = apify::RunTimeout::Duration(Duration::from_secs(60));
+                    let options = apify::CallOptions { timeout: Some(minute), ..Default::default() };
+                    let run = Actor::start_task("user/task", Some(&json!({ "b": 2 })), options).await?;
+                    assert_eq!(run.status.as_deref(), Some("READY"), "not waited for");
+                    let mut resurrect = apify::ResurrectOptions { timeout: Some(minute), ..Default::default() };
+                    resurrect.resurrect.memory_mbytes = Some(256);
+                    Actor::resurrect("old-run", resurrect).await?;
                     let abort = apify::AbortOptions {
                         status_message: Some("Stopped by the parent".to_owned()),
                         gracefully: Some(true),
                         ..Default::default()
                     };
                     Actor::abort("other-run", abort).await?;
+                    let quiet = apify::AbortOptions { status_message: Some(String::new()), ..Default::default() };
+                    Actor::abort("quiet-run", quiet).await?;
                     let webhook = apify::WebhookOptions {
                         event_types: vec!["ACTOR.RUN.SUCCEEDED".to_owned()],
                         request_url: "https://example.com/hook".to_owned(),
@@ -448,7 +547,60 @@ fn child() {
                 }
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 echo().await.unwrap();
+                assert_eq!(Actor::get_value_or("MISSING", json!({ "default": true })).await.unwrap()["default"], true);
+                assert_eq!(Actor::get_value_or("INPUT", json!(null)).await.unwrap()["greeting"], "hi");
+                let run = Actor::set_status_message("Working", apify::StatusMessageOptions::default()).await;
+                assert!(run.is_some(), "the updated run");
                 Actor::exit(apify::ExitOptions::message("Echoed")).await;
+            }
+            "fail-default" | "fail-code" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let exit_code = if scenario == "fail-code" { 3 } else { apify::exit_codes::SUCCESS };
+                Actor::fail(apify::ExitOptions { exit_code, ..apify::ExitOptions::default() }).await;
+            }
+            "status-local" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let debug = apify::StatusMessageOptions {
+                    level: Some(crawlee::core::StatusLevel::Debug),
+                    ..apify::StatusMessageOptions::default()
+                };
+                assert!(Actor::set_status_message("at debug", debug).await.is_none(), "no run to update");
+                Actor::set_status_message("at info by default", apify::StatusMessageOptions::default()).await;
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "child-runs" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let named = |name: &str| apify::CallOptions {
+                    run_name: Some(name.to_owned()),
+                    ..apify::CallOptions::default()
+                };
+                let a = Actor::start("user/a", Some(&json!({ "n": 1 })), named("a")).await.unwrap();
+                let b = Actor::start_task("user/b", None::<&Value>, named("b")).await.unwrap();
+                let c = Actor::start("user/c", None::<&Value>, named("c")).await.unwrap();
+                println!("RUNS {} {} {}", a.id, b.id, c.id);
+                if let Err(apify::ApifyClientError::InvalidArgument(message)) =
+                    Actor::start("user/other", None::<&Value>, named("a")).await
+                {
+                    println!("REUSED {message}");
+                }
+                let mut names: Vec<String> = Actor::child_runs().into_keys().collect();
+                names.sort();
+                println!("CHILD RUNS {names:?}");
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "listen-before-init" => {
+                let listener = |name: &'static str| {
+                    move |event| async move {
+                        let crawlee::core::Event::Exit(options) = event else { return };
+                        let message = options.status_message;
+                        println!("EXIT LISTENER {name} {message:?}");
+                    }
+                };
+                Actor::on(crawlee::core::EventKind::Exit, listener("kept"));
+                let removed = Actor::on(crawlee::core::EventKind::Exit, listener("removed"));
+                Actor::off(removed);
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                Actor::exit(apify::ExitOptions::message("Bye")).await;
             }
             "before-init" => {
                 Actor::is_at_home();

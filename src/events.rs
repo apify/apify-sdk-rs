@@ -2,6 +2,8 @@
 //! (`ACTOR_EVENTS_WEBSOCKET_URL`) as `{"name": ..., "data": ...}` messages. They are relayed to a
 //! crawlee-rs [`EventManager`], like `PlatformEventManager` of the JS SDK does.
 
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Utc};
 use crawlee::core::{Event, EventManager, SystemInfo};
 use futures_util::StreamExt as _;
@@ -54,47 +56,130 @@ pub(crate) fn relay(message: &str, events: &EventManager, memory_limit_bytes: Op
             events.emit(Event::PersistState { is_migrating: true });
         }
         names::ABORTING => events.emit(Event::Aborting),
-        names::EXIT => events.emit(Event::Exit),
+        names::EXIT => events.emit(Event::Exit(Default::default())),
         _ => events.emit(Event::Custom { name, data }),
     }
     true
 }
 
-/// Connects to the platform's event websocket and relays its messages to `events` until the
-/// connection closes. As in the JS SDK, a closed connection is not reopened.
-pub(crate) async fn connect(url: &str, events: EventManager, memory_limit_bytes: Option<u64>) -> JoinHandle<()> {
-    let connection = tokio_tungstenite::connect_async(url).await;
-    tokio::spawn(async move {
-        let mut socket = match connection {
-            Ok((socket, _)) => socket,
-            Err(err) => {
-                tracing::error!("Connecting to the platform events websocket failed: {err}");
-                return;
+/// Close codes of a permanent condition, after which the connection is not reopened: the platform
+/// sends 1008 for an unknown run or too many connections; the others are protocol failures.
+const NON_RETRYABLE_CLOSE_CODES: [u16; 5] = [1002, 1003, 1007, 1008, 1010];
+/// Close codes of a clean close, as opposed to a lost connection.
+const CLEAN_CLOSE_CODES: [u16; 2] = [1000, 1001];
+/// A connection open at least this long was healthy: when it drops, it is reopened at once.
+const HEALTHY_CONNECTION_MIN_DURATION: Duration = Duration::from_secs(1);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Delays between reconnection attempts, as in the JS SDK (after the Python `websockets` library):
+/// a random one of up to 5 s, then from 3.1 s growing by 1.618 up to 90 s.
+#[derive(Default)]
+struct Backoff {
+    next_millis: Option<f64>,
+}
+
+impl Backoff {
+    fn next(&mut self) -> Duration {
+        let millis = match self.next_millis {
+            None => {
+                self.next_millis = Some(3100.0);
+                rand::random::<f64>() * 5000.0
+            }
+            Some(millis) => {
+                self.next_millis = Some(if millis < 90_000.0 { millis * 1.618 } else { millis });
+                millis.min(90_000.0)
             }
         };
-        while let Some(message) = socket.next().await {
-            let text = match message {
-                Ok(Message::Text(text)) => text.to_string(),
-                Ok(Message::Binary(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
-                Ok(Message::Close(_)) => break,
-                Ok(_) => continue,
-                Err(err) => {
-                    tracing::error!("The platform events websocket failed: {err}");
-                    break;
-                }
-            };
-            if !text.is_empty() && !relay(&text, &events, memory_limit_bytes) {
-                tracing::error!("Cannot parse Actor event: {text}");
+        Duration::from_secs_f64(millis / 1000.0)
+    }
+}
+
+async fn open(url: &str) -> Result<Socket, String> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(url)).await {
+        Ok(Ok((socket, _))) => Ok(socket),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("Opening handshake has timed out".to_owned()),
+    }
+}
+
+/// Relays the messages of `socket` until it closes, and returns the close code (1005 for a close
+/// without one, 1006 for a connection lost without a close).
+async fn relay_until_closed(mut socket: Socket, events: &EventManager, memory_limit_bytes: Option<u64>) -> u16 {
+    while let Some(message) = socket.next().await {
+        let text = match message {
+            Ok(Message::Text(text)) => text.to_string(),
+            Ok(Message::Binary(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(Message::Close(frame)) => return frame.map_or(1005, |frame| frame.code.into()),
+            Ok(_) => continue,
+            Err(err) => {
+                tracing::error!("Platform events websocket error: {err}");
+                return 1006;
             }
+        };
+        if !text.is_empty() && !relay(&text, events, memory_limit_bytes) {
+            tracing::error!("Cannot parse Actor event: {text}");
         }
-        tracing::debug!("The platform events websocket has been closed");
-    })
+    }
+    1006
+}
+
+/// Connects to the platform's event websocket and relays its messages to `events`. Fails when the
+/// first connection cannot be opened. A connection that drops is reopened, with backoff on
+/// repeated rapid drops, unless it was closed for good; aborting the task stops it.
+pub(crate) async fn connect(
+    url: &str,
+    events: EventManager,
+    memory_limit_bytes: Option<u64>,
+) -> Result<JoinHandle<()>, String> {
+    let mut socket = open(url).await?;
+    let url = url.to_owned();
+    Ok(tokio::spawn(async move {
+        let mut backoff: Option<Backoff> = None;
+        loop {
+            let opened_at = Instant::now();
+            let code = relay_until_closed(socket, &events, memory_limit_bytes).await;
+            if NON_RETRYABLE_CLOSE_CODES.contains(&code) {
+                tracing::error!(
+                    "Connection to platform events websocket was closed with a non-retryable code (code={code}); not \
+                     reconnecting. No further platform events will be received for the rest of this run, so migration \
+                     and abort handling (e.g. persisting state before a migration) is now disabled."
+                );
+                return;
+            }
+            if CLEAN_CLOSE_CODES.contains(&code) {
+                tracing::info!("Connection to platform events websocket was closed (code={code}), reconnecting...");
+            } else {
+                tracing::warn!("Connection to platform events websocket was lost (code={code}), reconnecting...");
+            }
+            // A healthy connection is reopened at once; the first rapid drop too, the next ones back off.
+            let mut delay = Duration::ZERO;
+            if opened_at.elapsed() >= HEALTHY_CONNECTION_MIN_DURATION {
+                backoff = None;
+            } else if let Some(backoff) = &mut backoff {
+                delay = backoff.next();
+            } else {
+                backoff = Some(Backoff::default());
+            }
+            tokio::time::sleep(delay).await;
+            socket = loop {
+                match open(&url).await {
+                    Ok(socket) => {
+                        tracing::info!("Reconnected to the platform events websocket.");
+                        break socket;
+                    }
+                    Err(err) => tracing::warn!("Reconnecting to platform events websocket failed: {err}"),
+                }
+                tokio::time::sleep(backoff.get_or_insert_with(Backoff::default).next()).await;
+            };
+        }
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use crawlee::core::EventKind;
     use parking_lot::Mutex;
@@ -148,22 +233,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_messages_are_relayed() {
+    async fn a_dropped_connection_is_reopened_until_a_permanent_close() {
         use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
+        let close = |code: CloseCode| Some(CloseFrame { code, reason: "".into() });
         tokio::spawn(async move {
+            // The platform goes away, then delivers an event on the next connection and closes it for good.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.close(close(CloseCode::Away)).await.unwrap();
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             socket.send(Message::text(r#"{"name":"aborting","data":null}"#)).await.unwrap();
-            socket.close(None).await.unwrap();
+            socket.close(close(CloseCode::Policy)).await.unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
         });
 
         let events = EventManager::new(Duration::from_secs(60));
         let seen = recorder(&events);
-        connect(&url, events.clone(), None).await.await.unwrap();
+        let relaying = connect(&url, events.clone(), None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relaying).await.expect("not reopened after 1008").unwrap();
         events.wait_for_all_listeners_to_complete().await;
         assert_eq!(*seen.lock(), [Event::Aborting]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_connection_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let events = EventManager::new(Duration::from_secs(60));
+        assert!(connect(&url, events, None).await.is_err());
     }
 }

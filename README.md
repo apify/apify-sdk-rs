@@ -74,13 +74,13 @@ input schema. Copy it and `apify push`.
 | **Configuration** | Every `ACTOR_*` / `APIFY_*` variable of the JS SDK, with its precedence and defaults (all memory on the platform) |
 | **Storages** | Platform datasets, key-value stores and request queues behind the crawlee-rs storage traits; names, aliases (`ACTOR_STORAGES_JSON`, remembered across migrations), `force_cloud`; local files with the input kept on purge |
 | **Request queues** | Single-consumer mode (local head estimate, no locks) and shared mode (platform locks, prolonged for long requests) |
-| **Events** | The platform websocket relayed as crawlee-rs events: system info for autoscaling, `migrating` (state saved, run rebooted), `aborting` (graceful exit) |
+| **Events** | The platform websocket (reopened when it drops) relayed as crawlee-rs events: system info for autoscaling, `migrating` (state saved, run rebooted), `aborting` (graceful exit) |
 | **Input** | `get_input` from the store or `INPUT(.json)`, schema defaults applied locally, secret fields decrypted |
-| **Platform API** | `call`, `start`, `call_task`, `abort`, `metamorph`, `add_webhook`, `set_status_message` (crawler status forwarded), `get_env`, `use_state` |
+| **Platform API** | `call` (the run's log redirected into this one's), `start`, `call_task`, `start_task`, `resurrect`, `abort`, `metamorph`, `add_webhook`, `set_status_message` (crawler status forwarded), `get_env`, `use_state`; named child runs (`run_name`, `child_runs`) that survive a migration or resurrection |
 | **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |
 | **Charging** | Pay-per-event: budget limits, the `apify-default-dataset-item` event charged as items are stored, `push_data_and_charge`, the local charging log |
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
-| **Autoscaling** | Rate-limited API calls (429) count toward the storage load signal |
+| **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 
 ## Testing
 

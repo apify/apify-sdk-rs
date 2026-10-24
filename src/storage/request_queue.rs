@@ -21,7 +21,7 @@ use crawlee::core::storage::backend::{
 use lru::LruCache;
 use parking_lot::Mutex;
 
-use super::{backend_error, date, extra_date, extra_u64, unsupported};
+use super::{DropHook, backend_error, date, extra_date, extra_u64, unsupported};
 
 /// How a request queue on the platform is consumed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,12 +187,14 @@ pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
     state: Mutex<State>,
     caches_initialized: tokio::sync::OnceCell<()>,
+    drop_hook: DropHook,
 }
 
 impl ApifySingleRequestQueue {
-    pub(crate) fn new(client: RequestQueueClient) -> Self {
+    pub(crate) fn new(client: RequestQueueClient, drop_hook: DropHook) -> Self {
         ApifySingleRequestQueue {
             client,
+            drop_hook,
             state: Mutex::new(State {
                 head: VecDeque::new(),
                 cached: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
@@ -282,7 +284,9 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        self.client.delete().await.map_err(backend_error)
+        self.client.delete().await.map_err(backend_error)?;
+        self.drop_hook.dropped();
+        Ok(())
     }
 
     async fn purge(&self) -> StorageResult<()> {

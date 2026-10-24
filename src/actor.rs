@@ -8,6 +8,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use apify_client::ApifyClient;
+use apify_client::models::ActorRun;
+use crawlee::core::events::ListenerId;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
 use crawlee::{Dataset, KeyValueStore, RequestQueue, Services, StorageIdentifier};
@@ -18,6 +20,7 @@ use serde_json::Value;
 use crate::charging::{
     ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend, DEFAULT_DATASET_ITEM_EVENT,
 };
+use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
@@ -73,6 +76,18 @@ pub struct ExitOptions {
     pub timeout: Duration,
 }
 
+impl ExitOptions {
+    /// The options as the payload of [`Event::Exit`], which crawlee-rs defines.
+    fn to_event_options(&self) -> crawlee::core::ExitOptions {
+        crawlee::core::ExitOptions {
+            status_message: self.status_message.clone(),
+            exit_code: self.exit_code,
+            exit: self.exit,
+            timeout: self.timeout,
+        }
+    }
+}
+
 impl Default for ExitOptions {
     fn default() -> Self {
         ExitOptions {
@@ -95,8 +110,8 @@ impl ExitOptions {
 pub struct StatusMessageOptions {
     /// The last message of the run.
     pub is_terminal: bool,
-    /// How the message is logged. `Debug` (the default) logs it at the info level, as in JS.
-    pub level: StatusLevel,
+    /// The level the message is logged at; info when not set.
+    pub level: Option<StatusLevel>,
 }
 
 /// Where storages are opened (see [`Actor::open_dataset`]).
@@ -123,6 +138,9 @@ struct Inner {
     rebooting: AtomicBool,
     handlers: Mutex<Handlers>,
     websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The options of the exit in progress.
+    exit_options: Mutex<Option<ExitOptions>>,
+    child_runs: ChildRunTracker,
 }
 
 /// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
@@ -151,6 +169,23 @@ pub enum Actor {}
 
 static STATE: OnceLock<Inner> = OnceLock::new();
 
+/// A listener added with [`Actor::on`], to remove with [`Actor::off`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActorListenerId(u64);
+
+/// Adds a listener to the run's events.
+type PendingListener = Box<dyn FnOnce(&EventManager) -> ListenerId + Send>;
+
+/// The listeners added with [`Actor::on`]: queued before [`Actor::init`], which attaches them.
+#[derive(Default)]
+struct Listeners {
+    next_id: u64,
+    pending: Vec<(ActorListenerId, PendingListener)>,
+    attached: Vec<(ActorListenerId, ListenerId)>,
+}
+
+static LISTENERS: Mutex<Listeners> = Mutex::new(Listeners { next_id: 0, pending: Vec::new(), attached: Vec::new() });
+
 /// The state of the initialized Actor.
 fn state() -> &'static Inner {
     STATE.get().expect("Actor::init() must be called before the other functions of Actor")
@@ -168,6 +203,12 @@ pub enum InitError {
     Storage(#[from] crawlee::core::StorageError),
     #[error(transparent)]
     Charging(#[from] ChargingError),
+    /// The platform events websocket could not be connected to.
+    #[error("Error connecting to platform events websocket! {0}")]
+    EventsConnection(String),
+    /// The tracked child runs could not be loaded.
+    #[error(transparent)]
+    ChildRuns(apify_client::ApifyClientError),
 }
 
 fn flush_and_exit(code: i32) -> ! {
@@ -213,7 +254,6 @@ impl Actor {
             Ok(()) => Self::exit(exit).await,
             Err(err) => {
                 tracing::error!("{err:?}");
-                // The JS SDK drops the other exit options here.
                 Self::exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
             }
         }
@@ -279,6 +319,7 @@ impl Actor {
         // Only one `init` gets past this: the services can be set once.
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
+        let child_run_services = services.clone();
         let inner = Inner {
             configuration: configuration.clone(),
             client,
@@ -290,6 +331,8 @@ impl Actor {
             rebooting: AtomicBool::new(false),
             handlers: Mutex::default(),
             websocket: Mutex::default(),
+            exit_options: Mutex::default(),
+            child_runs: ChildRunTracker::new(child_run_services),
         };
         if STATE.set(inner).is_err() {
             return Err(InitError::ServicesAlreadySet);
@@ -307,13 +350,30 @@ impl Actor {
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
+        {
+            let mut listeners = LISTENERS.lock();
+            let pending = std::mem::take(&mut listeners.pending);
+            if !pending.is_empty() {
+                tracing::debug!("Attached {} listener(s) registered before Actor::init()", pending.len());
+            }
+            for (id, attach) in pending {
+                let attached = attach(&events);
+                listeners.attached.push((id, attached));
+            }
+        }
 
         // Connected once the listeners are in place, so that no early event is missed.
         if configuration.is_at_home {
             match &configuration.actor_events_ws_url {
                 Some(url) => {
                     let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
-                    *state.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
+                    match crate::events::connect(url, events.clone(), memory).await {
+                        Ok(relaying) => *state.websocket.lock() = Some(relaying),
+                        Err(err) => {
+                            events.close().await;
+                            return Err(InitError::EventsConnection(err));
+                        }
+                    }
                 }
                 None => tracing::debug!(
                     "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."
@@ -322,6 +382,7 @@ impl Actor {
         }
 
         state.services.purge_on_start().await?;
+        state.child_runs.load().await.map_err(InitError::ChildRuns)?;
         state.charging.init(state.storage.as_ref()).await?;
         if state.charging.is_pay_per_event() && state.smart.is_none() {
             tracing::warn!(
@@ -374,6 +435,45 @@ impl Actor {
         &state().services
     }
 
+    /// Adds a listener to the run's events. Before [`init`](Self::init), the listener is queued
+    /// and `init` adds it, before the platform events are connected.
+    pub fn on<F, Fut>(kind: EventKind, listener: F) -> ActorListenerId
+    where
+        F: Fn(Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut listeners = LISTENERS.lock();
+        let id = ActorListenerId(listeners.next_id);
+        listeners.next_id += 1;
+        match STATE.get() {
+            Some(state) => {
+                let attached = state.services.events.on(kind, listener);
+                listeners.attached.push((id, attached));
+            }
+            None => listeners.pending.push((id, Box::new(move |events: &EventManager| events.on(kind, listener)))),
+        }
+        id
+    }
+
+    /// Removes a listener added with [`on`](Self::on).
+    pub fn off(id: ActorListenerId) {
+        let mut listeners = LISTENERS.lock();
+        listeners.pending.retain(|(pending, _)| *pending != id);
+        if let Some(index) = listeners.attached.iter().position(|(attached, _)| *attached == id) {
+            let (_, attached) = listeners.attached.remove(index);
+            state().services.events.off(attached);
+        }
+    }
+
+    /// The options of the [`exit`](Self::exit) in progress, for the listeners of [`EventKind::Exit`].
+    pub fn exit_options() -> Option<ExitOptions> {
+        state().exit_options.lock().clone()
+    }
+
+    pub(crate) fn child_run_tracker() -> &'static ChildRunTracker {
+        &state().child_runs
+    }
+
     pub fn events() -> &'static EventManager {
         &state().services.events
     }
@@ -398,7 +498,8 @@ impl Actor {
 
         events.close().await;
         tracing::debug!("Events closed");
-        events.emit(Event::Exit);
+        *state().exit_options.lock() = Some(options.clone());
+        events.emit(Event::Exit(options.to_event_options()));
 
         if options.exit {
             // A thread of its own: the tokio runtime may be too busy to run a timer.
@@ -420,7 +521,7 @@ impl Actor {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
             if let Some(message) = &options.status_message {
-                let level = if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info };
+                let level = Some(if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
                 Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
             }
         };
@@ -440,30 +541,39 @@ impl Actor {
         }
     }
 
-    /// [`exit`](Self::exit) with exit code 1.
+    /// [`exit`](Self::exit) with exit code 1, or the code of `options` when it is not 0.
     pub async fn fail(options: ExitOptions) {
-        Self::exit(ExitOptions { exit_code: 1, ..options }).await;
+        let exit_code = if options.exit_code == exit_codes::SUCCESS { 1 } else { options.exit_code };
+        Self::exit(ExitOptions { exit_code, ..options }).await;
     }
 
-    /// Sets the status message of the run, and logs it.
-    pub async fn set_status_message(message: &str, options: StatusMessageOptions) {
+    /// Sets the status message of the run, and logs it. Returns the updated run, or `None` when no
+    /// run was updated: off the platform, or when the update failed or timed out (which is logged).
+    pub async fn set_status_message(message: &str, options: StatusMessageOptions) -> Option<ActorRun> {
         match options.level {
-            StatusLevel::Warning => tracing::warn!("[Status message]: {message}"),
-            StatusLevel::Error => tracing::error!("[Status message]: {message}"),
-            _ => tracing::info!("[Status message]: {message}"),
+            Some(StatusLevel::Debug) => tracing::debug!("[Status message]: {message}"),
+            Some(StatusLevel::Warning) => tracing::warn!("[Status message]: {message}"),
+            Some(StatusLevel::Error) => tracing::error!("[Status message]: {message}"),
+            Some(StatusLevel::Info) | None => tracing::info!("[Status message]: {message}"),
         }
-        Self::update_run_status_message(message, options.is_terminal).await;
+        Self::update_run_status_message(message, options.is_terminal).await
     }
 
     /// Best effort: a failure or a slow API is only logged.
-    async fn update_run_status_message(message: &str, is_terminal: bool) {
-        let Some(run_id) = &state().configuration.actor_run_id else { return };
+    async fn update_run_status_message(message: &str, is_terminal: bool) -> Option<ActorRun> {
+        let run_id = state().configuration.actor_run_id.as_ref()?;
         let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": is_terminal });
         let run = state().client.run(run_id.clone());
         match tokio::time::timeout(STATUS_MESSAGE_TIMEOUT, run.update(&body)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => tracing::warn!("Setting the status message failed: {err}"),
-            Err(_) => tracing::warn!("Setting status message timed out after 1s"),
+            Ok(Ok(run)) => Some(run),
+            Ok(Err(err)) => {
+                tracing::warn!("Setting the status message failed: {err}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("Setting status message timed out after 1s");
+                None
+            }
         }
     }
 
@@ -618,14 +728,20 @@ impl Actor {
         state().services.open_key_value_store(&StorageIdentifier::Default).await?.get_value(key).await
     }
 
+    /// A value of the default key-value store, or `default` when it has none.
+    pub async fn get_value_or<T: DeserializeOwned>(key: &str, default: T) -> crawlee::core::StorageResult<T> {
+        Ok(Self::get_value(key).await?.unwrap_or(default))
+    }
+
     /// Stores a value as JSON in the default key-value store.
     pub async fn set_value<T: serde::Serialize + ?Sized>(key: &str, value: &T) -> crawlee::core::StorageResult<()> {
         state().services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await
     }
 
-    /// The input of the run, as it was stored. Locally, an `INPUT` or `INPUT.json` file in the
-    /// working directory, then in the storage directory, is used when the default key-value
-    /// store has no input.
+    /// The input of the run, as it was stored. Locally, the input may instead be an `INPUT` or
+    /// `INPUT.json` file in the working directory; a storage backend that does not read the default
+    /// key-value store's directory (in-memory) also gets the file `apify run` writes there. Input
+    /// found in more than one place is an error.
     pub async fn get_input_raw() -> Result<Input, ActorInputError> {
         let configuration = &state().configuration;
         let key = &configuration.input_key;
@@ -639,23 +755,40 @@ impl Actor {
             .get_record(key)
             .await
             .map_err(|err| ActorInputError::new(ActorInputErrorCode::NotFound, err.to_string()).caused_by(err))?;
-        let input = match record {
+        let local = !configuration.is_at_home;
+        // Not a conflict check: under the file system backend, the record is the store directory's file.
+        let store_input = match record {
             Some(record) => Some(crate::input::parse_input(record.value, record.content_type.as_deref(), &source)?),
-            None if !configuration.is_at_home => {
-                match crate::input::read_input_file(&working_directory(), "working directory", key).await? {
-                    Some(input) => Some(input),
-                    None => {
-                        crate::input::read_input_file(&configuration.crawlee.storage_dir, "storage directory", key)
-                            .await?
-                    }
-                }
+            // Where `apify run` writes the input, for a backend that does not read it (in-memory).
+            None if local => {
+                let directory = configuration
+                    .crawlee
+                    .storage_dir
+                    .join("key_value_stores")
+                    .join(&configuration.default_key_value_store_id);
+                crate::input::read_input_file(&directory, "default key-value store directory", key).await?
             }
             None => None,
         };
-        let Some(input) = input else {
+        let working_directory_input = match local {
+            true => crate::input::read_input_file(&working_directory(), "working directory", key).await?,
+            false => None,
+        };
+        if store_input.is_some() && working_directory_input.is_some() {
+            return Err(ActorInputError::new(
+                ActorInputErrorCode::MultipleFiles,
+                format!(
+                    "Found the input both in the default key-value store and in a \"{key}\" or \"{key}.json\" file \
+                     in the working directory. Keep only one of them."
+                ),
+            ));
+        }
+        let Some(input) = store_input.or(working_directory_input) else {
             let mut locations = vec![source];
-            if !configuration.is_at_home {
-                locations.push(format!("a \"{key}\" or \"{key}.json\" file in the working or storage directory"));
+            if local {
+                locations.push(format!(
+                    "a \"{key}\" or \"{key}.json\" file in the working or default key-value store directory"
+                ));
             }
             return Err(ActorInputError::new(
                 ActorInputErrorCode::NotFound,

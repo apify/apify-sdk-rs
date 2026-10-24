@@ -7,7 +7,7 @@ mod request_queue;
 mod request_queue_shared;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use apify_client::models::Extra;
 use apify_client::{ApifyClient, ApifyClientError};
@@ -19,6 +19,7 @@ use crawlee::core::errors::StorageError;
 use crawlee::core::storage::backend::{
     DatasetBackend, KeyValueStoreBackend, RequestQueueBackend, StorageBackend, StorageKind,
 };
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -71,6 +72,39 @@ fn random_id(length: usize) -> String {
     (0..length).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect()
 }
 
+/// The backends opened in this process, so that a storage opened again is the same backend, with
+/// one request queue head and cache per queue (the storage instance cache of Crawlee for JS).
+#[derive(Default)]
+struct OpenedStorages {
+    /// The ids of named storages, by kind and name.
+    names: HashMap<(StorageKind, String), String>,
+    datasets: HashMap<String, Arc<dyn DatasetBackend>>,
+    key_value_stores: HashMap<String, Arc<dyn KeyValueStoreBackend>>,
+    request_queues: HashMap<String, Arc<dyn RequestQueueBackend>>,
+}
+
+/// Forgets a dropped storage, so that opening it again opens (or creates) it anew. Aliases keep
+/// their storage, as in JS.
+pub(crate) struct DropHook {
+    opened: Weak<Mutex<OpenedStorages>>,
+    kind: StorageKind,
+    id: String,
+}
+
+impl DropHook {
+    pub(crate) fn dropped(&self) {
+        let Some(opened) = self.opened.upgrade() else { return };
+        let mut opened = opened.lock();
+        let id = &self.id;
+        match self.kind {
+            StorageKind::Dataset => opened.datasets.remove(id).map(|_| ()),
+            StorageKind::KeyValueStore => opened.key_value_stores.remove(id).map(|_| ()),
+            StorageKind::RequestQueue => opened.request_queues.remove(id).map(|_| ()),
+        };
+        opened.names.retain(|(kind, _), id| (*kind, id.as_str()) != (self.kind, self.id.as_str()));
+    }
+}
+
 /// Storages on the Apify platform.
 ///
 /// Storages are resolved as in the JS SDK:
@@ -90,6 +124,7 @@ pub struct ApifyStorageBackend {
     rate_limits: RateLimitCounter,
     client_key: String,
     aliases: tokio::sync::Mutex<AliasCache>,
+    opened: Arc<Mutex<OpenedStorages>>,
 }
 
 #[derive(Default)]
@@ -132,6 +167,7 @@ impl ApifyStorageBackend {
             rate_limits,
             client_key,
             aliases: tokio::sync::Mutex::default(),
+            opened: Arc::default(),
         }
     }
 
@@ -143,6 +179,13 @@ impl ApifyStorageBackend {
 
     pub fn client(&self) -> &ApifyClient {
         &self.client
+    }
+
+    /// The rate-limited calls of [`client`](Self::client) (`client.stats.rateLimitErrors` in JS).
+    /// Not reported to autoscaling as [`StorageBackend::rate_limit_errors`]: the JS SDK's backend
+    /// has no `stats`, so its storage load signal never sees a rate limit.
+    pub fn rate_limits(&self) -> &RateLimitCounter {
+        &self.rate_limits
     }
 
     async fn get_exists(&self, id: &str, kind: StorageKind) -> StorageResult<Option<String>> {
@@ -174,7 +217,15 @@ impl ApifyStorageBackend {
     async fn resolve_id(&self, identifier: &StorageIdentifier, kind: StorageKind) -> StorageResult<String> {
         let alias = match identifier {
             StorageIdentifier::Id(id) => return Ok(id.clone()),
-            StorageIdentifier::Name(name) => return self.get_or_create(Some(name), kind).await,
+            StorageIdentifier::Name(name) => {
+                let key = (kind, name.clone());
+                if let Some(id) = self.opened.lock().names.get(&key) {
+                    return Ok(id.clone());
+                }
+                let id = self.get_or_create(Some(name), kind).await?;
+                self.opened.lock().names.insert(key, id.clone());
+                return Ok(id);
+            }
             StorageIdentifier::Default => DEFAULT_STORAGE_ALIAS,
             StorageIdentifier::Alias(alias) => alias.as_str(),
         };
@@ -245,6 +296,10 @@ impl ApifyStorageBackend {
         Ok(id)
     }
 
+    fn drop_hook(&self, kind: StorageKind, id: &str) -> DropHook {
+        DropHook { opened: Arc::downgrade(&self.opened), kind, id: id.to_owned() }
+    }
+
     /// The run's default key-value store, which keeps the alias mapping; only on the platform.
     fn alias_mapping_store(&self) -> Option<apify_client::clients::key_value_store::KeyValueStoreClient> {
         self.configuration
@@ -276,7 +331,12 @@ async fn persist_alias_id(
 impl StorageBackend for ApifyStorageBackend {
     async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
         let id = self.resolve_id(id, StorageKind::Dataset).await?;
-        Ok(Arc::new(dataset::ApifyDataset { client: self.client.dataset(id) }))
+        let mut opened = self.opened.lock();
+        let backend = opened.datasets.entry(id.clone()).or_insert_with(|| {
+            let drop_hook = self.drop_hook(StorageKind::Dataset, &id);
+            Arc::new(dataset::ApifyDataset { client: self.client.dataset(id), drop_hook })
+        });
+        Ok(backend.clone())
     }
 
     async fn create_key_value_store_backend(
@@ -284,7 +344,12 @@ impl StorageBackend for ApifyStorageBackend {
         id: &StorageIdentifier,
     ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
         let id = self.resolve_id(id, StorageKind::KeyValueStore).await?;
-        Ok(Arc::new(key_value_store::ApifyKeyValueStore { client: self.client.key_value_store(id) }))
+        let mut opened = self.opened.lock();
+        let backend = opened.key_value_stores.entry(id.clone()).or_insert_with(|| {
+            let drop_hook = self.drop_hook(StorageKind::KeyValueStore, &id);
+            Arc::new(key_value_store::ApifyKeyValueStore { client: self.client.key_value_store(id), drop_hook })
+        });
+        Ok(backend.clone())
     }
 
     async fn create_request_queue_backend(
@@ -292,11 +357,18 @@ impl StorageBackend for ApifyStorageBackend {
         id: &StorageIdentifier,
     ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
         let id = self.resolve_id(id, StorageKind::RequestQueue).await?;
-        let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
-        Ok(match self.request_queue_access {
-            RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client)),
-            RequestQueueAccess::Shared => Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client)),
-        })
+        let mut opened = self.opened.lock();
+        let backend = opened.request_queues.entry(id.clone()).or_insert_with(|| {
+            let drop_hook = self.drop_hook(StorageKind::RequestQueue, &id);
+            let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
+            match self.request_queue_access {
+                RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client, drop_hook)),
+                RequestQueueAccess::Shared => {
+                    Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client, drop_hook))
+                }
+            }
+        });
+        Ok(backend.clone())
     }
 
     /// Whether `id` is the id of a storage (the API also finds storages by name).
@@ -305,10 +377,7 @@ impl StorageBackend for ApifyStorageBackend {
     }
 
     // `purge` keeps the default no-op: the platform gives every run empty default storages.
-
-    fn rate_limit_errors(&self) -> u64 {
-        self.rate_limits.get()
-    }
+    // `rate_limit_errors` keeps the default 0, see `rate_limits`.
 }
 
 /// The storage backend of an Actor: [`ApifyStorageBackend`] on the platform, `local` elsewhere,

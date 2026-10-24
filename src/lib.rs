@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod charging;
+pub mod child_runs;
 pub mod client;
 pub mod configuration;
 pub mod events;
@@ -12,18 +13,24 @@ pub mod input;
 pub mod input_secrets;
 pub mod platform;
 pub mod proxy;
+mod run_log;
 pub mod storage;
 pub mod url_filters;
 
-pub use crate::actor::{Actor, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes};
+pub use crate::actor::{
+    Actor, ActorListenerId, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes,
+};
+pub use crate::child_runs::{ChildRunInfo, TrackedChildRun};
 pub use crate::client::{RateLimitCounter, new_client};
 pub use crate::configuration::Configuration;
 pub use crate::input::{ActorInputError, ActorInputErrorCode, Input};
-pub use crate::platform::{AbortOptions, ApifyEnv, CallOptions, MetamorphOptions, RunTimeout, WebhookOptions};
+pub use crate::platform::{
+    AbortOptions, ApifyEnv, CallOptions, MetamorphOptions, ResurrectOptions, RunLog, RunTimeout, WebhookOptions,
+};
 pub use crate::proxy::{ProxyConfiguration, ProxyConfigurationOptions};
 pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
-pub use apify_client::ApifyClient;
+pub use apify_client::{ApiError, ApifyClient, ApifyClientError, ApifyClientResult};
 
 /// The crawlee-rs version this SDK is built on. Use it through this re-export, so that the
 /// crawler and the SDK share one version of crawlee-rs.

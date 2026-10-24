@@ -18,15 +18,15 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 
 ## Actor lifecycle
 
-- **A failing user function keeps the exit options.** When the function given to `main` fails,
-  the JS SDK exits with code 91 and drops the other exit options (such as the status message).
-  `main_with` keeps them and only sets the exit code.
 - **The final status message is awaited.** The JS SDK gives the request that sets the terminal
   status message 1 ms before exiting. Here it gets up to 1 s (the status message timeout), since
   a process exit in Rust cuts off requests in flight.
+- **`fail` cannot exit with code 0.** `ExitOptions::exit_code` has no "not set" value, so `fail`
+  takes 0 (the default) as not set and exits with 1; the JS SDK's `fail({ exitCode: 0 })` exits
+  with 0.
 - **The Actor's functions panic before `Actor::init()`.** Calling them first is a bug in the code;
-  the JS SDK warns and continues with an uninitialized Actor.
-- **`abort` sets the status message on the aborted run.** The JS SDK sets it on the current run.
+  the JS SDK warns and continues with an uninitialized Actor. `Actor::on` and `Actor::off` are the
+  exception: as in JS, listeners added before `init` are queued and attached by it.
 - **`get_env` falls back to the `APIFY_*` variables.** The JS SDK reads both generations of
   variables into one object, and a missing `ACTOR_*` variable overwrites its `APIFY_*` predecessor
   with `null`. Here the `ACTOR_*` variable is read first and the `APIFY_*` one is the fallback.
@@ -34,6 +34,10 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   configuration, whatever the Actor was configured with.
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.
+
+- **A redirected log chunk without a newline waits for the rest of its line.** The JS
+  `StreamedLog` logs such a chunk without its last character, which looks like a bug; here the
+  line is logged once it is complete (or when the stream ends).
 
 ## Input
 

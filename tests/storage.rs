@@ -113,6 +113,36 @@ async fn names_and_aliases_resolve_to_platform_storages() {
 }
 
 #[tokio::test]
+async fn a_storage_opened_again_is_the_same_storage() {
+    let api = FakeApi::start().await;
+    api.set_head_lag(3);
+    let services = services(&api);
+
+    // Start URLs added through one handle are fetched through another, before the platform head shows them.
+    let start = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    start.add_requests(vec!["https://a.test/start".into()], false).await.unwrap();
+    let crawler = services.open_request_queue(&StorageIdentifier::id(DEFAULT_QUEUE)).await.unwrap();
+    assert!(Arc::ptr_eq(start.backend(), crawler.backend()));
+    assert_eq!(crawler.fetch_next_request().await.unwrap().unwrap().url, "https://a.test/start");
+
+    // A named storage is looked up once.
+    let named = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    let again = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    assert!(named.same_storage(&again));
+    assert_eq!(api.count_calls("POST /v2/datasets"), 1);
+    let id = named.get_info().await.unwrap().id;
+    let by_id = services.open_dataset(&StorageIdentifier::id(id.clone())).await.unwrap();
+    assert!(named.same_storage(&by_id));
+
+    // Until it is dropped.
+    named.drop_storage().await.unwrap();
+    let recreated = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    assert!(!recreated.same_storage(&again));
+    assert_eq!(api.count_calls("POST /v2/datasets"), 2);
+    assert_ne!(recreated.get_info().await.unwrap().id, id);
+}
+
+#[tokio::test]
 async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
     let api = FakeApi::start().await;
     let declared = Arc::new(Configuration {
@@ -158,10 +188,12 @@ async fn request_queue_serves_its_own_requests_from_the_local_cache() {
     let info = queue.get_info().await.unwrap();
     assert_eq!((info.total_request_count, info.handled_request_count, info.pending_request_count), (3, 3, 0));
 
-    // Adding a handled request again costs no write.
+    // Adding a handled request again costs no write. As in Crawlee for JS, the cache keeps what
+    // the platform answered to the mark (whether it was handled before), so it says `false`.
     api.clear_calls();
     let again = queue.add_requests(vec!["https://a.test/1".into()], true).await.unwrap();
-    assert!(again.processed_requests[0].was_already_handled);
+    assert!(again.processed_requests[0].was_already_present);
+    assert!(!again.processed_requests[0].was_already_handled);
     assert_eq!(api.count_calls("POST"), 0);
 }
 
@@ -238,7 +270,7 @@ async fn a_resurrected_run_deduplicates_from_the_prefetched_queue() {
 }
 
 #[tokio::test]
-async fn rate_limited_calls_are_retried_and_counted() {
+async fn rate_limited_calls_are_retried_and_counted_by_attempt() {
     let api = FakeApi::start().await;
     let backend = Arc::new(ApifyStorageBackend::new(configuration(&api, true)));
     let services = Services::new(backend.clone());
@@ -247,8 +279,11 @@ async fn rate_limited_calls_are_retried_and_counted() {
     api.rate_limit_next(2);
     dataset.push_data(&json!({ "a": 1 })).await.unwrap();
     assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 1);
+    assert_eq!(backend.rate_limits().by_attempt(), [1, 1]);
+    // As in the JS SDK, whose `ApifyStorageBackend` has no `stats`: the storage load signal of
+    // autoscaling sees no rate limits.
     use crawlee::core::StorageBackend as _;
-    assert_eq!(backend.rate_limit_errors(), 2);
+    assert_eq!(backend.rate_limit_errors(), 0);
 }
 
 #[tokio::test]

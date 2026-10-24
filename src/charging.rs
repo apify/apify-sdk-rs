@@ -9,6 +9,7 @@
 //! other's API calls, and cannot together spend more than the budget.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use apify_client::{ApifyClient, ApifyClientError, RunChargeOptions};
 use async_trait::async_trait;
@@ -72,6 +73,8 @@ pub(crate) fn js_to_fixed(x: f64, digits: usize) -> f64 {
 pub struct ChargeOptions {
     pub event_name: String,
     pub count: u64,
+    /// Keeps a retried operation from being charged twice: a charge repeated under the same key
+    /// within three minutes is not made again (see [`ChargingManager::charge`]).
     pub idempotency_key: Option<String>,
 }
 
@@ -122,6 +125,17 @@ struct EventPrice {
     title: String,
 }
 
+/// A charge made with an idempotency key.
+struct IdempotentCharge {
+    event_name: String,
+    charged_count: u64,
+    /// When the key is forgotten.
+    expires_at: Instant,
+}
+
+/// How long a charge is remembered by its idempotency key, as long as the platform does.
+const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(3 * 60);
+
 #[derive(Default)]
 struct State {
     initialized: bool,
@@ -131,6 +145,30 @@ struct State {
     /// Charged count and amount by event.
     charged: IndexMap<String, (u64, f64)>,
     not_ppe_warning_printed: bool,
+    /// Charges made with an idempotency key, by key, in the order they expire.
+    idempotent: IndexMap<String, IdempotentCharge>,
+}
+
+impl State {
+    /// The charge made under `key`, unless it expired.
+    fn idempotent_charge(&mut self, key: &str) -> Option<&IdempotentCharge> {
+        if self.idempotent.get(key).is_some_and(|charge| charge.expires_at <= Instant::now()) {
+            self.idempotent.shift_remove(key);
+        }
+        self.idempotent.get(key)
+    }
+
+    fn remember_idempotent_charge(&mut self, key: String, event_name: &str, charged_count: u64) {
+        let now = Instant::now();
+        let expired = self.idempotent.values().take_while(|charge| charge.expires_at <= now).count();
+        self.idempotent.drain(..expired);
+        let charge = IdempotentCharge {
+            event_name: event_name.to_owned(),
+            charged_count,
+            expires_at: now + IDEMPOTENCY_KEY_TTL,
+        };
+        self.idempotent.insert(key, charge);
+    }
 }
 
 /// `f64` counts (possibly infinite) as optional integers.
@@ -288,7 +326,13 @@ impl ChargingManager {
 
     /// Charges for `count` events, as far as the budget allows. When it allows fewer, one more is
     /// charged, so that the platform notices and stops the run.
+    ///
+    /// A charge repeated under the same idempotency key within three minutes is not made again: it
+    /// reports the count of the original charge, or 0 when that was of another event.
     pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
+        if options.idempotency_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
+            return Err(ChargingError::Invalid("idempotencyKey must not be blank".to_owned()));
+        }
         if !self.is_pay_per_event() {
             let mut state = self.state.lock();
             if !state.not_ppe_warning_printed {
@@ -307,9 +351,46 @@ impl ChargingManager {
             return Err(ChargingError::NotInitialized);
         }
         let ChargeOptions { event_name, count, idempotency_key } = options;
-        let charged_count = self.reserve(&event_name, count);
-        if charged_count > 0 {
-            self.send_charge(&event_name, charged_count, idempotency_key).await?;
+        let charged_count = {
+            let mut state = self.state.lock();
+            if let Some(key) = &idempotency_key
+                && let Some(previous) = state.idempotent_charge(key)
+            {
+                // A repeat the platform would discard: counting it would spend the budget early.
+                let repeated_count = if previous.event_name == event_name {
+                    tracing::debug!("Skipped a repeated charge of event '{event_name}' under key '{key}'.");
+                    previous.charged_count
+                } else {
+                    tracing::warn!(
+                        "Idempotency key '{key}' was already used to charge for event '{}', so the charge of event \
+                         '{event_name}' is skipped.",
+                        previous.event_name
+                    );
+                    0
+                };
+                return Ok(ChargeResult {
+                    event_charge_limit_reached: self.is_event_charge_limit_reached_of(&state, &event_name),
+                    charged_count: repeated_count,
+                    chargeable_within_limit: self.chargeable_within_limit_of(&state),
+                });
+            }
+            let charged_count = self.reserve(&mut state, &event_name, count);
+            // Remembered right away, so that a concurrent repeat is skipped too.
+            if let Some(key) = &idempotency_key {
+                state.remember_idempotent_charge(key.clone(), &event_name, charged_count);
+            }
+            charged_count
+        };
+        if charged_count > 0
+            && let Err(err) = self.send_charge(&event_name, charged_count, idempotency_key.clone()).await
+        {
+            // Counted only once made, so that a failed charge retried under its key is counted once.
+            let mut state = self.state.lock();
+            self.add_charged(&mut state, &event_name, -(charged_count as i64));
+            if let Some(key) = &idempotency_key {
+                state.idempotent.shift_remove(key);
+            }
+            return Err(err);
         }
         if charged_count < count && charged_count > 0 {
             let subject = if count == 1 { "instance" } else { "instances" };
@@ -332,19 +413,18 @@ impl ChargingManager {
 
     /// Counts up to `count` events as charged, as far as the budget allows (one more when it
     /// allows fewer, unless already over it), and returns how many.
-    fn reserve(&self, event_name: &str, count: u64) -> u64 {
-        let mut state = self.state.lock();
-        let max = self.max_event_charge_count_of(&state, event_name);
+    fn reserve(&self, state: &mut State, event_name: &str, count: u64) -> u64 {
+        let max = self.max_event_charge_count_of(state, event_name);
         let charged_count = if (count as f64) <= max {
             count
-        } else if self.total_charged_amount_of(&state) <= state.max_total_charge_usd {
+        } else if self.total_charged_amount_of(state) <= state.max_total_charge_usd {
             // Over budget: one more than allowed, so that the platform stops the run. Not when
             // already strictly over it.
             max as u64 + 1
         } else {
             0
         };
-        self.add_charged(&mut state, event_name, charged_count as i64);
+        self.add_charged(state, event_name, charged_count as i64);
         charged_count
     }
 
@@ -437,23 +517,28 @@ impl ChargingManager {
                 // Synthetic events are charged by the platform itself, from the dataset writes.
             } else if known {
                 let run_id = self.configuration.actor_run_id.clone().unwrap_or_default();
-                let charge =
-                    RunChargeOptions { event_name: event_name.to_owned(), count: Some(count as i64), idempotency_key };
+                let charge = RunChargeOptions {
+                    event_name: event_name.to_owned(),
+                    count: Some(count as i64),
+                    idempotency_key: idempotency_key.clone(),
+                };
                 self.client.run(run_id).charge(charge).await?;
             } else {
                 tracing::warn!("Attempting to charge for an unknown event '{event_name}'");
             }
         }
         if let Some(dataset) = self.log_dataset.get() {
-            dataset
-                .push_data(&serde_json::json!({
-                    "eventName": event_name,
-                    "eventTitle": title,
-                    "eventPriceUsd": price,
-                    "chargedCount": count,
-                    "timestamp": crawlee::core::now_iso(),
-                }))
-                .await?;
+            let mut entry = serde_json::json!({
+                "eventName": event_name,
+                "eventTitle": title,
+                "eventPriceUsd": price,
+                "chargedCount": count,
+            });
+            if let Some(key) = idempotency_key {
+                entry["idempotencyKey"] = Value::String(key);
+            }
+            entry["timestamp"] = Value::String(crawlee::core::now_iso());
+            dataset.push_data(&entry).await?;
         }
         Ok(())
     }
@@ -689,6 +774,26 @@ mod tests {
         };
         let client = crate::new_client(&configuration, None, Default::default());
         ChargingManager::new(Arc::new(configuration), client)
+    }
+
+    #[tokio::test]
+    async fn a_charge_repeated_under_its_idempotency_key_counts_once() {
+        let manager = manager(10.0, &[("page", 1.0), ("apify-default-dataset-item", 0.5)], &[]);
+        manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();
+        let keyed = |event: &str, count: u64, key: &str| ChargeOptions {
+            idempotency_key: Some(key.to_owned()),
+            ..ChargeOptions::new(event, count)
+        };
+        let item = "apify-default-dataset-item";
+        assert_eq!(manager.charge(keyed(item, 2, "k")).await.unwrap().charged_count, 2);
+        let repeated = manager.charge(keyed(item, 2, "k")).await.unwrap();
+        assert_eq!(repeated.charged_count, 2, "the count of the original charge");
+        assert_eq!(manager.charged_event_count(item), 2);
+        // The key alone decides: another event under it is not charged.
+        assert_eq!(manager.charge(keyed("page", 1, "k")).await.unwrap().charged_count, 0);
+        assert_eq!(manager.charged_event_count("page"), 0);
+        assert_eq!(manager.charge(keyed(item, 1, "other")).await.unwrap().charged_count, 1);
+        assert!(matches!(manager.charge(keyed(item, 1, " ")).await, Err(ChargingError::Invalid(_))));
     }
 
     #[tokio::test]

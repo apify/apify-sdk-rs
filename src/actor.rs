@@ -216,7 +216,6 @@ impl Actor {
             Ok(()) => Self::exit(exit).await,
             Err(err) => {
                 tracing::error!("{err:?}");
-                // The JS SDK drops the other exit options here.
                 Self::exit(ExitOptions { exit_code: exit_codes::ERROR_USER_FUNCTION_THREW, ..exit }).await;
             }
         }
@@ -449,9 +448,10 @@ impl Actor {
         }
     }
 
-    /// [`exit`](Self::exit) with exit code 1.
+    /// [`exit`](Self::exit) with exit code 1, or the code of `options` when it is not 0.
     pub async fn fail(options: ExitOptions) {
-        Self::exit(ExitOptions { exit_code: 1, ..options }).await;
+        let exit_code = if options.exit_code == exit_codes::SUCCESS { 1 } else { options.exit_code };
+        Self::exit(ExitOptions { exit_code, ..options }).await;
     }
 
     /// Sets the status message of the run, and logs it.

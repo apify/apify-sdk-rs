@@ -234,8 +234,7 @@ impl Actor {
         client.task(task_id).call(input, Self::start_options(&options), wait).await
     }
 
-    /// Aborts a run. The status message goes to the aborted run (the JS SDK sets it on the
-    /// current run).
+    /// Aborts a run. The status message goes to the aborted run.
     pub async fn abort(run_id: &str, options: AbortOptions) -> ApifyClientResult<ActorRun> {
         let client = Self::client_for(options.token.as_deref());
         if let Some(message) = &options.status_message {

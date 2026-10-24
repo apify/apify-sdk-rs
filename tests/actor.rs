@@ -83,8 +83,16 @@ async fn a_failing_user_function_exits_with_91() {
     let output = run_child("fail", &platform_env(&api, None), dir.path()).await;
     assert_exit(&output, 91);
     assert!(String::from_utf8_lossy(&output.stdout).contains("boom"));
-    // The exit options of `main_with` are kept (the JS SDK drops them).
+    // The exit options of `main_with` are kept.
     assert_eq!(terminal_messages(&api), ["Done"]);
+}
+
+#[tokio::test]
+async fn fail_exits_with_1_or_the_code_given() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("fail-default", &platform_env(&api, None), dir.path()).await, 1);
+    assert_exit(&run_child("fail-code", &platform_env(&api, None), dir.path()).await, 3);
 }
 
 /// `Actor::init` and `exit` without `Actor::main`, and the functions of the Actor in between.
@@ -449,6 +457,11 @@ fn child() {
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 echo().await.unwrap();
                 Actor::exit(apify::ExitOptions::message("Echoed")).await;
+            }
+            "fail-default" | "fail-code" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let exit_code = if scenario == "fail-code" { 3 } else { apify::exit_codes::SUCCESS };
+                Actor::fail(apify::ExitOptions { exit_code, ..apify::ExitOptions::default() }).await;
             }
             "before-init" => {
                 Actor::is_at_home();

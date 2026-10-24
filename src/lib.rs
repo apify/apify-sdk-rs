@@ -29,7 +29,7 @@ pub use crate::platform::{
 pub use crate::proxy::{ProxyConfiguration, ProxyConfigurationOptions};
 pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
-pub use apify_client::ApifyClient;
+pub use apify_client::{ApiError, ApifyClient, ApifyClientError, ApifyClientResult};
 
 /// The crawlee-rs version this SDK is built on. Use it through this re-export, so that the
 /// crawler and the SDK share one version of crawlee-rs.

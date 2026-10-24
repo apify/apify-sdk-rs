@@ -566,8 +566,10 @@ fn child() {
                 let b = Actor::start_task("user/b", None::<&Value>, named("b")).await.unwrap();
                 let c = Actor::start("user/c", None::<&Value>, named("c")).await.unwrap();
                 println!("RUNS {} {} {}", a.id, b.id, c.id);
-                if let Err(err) = Actor::start("user/other", None::<&Value>, named("a")).await {
-                    println!("REUSED {err}");
+                if let Err(apify::ApifyClientError::InvalidArgument(message)) =
+                    Actor::start("user/other", None::<&Value>, named("a")).await
+                {
+                    println!("REUSED {message}");
                 }
                 let mut names: Vec<String> = Actor::child_runs().await.into_keys().collect();
                 names.sort();

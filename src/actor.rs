@@ -632,9 +632,10 @@ impl Actor {
         state().services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await
     }
 
-    /// The input of the run, as it was stored. Locally, an `INPUT` or `INPUT.json` file in the
-    /// working directory, then in the storage directory, is used when the default key-value
-    /// store has no input.
+    /// The input of the run, as it was stored. Locally, the input may instead be an `INPUT` or
+    /// `INPUT.json` file in the working directory; a storage backend that does not read the default
+    /// key-value store's directory (in-memory) also gets the file `apify run` writes there. Input
+    /// found in more than one place is an error.
     pub async fn get_input_raw() -> Result<Input, ActorInputError> {
         let configuration = &state().configuration;
         let key = &configuration.input_key;
@@ -648,23 +649,40 @@ impl Actor {
             .get_record(key)
             .await
             .map_err(|err| ActorInputError::new(ActorInputErrorCode::NotFound, err.to_string()).caused_by(err))?;
-        let input = match record {
+        let local = !configuration.is_at_home;
+        // Not a conflict check: under the file system backend, the record is the store directory's file.
+        let store_input = match record {
             Some(record) => Some(crate::input::parse_input(record.value, record.content_type.as_deref(), &source)?),
-            None if !configuration.is_at_home => {
-                match crate::input::read_input_file(&working_directory(), "working directory", key).await? {
-                    Some(input) => Some(input),
-                    None => {
-                        crate::input::read_input_file(&configuration.crawlee.storage_dir, "storage directory", key)
-                            .await?
-                    }
-                }
+            // Where `apify run` writes the input, for a backend that does not read it (in-memory).
+            None if local => {
+                let directory = configuration
+                    .crawlee
+                    .storage_dir
+                    .join("key_value_stores")
+                    .join(&configuration.default_key_value_store_id);
+                crate::input::read_input_file(&directory, "default key-value store directory", key).await?
             }
             None => None,
         };
-        let Some(input) = input else {
+        let working_directory_input = match local {
+            true => crate::input::read_input_file(&working_directory(), "working directory", key).await?,
+            false => None,
+        };
+        if store_input.is_some() && working_directory_input.is_some() {
+            return Err(ActorInputError::new(
+                ActorInputErrorCode::MultipleFiles,
+                format!(
+                    "Found the input both in the default key-value store and in a \"{key}\" or \"{key}.json\" file \
+                     in the working directory. Keep only one of them."
+                ),
+            ));
+        }
+        let Some(input) = store_input.or(working_directory_input) else {
             let mut locations = vec![source];
-            if !configuration.is_at_home {
-                locations.push(format!("a \"{key}\" or \"{key}.json\" file in the working or storage directory"));
+            if local {
+                locations.push(format!(
+                    "a \"{key}\" or \"{key}.json\" file in the working or default key-value store directory"
+                ));
             }
             return Err(ActorInputError::new(
                 ActorInputErrorCode::NotFound,

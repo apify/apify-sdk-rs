@@ -182,23 +182,30 @@ async fn a_local_run_reads_its_input_from_the_working_directory() {
 }
 
 #[tokio::test]
-async fn a_local_run_falls_back_to_the_storage_directory_after_the_working_directory() {
+async fn a_local_run_reads_the_default_store_directory_but_not_next_to_a_working_directory_file() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("storage")).unwrap();
-    std::fs::write(dir.path().join("storage/INPUT.json"), r#"{"from":"storage"}"#).unwrap();
-    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
-    let read_item = || -> Value {
-        serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("storage/datasets/default/000000001.json")).unwrap(),
-        )
-        .unwrap()
-    };
-    assert_eq!(read_item(), json!({ "echo": { "from": "storage" } }));
+    // Where `apify run` writes the input; the in-memory backend never reads it.
+    let in_memory = [("CRAWLEE_PERSIST_STORAGE", "false".to_owned())];
+    std::fs::create_dir_all(dir.path().join("storage/key_value_stores/default")).unwrap();
+    std::fs::write(dir.path().join("storage/key_value_stores/default/INPUT.json"), r#"{"from":"storage"}"#).unwrap();
+    // The storage root is not looked at.
+    std::fs::write(dir.path().join("storage/INPUT.json"), r#"{"from":"root"}"#).unwrap();
+    let output = run_child("echo-stdout", &in_memory, dir.path()).await;
+    assert_exit(&output, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains(r#"ECHO {"from":"storage"}"#));
 
     std::fs::write(dir.path().join("INPUT.json"), r#"{"from":"cwd"}"#).unwrap();
-    std::fs::remove_dir_all(dir.path().join("storage/key_value_stores")).unwrap();
-    assert_exit(&run_child("echo", &[], dir.path()).await, 0);
-    assert_eq!(read_item(), json!({ "echo": { "from": "cwd" } }));
+    for vars in [&in_memory[..], &[]] {
+        let output = run_child("echo-stdout", vars, dir.path()).await;
+        assert_exit(&output, 91);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(
+                r#"Found the input both in the default key-value store and in a "INPUT" or "INPUT.json" file in the working directory. Keep only one of them."#
+            ),
+            "{stdout}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -209,7 +216,7 @@ async fn missing_input_and_late_init_are_errors() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working or storage directory."#
+            r#"Input does not exist. Expected the "INPUT" record of the default key-value store or a "INPUT" or "INPUT.json" file in the working or default key-value store directory."#
         ),
         "{stdout}"
     );
@@ -360,6 +367,14 @@ fn child() {
                 Actor::main_with(apify::InitOptions::default(), exit, || async move {
                     let input: Value = Actor::get_input().await?;
                     Actor::push_data(&json!({ "echo": input })).await?;
+                    Ok(())
+                })
+                .await
+            }
+            "echo-stdout" => {
+                Actor::main(|| async move {
+                    let input: Value = Actor::get_input().await?;
+                    println!("ECHO {input}");
                     Ok(())
                 })
                 .await

@@ -1,5 +1,5 @@
 //! The input of an Actor run: the `INPUT` record of the default key-value store, or locally an
-//! `INPUT` / `INPUT.json` file in the working or storage directory.
+//! `INPUT` / `INPUT.json` file in the working or default key-value store directory.
 
 use std::path::Path;
 

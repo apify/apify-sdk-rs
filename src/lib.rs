@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod charging;
+pub mod child_runs;
 pub mod client;
 pub mod configuration;
 pub mod events;
@@ -18,10 +19,13 @@ pub mod url_filters;
 pub use crate::actor::{
     Actor, ActorListenerId, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes,
 };
+pub use crate::child_runs::{ChildRunInfo, TrackedChildRun};
 pub use crate::client::{RateLimitCounter, new_client};
 pub use crate::configuration::Configuration;
 pub use crate::input::{ActorInputError, ActorInputErrorCode, Input};
-pub use crate::platform::{AbortOptions, ApifyEnv, CallOptions, MetamorphOptions, RunTimeout, WebhookOptions};
+pub use crate::platform::{
+    AbortOptions, ApifyEnv, CallOptions, MetamorphOptions, ResurrectOptions, RunTimeout, WebhookOptions,
+};
 pub use crate::proxy::{ProxyConfiguration, ProxyConfigurationOptions};
 pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 

@@ -79,6 +79,8 @@ struct Data {
     run_updates: Vec<Value>,
     /// Starts, aborts, metamorphs and webhooks: `(call, query, body)`.
     platform_calls: Vec<(String, HashMap<String, String>, Value)>,
+    /// Runs started through the API, by id. They finish at once.
+    runs: HashMap<String, Value>,
 }
 
 impl Data {
@@ -144,6 +146,7 @@ impl FakeApi {
             .route("/v2/actor-tasks/{id}/runs", post(start_run))
             .route("/v2/webhooks", post(create_webhook))
             .route("/v2/actor-runs/{id}/reboot", post(reboot_run))
+            .route("/v2/actor-runs/{id}/resurrect", post(resurrect_run))
             .layer(tower_http::decompression::RequestDecompressionLayer::new())
             .layer(middleware::from_fn_with_state(shared.clone(), gate))
             .with_state(shared.clone());
@@ -216,6 +219,11 @@ impl FakeApi {
 
     pub fn platform_calls(&self) -> Vec<(String, HashMap<String, String>, Value)> {
         self.shared.data.lock().platform_calls.clone()
+    }
+
+    /// Sets the status of a run started through the API.
+    pub fn set_run_status(&self, id: &str, status: &str) {
+        self.shared.data.lock().runs.get_mut(id).expect("a started run")["status"] = json!(status);
     }
 
     pub fn run_updates(&self) -> Vec<Value> {
@@ -657,11 +665,28 @@ async fn start_run(
     body: Bytes,
 ) -> Response {
     record_platform_call(&shared, uri.path().to_owned(), query, &body);
-    envelope(StatusCode::CREATED, json!({ "id": "started-run", "status": "READY" }))
+    let mut data = shared.data.lock();
+    let id = format!("child-{}", data.runs.len() + 1);
+    data.runs.insert(id.clone(), json!({ "id": id, "status": "SUCCEEDED", "startedAt": NOW }));
+    envelope(StatusCode::CREATED, json!({ "id": id, "status": "READY", "startedAt": NOW }))
 }
 
-async fn get_run(Path(id): Path<String>) -> Response {
-    envelope(StatusCode::OK, json!({ "id": id, "status": "SUCCEEDED" }))
+async fn get_run(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    let run = shared.data.lock().runs.get(&id).cloned();
+    envelope(StatusCode::OK, run.unwrap_or_else(|| json!({ "id": id, "status": "SUCCEEDED" })))
+}
+
+async fn resurrect_run(
+    State(shared): State<Shared>,
+    uri: axum::http::Uri,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    record_platform_call(&shared, uri.path().to_owned(), query, &[]);
+    let mut data = shared.data.lock();
+    let run = data.runs.entry(id.clone()).or_insert_with(|| json!({ "id": id, "startedAt": NOW }));
+    run["status"] = json!("RUNNING");
+    envelope(StatusCode::OK, run.clone())
 }
 
 async fn run_action(

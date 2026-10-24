@@ -4,14 +4,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use apify_client::clients::run::RunClient;
 use apify_client::models::{ActorRun, Webhook};
-use apify_client::{ActorStartOptions, ApifyClient, ApifyClientError, ApifyClientResult};
+use apify_client::{ActorStartOptions, ApifyClient, ApifyClientError, ApifyClientResult, RunResurrectOptions};
 use chrono::{DateTime, Utc};
 use crawlee::core::{SerdeState, StorageResult};
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::actor::Actor;
+use crate::child_runs::ChildRunRequest;
 
 /// The shortest run timeout `RunTimeout::Inherit` gives, as in JS.
 const MINIMUM_API_TIMEOUT_SECS: i64 = 1;
@@ -26,7 +29,7 @@ pub enum RunTimeout {
     Inherit,
 }
 
-/// Options of [`Actor::call`], [`Actor::start`] and [`Actor::call_task`].
+/// Options of [`Actor::call`], [`Actor::start`], [`Actor::call_task`] and [`Actor::start_task`].
 #[derive(Clone, Debug, Default)]
 pub struct CallOptions {
     /// Run with another token than the Actor's.
@@ -36,6 +39,23 @@ pub struct CallOptions {
     pub start: ActorStartOptions,
     /// How long `call` waits for the run to finish; `None` waits until it does.
     pub wait: Option<Duration>,
+    /// A local name for the run, unique across the Actors and tasks this run starts. A `READY`,
+    /// `RUNNING` or `SUCCEEDED` run tracked under it is returned instead of starting a new one,
+    /// also after a migration or resurrection of this run; an aborted or timed out one is
+    /// resurrected with these options, and a failed one replaced. Reusing the name for another
+    /// Actor, task or input is an error, unless the tracked run is replaced. See
+    /// [`Actor::child_runs`].
+    pub run_name: Option<String>,
+}
+
+/// Options of [`Actor::resurrect`]. Options left out keep the values of the original run.
+#[derive(Clone, Debug, Default)]
+pub struct ResurrectOptions {
+    /// Resurrect with another token than the Actor's.
+    pub token: Option<String>,
+    pub timeout: Option<RunTimeout>,
+    /// Build, memory and the other run options of the API.
+    pub resurrect: RunResurrectOptions,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -194,14 +214,72 @@ impl Actor {
         Some(((remaining_millis + 999).div_euclid(1000)).max(MINIMUM_API_TIMEOUT_SECS))
     }
 
+    fn timeout_secs(timeout: Option<RunTimeout>) -> Option<Option<i64>> {
+        match timeout {
+            Some(RunTimeout::Duration(timeout)) => Some(Some(timeout.as_secs() as i64)),
+            Some(RunTimeout::Inherit) => Some(Self::remaining_time_secs()),
+            None => None,
+        }
+    }
+
     fn start_options(options: &CallOptions) -> ActorStartOptions {
         let mut start = options.start.clone();
-        match options.timeout {
-            Some(RunTimeout::Duration(timeout)) => start.timeout_secs = Some(timeout.as_secs() as i64),
-            Some(RunTimeout::Inherit) => start.timeout_secs = Self::remaining_time_secs(),
-            None => {}
+        if let Some(timeout_secs) = Self::timeout_secs(options.timeout) {
+            start.timeout_secs = timeout_secs;
         }
         start
+    }
+
+    /// Starts an Actor or a task (`kind`), or with a run name, the run tracked under it.
+    async fn start_run<T: Serialize>(
+        kind: &'static str,
+        id: &str,
+        input: Option<&T>,
+        options: &CallOptions,
+    ) -> ApifyClientResult<ActorRun> {
+        let client = Self::client_for(options.token.as_deref());
+        let start = Self::start_options(options);
+        let start_new = |start: ActorStartOptions| async {
+            match kind {
+                "task" => client.task(id).start(input, start).await,
+                _ => client.actor(id).start(input, start).await,
+            }
+        };
+        let Some(run_name) = &options.run_name else { return start_new(start).await };
+        let request = ChildRunRequest { kind, id: id.to_owned(), input: input.map(serde_json::to_value).transpose()? };
+        let resurrect = RunResurrectOptions {
+            build: start.build.clone(),
+            memory_mbytes: start.memory_mbytes,
+            timeout_secs: start.timeout_secs,
+            max_items: start.max_items,
+            max_total_charge_usd: start.max_total_charge_usd,
+            restart_on_error: start.restart_on_error,
+        };
+        let tracker = Self::child_run_tracker();
+        let (run, _) = tracker.start_or_resume(&client, run_name, request, resurrect, || start_new(start)).await?;
+        Ok(run)
+    }
+
+    /// Starts an Actor or a task and waits for its run to finish.
+    async fn call_run<T: Serialize>(
+        kind: &'static str,
+        id: &str,
+        input: Option<&T>,
+        options: CallOptions,
+    ) -> ApifyClientResult<ActorRun> {
+        let client = Self::client_for(options.token.as_deref());
+        let wait = options.wait.map(|wait| wait.as_secs() as i64);
+        let Some(run_name) = &options.run_name else {
+            let start = Self::start_options(&options);
+            return match kind {
+                "task" => client.task(id).call(input, start, wait).await,
+                _ => client.actor(id).call(input, start, wait).await,
+            };
+        };
+        let run = Self::start_run(kind, id, input, &options).await?;
+        let finished = client.run(run.id).wait_for_finish(wait).await?;
+        Self::child_run_tracker().update(run_name, &finished).await?;
+        Ok(finished)
     }
 
     /// Starts an Actor (`username/actor-name` or its id) and waits for its run to finish.
@@ -210,9 +288,7 @@ impl Actor {
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        let client = Self::client_for(options.token.as_deref());
-        let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        client.actor(actor_id).call(input, Self::start_options(&options), wait).await
+        Self::call_run("actor", actor_id, input, options).await
     }
 
     /// Starts an Actor without waiting for its run to finish.
@@ -221,8 +297,7 @@ impl Actor {
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
-        let client = Self::client_for(options.token.as_deref());
-        client.actor(actor_id).start(input, Self::start_options(&options)).await
+        Self::start_run("actor", actor_id, input, &options).await
     }
 
     /// Runs a task, with `input` overriding the task's input, and waits for the run to finish.
@@ -231,9 +306,37 @@ impl Actor {
         input: Option<&T>,
         options: CallOptions,
     ) -> ApifyClientResult<ActorRun> {
+        Self::call_run("task", task_id, input, options).await
+    }
+
+    /// Starts a task, with `input` overriding the task's input, without waiting for the run to
+    /// finish.
+    pub async fn start_task<T: Serialize>(
+        task_id: &str,
+        input: Option<&T>,
+        options: CallOptions,
+    ) -> ApifyClientResult<ActorRun> {
+        Self::start_run("task", task_id, input, &options).await
+    }
+
+    /// Resurrects a finished run (`SUCCEEDED`, `FAILED`, `ABORTED` or `TIMED-OUT`): it goes back
+    /// to `RUNNING` and keeps its default storages.
+    pub async fn resurrect(run_id: &str, options: ResurrectOptions) -> ApifyClientResult<ActorRun> {
         let client = Self::client_for(options.token.as_deref());
-        let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        client.task(task_id).call(input, Self::start_options(&options), wait).await
+        let mut resurrect = options.resurrect;
+        if let Some(timeout_secs) = Self::timeout_secs(options.timeout) {
+            resurrect.timeout_secs = timeout_secs;
+        }
+        client.run(run_id).resurrect(resurrect).await
+    }
+
+    /// Clients of the child runs started with [`CallOptions::run_name`], by that name, including
+    /// the runs started before a migration or resurrection of this run. Each client is of the
+    /// current run under its name, with the token it was started with in this process. The
+    /// tracked runs, with the runs replaced under each name, are kept in the default key-value
+    /// store under `__ACTOR_CHILD_RUNS`.
+    pub async fn child_runs() -> IndexMap<String, RunClient> {
+        Self::child_run_tracker().run_clients(Self::client()).await
     }
 
     /// Aborts a run. The status message goes to the aborted run.

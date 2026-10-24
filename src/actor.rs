@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::charging::{
     ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend, DEFAULT_DATASET_ITEM_EVENT,
 };
+use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
@@ -127,6 +128,7 @@ struct Inner {
     websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The options of the exit in progress.
     exit_options: Mutex<Option<ExitOptions>>,
+    child_runs: ChildRunTracker,
 }
 
 /// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
@@ -192,6 +194,9 @@ pub enum InitError {
     /// The platform events websocket could not be connected to.
     #[error("Error connecting to platform events websocket! {0}")]
     EventsConnection(String),
+    /// The tracked child runs could not be loaded.
+    #[error(transparent)]
+    ChildRuns(apify_client::ApifyClientError),
 }
 
 fn flush_and_exit(code: i32) -> ! {
@@ -302,6 +307,7 @@ impl Actor {
         // Only one `init` gets past this: the services can be set once.
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
+        let child_run_services = services.clone();
         let inner = Inner {
             configuration: configuration.clone(),
             client,
@@ -314,6 +320,7 @@ impl Actor {
             handlers: Mutex::default(),
             websocket: Mutex::default(),
             exit_options: Mutex::default(),
+            child_runs: ChildRunTracker::new(child_run_services),
         };
         if STATE.set(inner).is_err() {
             return Err(InitError::ServicesAlreadySet);
@@ -363,6 +370,7 @@ impl Actor {
         }
 
         state.services.purge_on_start().await?;
+        state.child_runs.load().await.map_err(InitError::ChildRuns)?;
         state.charging.init(state.storage.as_ref()).await?;
         if state.charging.is_pay_per_event() && state.smart.is_none() {
             tracing::warn!(
@@ -448,6 +456,10 @@ impl Actor {
     /// The options of the [`exit`](Self::exit) in progress, for the listeners of [`EventKind::Exit`].
     pub fn exit_options() -> Option<ExitOptions> {
         state().exit_options.lock().clone()
+    }
+
+    pub(crate) fn child_run_tracker() -> &'static ChildRunTracker {
+        &state().child_runs
     }
 
     pub fn events() -> &'static EventManager {

@@ -130,6 +130,38 @@ async fn status_messages_are_logged_at_their_level_and_return_the_updated_run() 
 }
 
 #[tokio::test]
+async fn named_child_runs_are_reused_resurrected_or_replaced_after_a_restart() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let vars = platform_env(&api, None);
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-1 child-2 child-3"), "{stdout}");
+    assert!(stdout.contains(r#"The run name "a" was already used for a different Actor, task or input."#), "{stdout}");
+    assert!(stdout.contains(r#"CHILD RUNS ["a", "b", "c"]"#), "{stdout}");
+    let starts = |api: &FakeApi| -> Vec<String> { api.platform_calls().into_iter().map(|(path, _, _)| path).collect() };
+    assert_eq!(starts(&api), ["/v2/actors/user~a/runs", "/v2/actor-tasks/user~b/runs", "/v2/actors/user~c/runs"]);
+
+    // After a restart: the aborted run is resurrected, the failed one replaced and the succeeded one kept.
+    api.set_run_status("child-1", "ABORTED");
+    api.set_run_status("child-2", "FAILED");
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-1 child-4 child-3"), "{stdout}");
+    assert_eq!(starts(&api)[3..], ["/v2/actor-runs/child-1/resurrect", "/v2/actor-tasks/user~b/runs"]);
+    let (stored, _) = api.record(DEFAULT_STORE, "__ACTOR_CHILD_RUNS").unwrap();
+    let stored: Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(stored["a"]["status"], "RUNNING");
+    assert_eq!(stored["b"]["runId"], "child-4");
+    assert_eq!(
+        stored["b"]["history"],
+        json!([{ "runId": "child-2", "status": "FAILED", "startedAt": "2026-01-01T00:00:00.000Z" }])
+    );
+}
+
+#[tokio::test]
 async fn the_actor_panics_before_init() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("before-init", &[], dir.path()).await;
@@ -260,6 +292,8 @@ async fn the_platform_api() {
         [
             "/v2/actors/apify~hello-world/runs",
             "/v2/actor-tasks/user~task/runs",
+            "/v2/actor-tasks/user~task/runs",
+            "/v2/actor-runs/old-run/resurrect",
             "/v2/actor-runs/other-run/abort",
             "/v2/webhooks",
             "/v2/actor-runs/run-1/metamorph",
@@ -270,13 +304,15 @@ async fn the_platform_api() {
     let timeout: i64 = query["timeout"].parse().unwrap();
     assert!((95..=100).contains(&timeout), "the remaining time of this run: {timeout}");
     assert_eq!(calls[1].1["memory"], "512");
-    assert_eq!(calls[2].1["gracefully"], "1");
+    assert_eq!((&calls[2].1["timeout"], &calls[2].2), (&"60".to_owned(), &json!({ "b": 2 })));
+    assert_eq!((&calls[3].1["timeout"], &calls[3].1["memory"]), (&"60".to_owned(), &"256".to_owned()));
+    assert_eq!(calls[4].1["gracefully"], "1");
     assert_eq!(
-        calls[3].2,
+        calls[5].2,
         json!({ "eventTypes": ["ACTOR.RUN.SUCCEEDED"], "requestUrl": "https://example.com/hook", "isAdHoc": true,
                 "condition": { "actorRunId": "run-1" } })
     );
-    assert_eq!(calls[4].1["targetActorId"], "apify~other");
+    assert_eq!(calls[6].1["targetActorId"], "apify~other");
     // The status message of an aborted run goes to that run.
     let updates = api.run_updates();
     assert_eq!(updates, [json!({ "statusMessage": "Stopped by the parent", "isStatusMessageTerminal": true })]);
@@ -424,6 +460,13 @@ fn child() {
                     let mut options = apify::CallOptions::default();
                     options.start.memory_mbytes = Some(512);
                     Actor::call_task("user/task", None::<&Value>, options).await?;
+                    let minute = apify::RunTimeout::Duration(Duration::from_secs(60));
+                    let options = apify::CallOptions { timeout: Some(minute), ..Default::default() };
+                    let run = Actor::start_task("user/task", Some(&json!({ "b": 2 })), options).await?;
+                    assert_eq!(run.status.as_deref(), Some("READY"), "not waited for");
+                    let mut resurrect = apify::ResurrectOptions { timeout: Some(minute), ..Default::default() };
+                    resurrect.resurrect.memory_mbytes = Some(256);
+                    Actor::resurrect("old-run", resurrect).await?;
                     let abort = apify::AbortOptions {
                         status_message: Some("Stopped by the parent".to_owned()),
                         gracefully: Some(true),
@@ -511,6 +554,24 @@ fn child() {
                 };
                 assert!(Actor::set_status_message("at debug", debug).await.is_none(), "no run to update");
                 Actor::set_status_message("at info by default", apify::StatusMessageOptions::default()).await;
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "child-runs" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let named = |name: &str| apify::CallOptions {
+                    run_name: Some(name.to_owned()),
+                    ..apify::CallOptions::default()
+                };
+                let a = Actor::start("user/a", Some(&json!({ "n": 1 })), named("a")).await.unwrap();
+                let b = Actor::start_task("user/b", None::<&Value>, named("b")).await.unwrap();
+                let c = Actor::start("user/c", None::<&Value>, named("c")).await.unwrap();
+                println!("RUNS {} {} {}", a.id, b.id, c.id);
+                if let Err(err) = Actor::start("user/other", None::<&Value>, named("a")).await {
+                    println!("REUSED {err}");
+                }
+                let mut names: Vec<String> = Actor::child_runs().await.into_keys().collect();
+                names.sort();
+                println!("CHILD RUNS {names:?}");
                 Actor::exit(apify::ExitOptions::default()).await;
             }
             "listen-before-init" => {

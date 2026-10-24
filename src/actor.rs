@@ -125,6 +125,8 @@ struct Inner {
     rebooting: AtomicBool,
     handlers: Mutex<Handlers>,
     websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The options of the exit in progress.
+    exit_options: Mutex<Option<ExitOptions>>,
 }
 
 /// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
@@ -311,6 +313,7 @@ impl Actor {
             rebooting: AtomicBool::new(false),
             handlers: Mutex::default(),
             websocket: Mutex::default(),
+            exit_options: Mutex::default(),
         };
         if STATE.set(inner).is_err() {
             return Err(InitError::ServicesAlreadySet);
@@ -442,6 +445,11 @@ impl Actor {
         }
     }
 
+    /// The options of the [`exit`](Self::exit) in progress, for the listeners of [`EventKind::Exit`].
+    pub fn exit_options() -> Option<ExitOptions> {
+        state().exit_options.lock().clone()
+    }
+
     pub fn events() -> &'static EventManager {
         &state().services.events
     }
@@ -466,6 +474,8 @@ impl Actor {
 
         events.close().await;
         tracing::debug!("Events closed");
+        // JS passes the options with the event; `Event::Exit` has no payload, so listeners read them here.
+        *state().exit_options.lock() = Some(options.clone());
         events.emit(Event::Exit);
 
         if options.exit {

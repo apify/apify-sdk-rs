@@ -114,7 +114,8 @@ async fn listeners_registered_before_init_are_attached_by_init() {
     let output = run_child("listen-before-init", &[], dir.path()).await;
     assert_exit(&output, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("EXIT LISTENER kept"), "{stdout}");
+    // The listeners of the exit see its options.
+    assert!(stdout.contains(r#"EXIT LISTENER kept Some("Bye")"#), "{stdout}");
     assert!(!stdout.contains("EXIT LISTENER removed"), "{stdout}");
 }
 
@@ -515,14 +516,15 @@ fn child() {
             "listen-before-init" => {
                 let listener = |name: &'static str| {
                     move |_| async move {
-                        println!("EXIT LISTENER {name}");
+                        let message = Actor::exit_options().and_then(|options| options.status_message);
+                        println!("EXIT LISTENER {name} {message:?}");
                     }
                 };
                 Actor::on(crawlee::core::EventKind::Exit, listener("kept"));
                 let removed = Actor::on(crawlee::core::EventKind::Exit, listener("removed"));
                 Actor::off(removed);
                 Actor::init(apify::InitOptions::default()).await.unwrap();
-                Actor::exit(apify::ExitOptions::default()).await;
+                Actor::exit(apify::ExitOptions::message("Bye")).await;
             }
             "before-init" => {
                 Actor::is_at_home();

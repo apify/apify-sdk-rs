@@ -104,6 +104,11 @@ impl DatasetBackend for ApifyDataset {
                 offset: Some(options.offset as i64),
                 limit: options.limit.map(|limit| limit as i64),
                 desc: options.desc.then_some(true),
+                fields: options.fields.clone(),
+                unwind: options.unwind.clone().map(|field| vec![field]),
+                clean: options.clean.then_some(true),
+                skip_hidden: options.skip_hidden.then_some(true),
+                skip_empty: options.skip_empty.then_some(true),
                 ..DatasetListItemsOptions::default()
             })
             .await

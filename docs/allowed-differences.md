@@ -37,6 +37,10 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.
 
+- **A redirected log chunk without a newline waits for the rest of its line.** The JS
+  `StreamedLog` logs such a chunk without its last character, which looks like a bug; here the
+  line is logged once it is complete (or when the stream ends).
+
 ## Input
 
 - **Encrypted PKCS#8 keys are not supported for input secrets.** The platform's key is a legacy

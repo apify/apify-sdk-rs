@@ -188,10 +188,12 @@ async fn request_queue_serves_its_own_requests_from_the_local_cache() {
     let info = queue.get_info().await.unwrap();
     assert_eq!((info.total_request_count, info.handled_request_count, info.pending_request_count), (3, 3, 0));
 
-    // Adding a handled request again costs no write.
+    // Adding a handled request again costs no write. As in Crawlee for JS, the cache keeps what
+    // the platform answered to the mark (whether it was handled before), so it says `false`.
     api.clear_calls();
     let again = queue.add_requests(vec!["https://a.test/1".into()], true).await.unwrap();
-    assert!(again.processed_requests[0].was_already_handled);
+    assert!(again.processed_requests[0].was_already_present);
+    assert!(!again.processed_requests[0].was_already_handled);
     assert_eq!(api.count_calls("POST"), 0);
 }
 

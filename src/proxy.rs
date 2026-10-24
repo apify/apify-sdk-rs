@@ -295,7 +295,7 @@ impl ProxySource for ProxyConfiguration {
     fn new_proxy_info(&self, session_id: &str) -> Option<ProxyInfo> {
         match &self.kind {
             // A session of its own per crawler session: the crawler keeps the proxy of a session.
-            Kind::Apify { .. } => Some(ProxyInfo::from_url(self.apify_url(&random_session_id()))),
+            Kind::Apify { .. } => Some(session_proxy_info(self.apify_url(&random_session_id()))),
             Kind::Custom(custom) => custom.new_proxy_info(session_id),
         }
     }
@@ -306,12 +306,18 @@ impl ProxySource for ProxyConfiguration {
     fn restored_proxy_info(&self, session_id: &str, restored: ProxyInfo) -> Option<ProxyInfo> {
         match &self.kind {
             Kind::Apify { .. } if has_proxy_session(&restored.username) => {
-                Some(ProxyInfo::from_url(self.apify_url_with_username(&restored.username)))
+                Some(session_proxy_info(self.apify_url_with_username(&restored.username)))
             }
             Kind::Apify { .. } => Some(restored),
             Kind::Custom(custom) => custom.restored_proxy_info(session_id, restored),
         }
     }
+}
+
+/// An Apify Proxy URL with a proxy session of its own: no other crawler session uses it, so the
+/// crawler can drop its HTTP client when the session goes.
+fn session_proxy_info(url: Url) -> ProxyInfo {
+    ProxyInfo { session_specific: true, ..ProxyInfo::from_url(url) }
 }
 
 /// Whether a proxy username has a `session-…` part (`SESSION_USERNAME_REGEX` in JS).

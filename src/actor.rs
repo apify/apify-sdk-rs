@@ -168,6 +168,9 @@ pub enum InitError {
     Storage(#[from] crawlee::core::StorageError),
     #[error(transparent)]
     Charging(#[from] ChargingError),
+    /// The platform events websocket could not be connected to.
+    #[error("Error connecting to platform events websocket! {0}")]
+    EventsConnection(String),
 }
 
 fn flush_and_exit(code: i32) -> ! {
@@ -313,7 +316,13 @@ impl Actor {
             match &configuration.actor_events_ws_url {
                 Some(url) => {
                     let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
-                    *state.websocket.lock() = Some(crate::events::connect(url, events.clone(), memory).await);
+                    match crate::events::connect(url, events.clone(), memory).await {
+                        Ok(relaying) => *state.websocket.lock() = Some(relaying),
+                        Err(err) => {
+                            events.close().await;
+                            return Err(InitError::EventsConnection(err));
+                        }
+                    }
                 }
                 None => tracing::debug!(
                     "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."

@@ -74,7 +74,7 @@ input schema. Copy it and `apify push`.
 | **Configuration** | Every `ACTOR_*` / `APIFY_*` variable of the JS SDK, with its precedence and defaults (all memory on the platform) |
 | **Storages** | Platform datasets, key-value stores and request queues behind the crawlee-rs storage traits; names, aliases (`ACTOR_STORAGES_JSON`, remembered across migrations), `force_cloud`; local files with the input kept on purge |
 | **Request queues** | Single-consumer mode (local head estimate, no locks) and shared mode (platform locks, prolonged for long requests) |
-| **Events** | The platform websocket relayed as crawlee-rs events: system info for autoscaling, `migrating` (state saved, run rebooted), `aborting` (graceful exit) |
+| **Events** | The platform websocket (reopened when it drops) relayed as crawlee-rs events: system info for autoscaling, `migrating` (state saved, run rebooted), `aborting` (graceful exit) |
 | **Input** | `get_input` from the store or `INPUT(.json)`, schema defaults applied locally, secret fields decrypted |
 | **Platform API** | `call`, `start`, `call_task`, `abort`, `metamorph`, `add_webhook`, `set_status_message` (crawler status forwarded), `get_env`, `use_state` |
 | **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |

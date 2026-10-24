@@ -627,6 +627,11 @@ impl Actor {
         state().services.open_key_value_store(&StorageIdentifier::Default).await?.get_value(key).await
     }
 
+    /// A value of the default key-value store, or `default` when it has none.
+    pub async fn get_value_or<T: DeserializeOwned>(key: &str, default: T) -> crawlee::core::StorageResult<T> {
+        Ok(Self::get_value(key).await?.unwrap_or(default))
+    }
+
     /// Stores a value as JSON in the default key-value store.
     pub async fn set_value<T: serde::Serialize + ?Sized>(key: &str, value: &T) -> crawlee::core::StorageResult<()> {
         state().services.open_key_value_store(&StorageIdentifier::Default).await?.set_value(key, value).await

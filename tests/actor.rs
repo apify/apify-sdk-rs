@@ -471,6 +471,8 @@ fn child() {
                 }
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 echo().await.unwrap();
+                assert_eq!(Actor::get_value_or("MISSING", json!({ "default": true })).await.unwrap()["default"], true);
+                assert_eq!(Actor::get_value_or("INPUT", json!(null)).await.unwrap()["greeting"], "hi");
                 Actor::exit(apify::ExitOptions::message("Echoed")).await;
             }
             "fail-default" | "fail-code" => {

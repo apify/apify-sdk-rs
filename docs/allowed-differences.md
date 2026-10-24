@@ -27,8 +27,6 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **The Actor's functions panic before `Actor::init()`.** Calling them first is a bug in the code;
   the JS SDK warns and continues with an uninitialized Actor. `Actor::on` and `Actor::off` are the
   exception: as in JS, listeners added before `init` are queued and attached by it.
-- **`Exit` listeners read the exit options from `Actor::exit_options()`.** The JS SDK emits the
-  options with the `exit` event; crawlee-rs's `Event::Exit` has no payload.
 - **`get_env` falls back to the `APIFY_*` variables.** The JS SDK reads both generations of
   variables into one object, and a missing `ACTOR_*` variable overwrites its `APIFY_*` predecessor
   with `null`. Here the `ACTOR_*` variable is read first and the `APIFY_*` one is the fallback.

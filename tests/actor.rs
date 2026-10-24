@@ -590,8 +590,9 @@ fn child() {
             }
             "listen-before-init" => {
                 let listener = |name: &'static str| {
-                    move |_| async move {
-                        let message = Actor::exit_options().and_then(|options| options.status_message);
+                    move |event| async move {
+                        let crawlee::core::Event::Exit(options) = event else { return };
+                        let message = options.status_message;
                         println!("EXIT LISTENER {name} {message:?}");
                     }
                 };

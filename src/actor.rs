@@ -76,6 +76,18 @@ pub struct ExitOptions {
     pub timeout: Duration,
 }
 
+impl ExitOptions {
+    /// The options as the payload of [`Event::Exit`], which crawlee-rs defines.
+    fn to_event_options(&self) -> crawlee::core::ExitOptions {
+        crawlee::core::ExitOptions {
+            status_message: self.status_message.clone(),
+            exit_code: self.exit_code,
+            exit: self.exit,
+            timeout: self.timeout,
+        }
+    }
+}
+
 impl Default for ExitOptions {
     fn default() -> Self {
         ExitOptions {
@@ -486,9 +498,8 @@ impl Actor {
 
         events.close().await;
         tracing::debug!("Events closed");
-        // JS passes the options with the event; `Event::Exit` has no payload, so listeners read them here.
         *state().exit_options.lock() = Some(options.clone());
-        events.emit(Event::Exit);
+        events.emit(Event::Exit(options.to_event_options()));
 
         if options.exit {
             // A thread of its own: the tokio runtime may be too busy to run a timer.

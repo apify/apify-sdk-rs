@@ -56,7 +56,7 @@ pub(crate) fn relay(message: &str, events: &EventManager, memory_limit_bytes: Op
             events.emit(Event::PersistState { is_migrating: true });
         }
         names::ABORTING => events.emit(Event::Aborting),
-        names::EXIT => events.emit(Event::Exit),
+        names::EXIT => events.emit(Event::Exit(Default::default())),
         _ => events.emit(Event::Custom { name, data }),
     }
     true

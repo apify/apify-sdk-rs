@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use apify_client::ApifyClient;
+use apify_client::models::ActorRun;
 use crawlee::core::events::ListenerId;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
@@ -96,8 +97,8 @@ impl ExitOptions {
 pub struct StatusMessageOptions {
     /// The last message of the run.
     pub is_terminal: bool,
-    /// How the message is logged. `Debug` (the default) logs it at the info level, as in JS.
-    pub level: StatusLevel,
+    /// The level the message is logged at; info when not set.
+    pub level: Option<StatusLevel>,
 }
 
 /// Where storages are opened (see [`Actor::open_dataset`]).
@@ -487,7 +488,7 @@ impl Actor {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
             if let Some(message) = &options.status_message {
-                let level = if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info };
+                let level = Some(if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
                 Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
             }
         };
@@ -513,25 +514,33 @@ impl Actor {
         Self::exit(ExitOptions { exit_code, ..options }).await;
     }
 
-    /// Sets the status message of the run, and logs it.
-    pub async fn set_status_message(message: &str, options: StatusMessageOptions) {
+    /// Sets the status message of the run, and logs it. Returns the updated run, or `None` when no
+    /// run was updated: off the platform, or when the update failed or timed out (which is logged).
+    pub async fn set_status_message(message: &str, options: StatusMessageOptions) -> Option<ActorRun> {
         match options.level {
-            StatusLevel::Warning => tracing::warn!("[Status message]: {message}"),
-            StatusLevel::Error => tracing::error!("[Status message]: {message}"),
-            _ => tracing::info!("[Status message]: {message}"),
+            Some(StatusLevel::Debug) => tracing::debug!("[Status message]: {message}"),
+            Some(StatusLevel::Warning) => tracing::warn!("[Status message]: {message}"),
+            Some(StatusLevel::Error) => tracing::error!("[Status message]: {message}"),
+            Some(StatusLevel::Info) | None => tracing::info!("[Status message]: {message}"),
         }
-        Self::update_run_status_message(message, options.is_terminal).await;
+        Self::update_run_status_message(message, options.is_terminal).await
     }
 
     /// Best effort: a failure or a slow API is only logged.
-    async fn update_run_status_message(message: &str, is_terminal: bool) {
-        let Some(run_id) = &state().configuration.actor_run_id else { return };
+    async fn update_run_status_message(message: &str, is_terminal: bool) -> Option<ActorRun> {
+        let run_id = state().configuration.actor_run_id.as_ref()?;
         let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": is_terminal });
         let run = state().client.run(run_id.clone());
         match tokio::time::timeout(STATUS_MESSAGE_TIMEOUT, run.update(&body)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => tracing::warn!("Setting the status message failed: {err}"),
-            Err(_) => tracing::warn!("Setting status message timed out after 1s"),
+            Ok(Ok(run)) => Some(run),
+            Ok(Err(err)) => {
+                tracing::warn!("Setting the status message failed: {err}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("Setting status message timed out after 1s");
+                None
+            }
         }
     }
 

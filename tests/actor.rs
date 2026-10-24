@@ -119,6 +119,16 @@ async fn listeners_registered_before_init_are_attached_by_init() {
 }
 
 #[tokio::test]
+async fn status_messages_are_logged_at_their_level_and_return_the_updated_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("status-local", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[Status message]: at info by default"), "{stdout}");
+    assert!(!stdout.contains("[Status message]: at debug"), "{stdout}");
+}
+
+#[tokio::test]
 async fn the_actor_panics_before_init() {
     let dir = tempfile::tempdir().unwrap();
     let output = run_child("before-init", &[], dir.path()).await;
@@ -483,12 +493,24 @@ fn child() {
                 echo().await.unwrap();
                 assert_eq!(Actor::get_value_or("MISSING", json!({ "default": true })).await.unwrap()["default"], true);
                 assert_eq!(Actor::get_value_or("INPUT", json!(null)).await.unwrap()["greeting"], "hi");
+                let run = Actor::set_status_message("Working", apify::StatusMessageOptions::default()).await;
+                assert!(run.is_some(), "the updated run");
                 Actor::exit(apify::ExitOptions::message("Echoed")).await;
             }
             "fail-default" | "fail-code" => {
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 let exit_code = if scenario == "fail-code" { 3 } else { apify::exit_codes::SUCCESS };
                 Actor::fail(apify::ExitOptions { exit_code, ..apify::ExitOptions::default() }).await;
+            }
+            "status-local" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let debug = apify::StatusMessageOptions {
+                    level: Some(crawlee::core::StatusLevel::Debug),
+                    ..apify::StatusMessageOptions::default()
+                };
+                assert!(Actor::set_status_message("at debug", debug).await.is_none(), "no run to update");
+                Actor::set_status_message("at info by default", apify::StatusMessageOptions::default()).await;
+                Actor::exit(apify::ExitOptions::default()).await;
             }
             "listen-before-init" => {
                 let listener = |name: &'static str| {

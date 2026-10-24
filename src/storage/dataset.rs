@@ -8,7 +8,7 @@ use crawlee::core::errors::StorageError;
 use crawlee::core::storage::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, PaginatedList};
 use serde_json::value::RawValue;
 
-use super::{backend_error, date, extra_date, unsupported};
+use super::{DropHook, backend_error, date, extra_date, unsupported};
 
 /// The API rejects payloads over 9 MB (`MAX_PAYLOAD_SIZE_BYTES` in `@apify/consts`).
 const MAX_PAYLOAD_SIZE_BYTES: usize = 9_437_184;
@@ -19,6 +19,7 @@ const MAX_ITEM_BYTES: usize = EFFECTIVE_LIMIT_BYTES - 2;
 
 pub(crate) struct ApifyDataset {
     pub(crate) client: DatasetClient,
+    pub(crate) drop_hook: DropHook,
 }
 
 /// Groups serialized items into JSON arrays of at most `limit` bytes, keeping their order.
@@ -67,7 +68,9 @@ impl DatasetBackend for ApifyDataset {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        self.client.delete().await.map_err(backend_error)
+        self.client.delete().await.map_err(backend_error)?;
+        self.drop_hook.dropped();
+        Ok(())
     }
 
     async fn purge(&self) -> StorageResult<()> {

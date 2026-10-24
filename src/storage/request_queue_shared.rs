@@ -17,11 +17,11 @@ use crawlee::core::storage::backend::{
 use lru::LruCache;
 use parking_lot::Mutex;
 
-use super::backend_error;
 use super::request_queue::{
     PURGE_UNSUPPORTED, get_request_by_id, newly_added, queue_metadata, send_batch, update_request,
 };
 use super::unsupported;
+use super::{DropHook, backend_error};
 
 const MAX_CACHED_REQUESTS: usize = 1_000_000;
 /// How long a fetched request stays locked, unless a longer processing time is expected.
@@ -50,12 +50,14 @@ pub(crate) struct ApifySharedRequestQueue {
     head: tokio::sync::Mutex<Head>,
     state: Mutex<State>,
     lock_secs: AtomicU64,
+    drop_hook: DropHook,
 }
 
 impl ApifySharedRequestQueue {
-    pub(crate) fn new(client: RequestQueueClient) -> Self {
+    pub(crate) fn new(client: RequestQueueClient, drop_hook: DropHook) -> Self {
         ApifySharedRequestQueue {
             client,
+            drop_hook,
             head: tokio::sync::Mutex::default(),
             state: Mutex::new(State {
                 known: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
@@ -112,7 +114,9 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        self.client.delete().await.map_err(backend_error)
+        self.client.delete().await.map_err(backend_error)?;
+        self.drop_hook.dropped();
+        Ok(())
     }
 
     async fn purge(&self) -> StorageResult<()> {

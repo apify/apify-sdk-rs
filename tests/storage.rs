@@ -113,6 +113,36 @@ async fn names_and_aliases_resolve_to_platform_storages() {
 }
 
 #[tokio::test]
+async fn a_storage_opened_again_is_the_same_storage() {
+    let api = FakeApi::start().await;
+    api.set_head_lag(3);
+    let services = services(&api);
+
+    // Start URLs added through one handle are fetched through another, before the platform head shows them.
+    let start = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    start.add_requests(vec!["https://a.test/start".into()], false).await.unwrap();
+    let crawler = services.open_request_queue(&StorageIdentifier::id(DEFAULT_QUEUE)).await.unwrap();
+    assert!(Arc::ptr_eq(start.backend(), crawler.backend()));
+    assert_eq!(crawler.fetch_next_request().await.unwrap().unwrap().url, "https://a.test/start");
+
+    // A named storage is looked up once.
+    let named = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    let again = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    assert!(named.same_storage(&again));
+    assert_eq!(api.count_calls("POST /v2/datasets"), 1);
+    let id = named.get_info().await.unwrap().id;
+    let by_id = services.open_dataset(&StorageIdentifier::id(id.clone())).await.unwrap();
+    assert!(named.same_storage(&by_id));
+
+    // Until it is dropped.
+    named.drop_storage().await.unwrap();
+    let recreated = services.open_dataset(&StorageIdentifier::name("results")).await.unwrap();
+    assert!(!recreated.same_storage(&again));
+    assert_eq!(api.count_calls("POST /v2/datasets"), 2);
+    assert_ne!(recreated.get_info().await.unwrap().id, id);
+}
+
+#[tokio::test]
 async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
     let api = FakeApi::start().await;
     let declared = Arc::new(Configuration {

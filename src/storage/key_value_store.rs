@@ -11,13 +11,14 @@ use crawlee::core::storage::backend::{
     KeyValueStoreListKeysResult, KeyValueStoreRecord,
 };
 
-use super::{backend_error, date, extra_date, unsupported};
+use super::{DropHook, backend_error, date, extra_date, unsupported};
 
 /// Content type of records stored without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
 pub(crate) struct ApifyKeyValueStore {
     pub(crate) client: KeyValueStoreClient,
+    pub(crate) drop_hook: DropHook,
 }
 
 #[async_trait]
@@ -39,7 +40,9 @@ impl KeyValueStoreBackend for ApifyKeyValueStore {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        self.client.delete().await.map_err(backend_error)
+        self.client.delete().await.map_err(backend_error)?;
+        self.drop_hook.dropped();
+        Ok(())
     }
 
     async fn purge(&self) -> StorageResult<()> {

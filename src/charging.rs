@@ -7,6 +7,11 @@
 //! A charge is counted against the budget at once, in one short critical section, and then sent
 //! to the platform without holding anything: concurrent charges and pushes do not wait for each
 //! other's API calls, and cannot together spend more than the budget.
+//!
+//! With buffered dataset writes (an extra of crawlee-rs, `CRAWLEE_DATASET_BUFFER`), the charges
+//! of pushed items are still counted against the budget when the items are pushed, but sent once
+//! per flush, with the counts of all its items summed by event. A flush that fails gives its
+//! charges back.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +24,7 @@ use crawlee::core::storage::backend::{
     DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, KeyValueStoreBackend, PaginatedList,
     RequestQueueBackend, StorageBackend, StorageKind,
 };
+use crawlee::core::storage::dataset_buffer::FlushCounters;
 use crawlee::{Dataset, StorageIdentifier};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -178,8 +184,9 @@ fn limit(count: f64) -> Option<u64> {
 
 tokio::task_local! {
     /// Set while the Actor stores items whose charges it already reserved, so that the default
-    /// dataset does not reserve them again.
-    static ITEMS_RESERVED: ();
+    /// dataset does not reserve them again. Holds the reserved charges until a buffered dataset
+    /// takes them over, to send them when it stores the items.
+    static ITEMS_RESERVED: Arc<Mutex<Option<FlushCounters>>>;
 }
 
 /// Tracks the charges of a run and makes them.
@@ -487,10 +494,93 @@ impl ChargingManager {
         events.iter().copied().chain(is_default_dataset.then_some(DEFAULT_DATASET_ITEM_EVENT))
     }
 
-    /// Stores items with `store`, whose charges were reserved already: the default dataset does
-    /// not charge them again.
-    pub(crate) async fn with_items_reserved<F: Future>(store: F) -> F::Output {
-        ITEMS_RESERVED.scope((), store).await
+    /// The charges [`reserve_items`](Self::reserve_items) reserved for `items_count` items.
+    fn item_counters(events: &[&str], is_default_dataset: bool, items_count: usize) -> FlushCounters {
+        let mut counters = FlushCounters::new();
+        for event in Self::item_events(events, is_default_dataset) {
+            counters.add(event, items_count as u64);
+        }
+        counters
+    }
+
+    /// Takes back reserved charges whose items were not stored.
+    fn unreserve(&self, counters: &FlushCounters) {
+        let mut state = self.state.lock();
+        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
+            for (event, count) in counters.iter() {
+                self.add_charged(&mut state, event, -(count as i64));
+            }
+        }
+    }
+
+    /// Sends reserved charges, one call per event.
+    async fn send_reserved(&self, counters: &FlushCounters) -> Result<(), ChargingError> {
+        if !self.is_pay_per_event() {
+            return Ok(());
+        }
+        for (event, count) in counters.iter() {
+            self.send_charge(event, count, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Stores items with `store`, whose charges (`reserved`) were reserved already: the default
+    /// dataset does not charge them again. Returns the charges unless a buffered dataset took
+    /// them over, which then sends them when it stores the items, or gives them back.
+    pub(crate) async fn with_items_reserved<F: Future>(
+        reserved: FlushCounters,
+        store: F,
+    ) -> (F::Output, Option<FlushCounters>) {
+        let reserved = Arc::new(Mutex::new(Some(reserved)));
+        let output = ITEMS_RESERVED.scope(reserved.clone(), store).await;
+        let left = reserved.lock().take();
+        (output, left)
+    }
+
+    /// Stores as many of `items` in `dataset` as the budget allows for `events` (plus the
+    /// default dataset item event if `is_default_dataset`), reserving their charges first and
+    /// sending them after (or, for a buffered dataset, with the flush that stores them), so that
+    /// concurrent pushes neither wait for each other nor spend more than the budget together.
+    pub(crate) async fn push_reserving_charges(
+        &self,
+        dataset: &Dataset,
+        mut items: Vec<DatasetItem>,
+        events: &[&str],
+        is_default_dataset: bool,
+    ) -> Result<ChargeResult, ChargingError> {
+        let limit = self.reserve_items(items.len(), events, is_default_dataset);
+        if limit == 0 {
+            return Ok(ChargeResult {
+                event_charge_limit_reached: !items.is_empty(),
+                charged_count: 0,
+                chargeable_within_limit: self.chargeable_within_limit(),
+            });
+        }
+        items.truncate(limit);
+        let reserved = Self::item_counters(events, is_default_dataset, limit);
+        let (stored, left) = Self::with_items_reserved(reserved, dataset.push_items(items)).await;
+        match (stored, left) {
+            (Err(err), Some(reserved)) => {
+                self.unreserve(&reserved);
+                return Err(err.into());
+            }
+            // A buffered dataset gave the charges back already.
+            (Err(err), None) => return Err(err.into()),
+            (Ok(()), Some(reserved)) => self.send_reserved(&reserved).await?,
+            // A buffered dataset sends them when it stores the items.
+            (Ok(()), None) => {}
+        }
+        let reached = if events.is_empty() {
+            self.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
+        } else {
+            events.iter().any(|event| self.is_event_charge_limit_reached(event))
+        };
+        Ok(ChargeResult {
+            event_charge_limit_reached: reached,
+            // Without the default dataset item event, `push_data` charges nothing.
+            charged_count: if events.is_empty() && !is_default_dataset { 0 } else { limit as u64 },
+            chargeable_within_limit: self.chargeable_within_limit(),
+        })
     }
 
     /// Sends a charge counted already: to the platform (unless synthetic, charged by the platform
@@ -667,6 +757,36 @@ impl DatasetBackend for ChargingDataset {
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
         self.inner.get_data(options).await
     }
+
+    /// Items a buffered dataset takes: their charges are reserved now, so that the budget is
+    /// enforced when they are pushed, and sent with the flush that stores them. The Actor's own
+    /// pushes reserved theirs already, and hand them over.
+    fn admit_buffered(&self, items: &mut Vec<DatasetItem>) -> FlushCounters {
+        if let Ok(reserved) = ITEMS_RESERVED.try_with(|reserved| reserved.lock().take()) {
+            return reserved.unwrap_or_default();
+        }
+        let charging = &self.charging;
+        if items.is_empty() || !charging.is_initialized() || !charging.is_pay_per_event() {
+            return FlushCounters::new();
+        }
+        let limit = charging.reserve_items(items.len(), &[], true);
+        items.truncate(limit);
+        ChargingManager::item_counters(&[], true, limit)
+    }
+
+    /// Stores the items of a flush and sends their charges, one call per event; gives the charges
+    /// back when the items could not be stored. A charge that cannot be sent is logged: the items
+    /// are stored, and failing the flush would store them again.
+    async fn push_buffered(&self, items: Vec<DatasetItem>, counters: FlushCounters) -> StorageResult<()> {
+        if let Err(err) = self.inner.push_data(items).await {
+            self.charging.unreserve(&counters);
+            return Err(err);
+        }
+        if let Err(err) = self.charging.send_reserved(&counters).await {
+            tracing::error!("Charging for stored dataset items failed: {err}");
+        }
+        Ok(())
+    }
 }
 
 /// A storage backend whose default dataset charges for its items.
@@ -794,6 +914,162 @@ mod tests {
         assert_eq!(manager.charged_event_count("page"), 0);
         assert_eq!(manager.charge(keyed(item, 1, "other")).await.unwrap().charged_count, 1);
         assert!(matches!(manager.charge(keyed(item, 1, " ")).await, Err(ChargingError::Invalid(_))));
+    }
+
+    /// A local pay-per-event manager whose charges go to a charging log in `storage`; every event
+    /// costs 1 USD.
+    async fn local_manager(max: f64, storage: &crawlee::core::MemoryStorageBackend) -> Arc<ChargingManager> {
+        let configuration = Configuration {
+            test_pay_per_event: true,
+            use_charging_log_dataset: true,
+            max_total_charge_usd: max,
+            ..Configuration::default()
+        };
+        let client = crate::new_client(&configuration, None, Default::default());
+        let manager = Arc::new(ChargingManager::new(Arc::new(configuration), client));
+        manager.init(storage).await.unwrap();
+        manager
+    }
+
+    /// The charges sent, from the charging log: (event, count).
+    async fn charges_sent(storage: &crawlee::core::MemoryStorageBackend) -> Vec<(String, u64)> {
+        let log = Dataset::open(storage, &StorageIdentifier::name(LOCAL_CHARGING_LOG_DATASET_NAME)).await.unwrap();
+        let entries: Vec<Value> = log.get_all().await.unwrap();
+        entries
+            .iter()
+            .map(|entry| (entry["eventName"].as_str().unwrap().to_owned(), entry["chargedCount"].as_u64().unwrap()))
+            .collect()
+    }
+
+    fn lingering() -> crawlee::core::DatasetBufferOptions {
+        crawlee::core::DatasetBufferOptions::new()
+            .with_stages([crawlee::core::BufferStage::new(0, Duration::from_secs(3600))])
+    }
+
+    fn items(count: usize) -> Vec<DatasetItem> {
+        (0..count).map(|n| serde_json::value::to_raw_value(&serde_json::json!({ "n": n })).unwrap()).collect()
+    }
+
+    /// The default dataset of an Actor, on `storage`, charging through `charging`.
+    async fn default_dataset(
+        storage: &Arc<crawlee::core::MemoryStorageBackend>,
+        charging: &Arc<ChargingManager>,
+    ) -> Dataset {
+        let charged = ChargingStorageBackend {
+            inner: storage.clone(),
+            charging: charging.clone(),
+            default_dataset_id: "default".to_owned(),
+        };
+        Dataset::open(&charged, &StorageIdentifier::Default).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn buffered_items_are_charged_once_per_flush() {
+        let storage = Arc::new(crawlee::core::MemoryStorageBackend::new());
+        let charging = local_manager(100.0, &storage).await;
+        let dataset = default_dataset(&storage, &charging).await.with_buffer(lingering(), None);
+
+        for _ in 0..3 {
+            let result = charging.push_reserving_charges(&dataset, items(2), &["page"], true).await.unwrap();
+            assert_eq!(result.charged_count, 2);
+        }
+        // Pushed without reserving, as a crawler's `ctx.push_data` does: reserved when buffered.
+        dataset.push_items(items(1)).await.unwrap();
+        // Counted against the budget at once, sent with the flush.
+        assert_eq!(charging.charged_event_count("page"), 6);
+        assert_eq!(charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 7);
+        assert!(charges_sent(&storage).await.is_empty());
+
+        dataset.flush().await.unwrap();
+        let sent = charges_sent(&storage).await;
+        assert_eq!(sent, [("page".to_owned(), 6), (DEFAULT_DATASET_ITEM_EVENT.to_owned(), 7)]);
+        assert_eq!(dataset.get_info().await.unwrap().item_count, 7);
+    }
+
+    #[tokio::test]
+    async fn the_budget_is_enforced_when_items_are_pushed() {
+        // Each item costs 2 USD locally: `page` and the default dataset item.
+        let storage = Arc::new(crawlee::core::MemoryStorageBackend::new());
+        let charging = local_manager(9.0, &storage).await;
+        let buffered = default_dataset(&storage, &charging).await.with_buffer(lingering(), None);
+        let result = charging.push_reserving_charges(&buffered, items(3), &["page"], true).await.unwrap();
+        assert_eq!((result.charged_count, result.event_charge_limit_reached), (3, false));
+        let result = charging.push_reserving_charges(&buffered, items(3), &["page"], true).await.unwrap();
+        assert_eq!((result.charged_count, result.event_charge_limit_reached), (1, false), "3 USD buy 1 more");
+        let result = charging.push_reserving_charges(&buffered, items(3), &["page"], true).await.unwrap();
+        assert_eq!((result.charged_count, result.event_charge_limit_reached), (1, true), "one over, to stop the run");
+        let result = charging.push_reserving_charges(&buffered, items(3), &["page"], true).await.unwrap();
+        assert_eq!(result.charged_count, 0);
+        // A crawler's push over the budget is cut too.
+        buffered.push_items(items(2)).await.unwrap();
+        buffered.flush().await.unwrap();
+        assert_eq!(buffered.get_info().await.unwrap().item_count, 5);
+        assert_eq!(charges_sent(&storage).await, [("page".to_owned(), 5), (DEFAULT_DATASET_ITEM_EVENT.to_owned(), 5)]);
+    }
+
+    /// Fails every push.
+    struct DownDataset;
+
+    #[async_trait]
+    impl DatasetBackend for DownDataset {
+        async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
+            unimplemented!()
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn push_data(&self, _items: Vec<DatasetItem>) -> StorageResult<()> {
+            Err(StorageError::Backend("the API is down".into()))
+        }
+        async fn get_data(&self, _options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_gives_its_charges_back() {
+        let storage = crawlee::core::MemoryStorageBackend::new();
+        let charging = local_manager(100.0, &storage).await;
+        let backend = Arc::new(ChargingDataset { inner: Arc::new(DownDataset), charging: charging.clone() });
+        let dataset = Dataset::from_backend(backend).with_buffer(lingering(), None);
+        charging.push_reserving_charges(&dataset, items(3), &["page"], true).await.unwrap();
+        dataset.push_items(items(1)).await.unwrap();
+        assert_eq!(charging.charged_event_count("page"), 3);
+        assert_eq!(charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 4);
+
+        assert!(dataset.flush().await.is_err());
+        assert_eq!(charging.charged_event_count("page"), 0);
+        assert_eq!(charging.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 0);
+        assert!(charges_sent(&storage).await.is_empty());
+
+        // Unbuffered, a failed push gives them back as before.
+        let unbuffered = Dataset::from_backend(Arc::new(ChargingDataset {
+            inner: Arc::new(DownDataset),
+            charging: charging.clone(),
+        }));
+        assert!(charging.push_reserving_charges(&unbuffered, items(2), &["page"], true).await.is_err());
+        assert_eq!(charging.charged_event_count("page"), 0);
+    }
+
+    #[tokio::test]
+    async fn unbuffered_items_are_charged_once_per_push() {
+        let storage = Arc::new(crawlee::core::MemoryStorageBackend::new());
+        let charging = local_manager(100.0, &storage).await;
+        let dataset = default_dataset(&storage, &charging).await;
+        charging.push_reserving_charges(&dataset, items(2), &["page"], true).await.unwrap();
+        charging.push_reserving_charges(&dataset, items(1), &["page"], true).await.unwrap();
+        assert_eq!(
+            charges_sent(&storage).await,
+            [
+                ("page".to_owned(), 2),
+                (DEFAULT_DATASET_ITEM_EVENT.to_owned(), 2),
+                ("page".to_owned(), 1),
+                (DEFAULT_DATASET_ITEM_EVENT.to_owned(), 1),
+            ]
+        );
     }
 
     #[tokio::test]

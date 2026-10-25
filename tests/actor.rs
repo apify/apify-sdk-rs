@@ -381,6 +381,36 @@ async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
 }
 
 #[tokio::test]
+async fn buffered_pay_per_event_pushes_of_a_crawl_are_charged_per_flush() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "30".to_owned()));
+    vars.push(("CRAWLEE_DATASET_BUFFER", "1".to_owned()));
+    vars.push(("CRAWLEE_DATASET_BUFFER_STAGES", "2:300ms".to_owned()));
+    assert_exit(&run_child("ppe-buffered-crawl", &vars, dir.path()).await, 0);
+
+    // The budget stops the pushes exactly as without buffering: 30 USD buy 20 items at 1.5, and
+    // one more is charged, so that the platform stops the run.
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 21);
+    let charges: Vec<u64> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body["count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(charges.iter().sum::<u64>(), 21, "each stored item is charged once");
+    assert!(charges.len() < 21, "the charges were sent per flush: {charges:?}");
+    assert!(api.count_calls("POST /v2/datasets/") < 21, "the items were stored in batches");
+}
+
+#[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
     let vars = [
@@ -527,6 +557,29 @@ fn child() {
                     // Each charge call takes 300 ms: one after another, 21 would take over 6 s.
                     let elapsed = started.elapsed();
                     assert!(elapsed < Duration::from_secs(2), "the pushes waited for each other: {elapsed:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-buffered-crawl" => {
+                Actor::main(|| async move {
+                    let charged = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let counter = charged.clone();
+                    let crawler = crawlee::BasicCrawler::builder()
+                        .request_handler(move |ctx: crawlee::BasicContext| {
+                            let counter = counter.clone();
+                            async move {
+                                let item = json!({ "url": ctx.request().url });
+                                let result = Actor::push_data_and_charge(&item, "page").await?;
+                                counter.fetch_add(result.charged_count, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            }
+                        })
+                        .build()?;
+                    let urls: Vec<String> = (0..30).map(|n| format!("https://example.com/{n}")).collect();
+                    let stats = crawler.run(urls).await?;
+                    assert_eq!(stats.requests_succeeded, 30);
+                    assert_eq!(charged.load(std::sync::atomic::Ordering::SeqCst), 21);
                     Ok(())
                 })
                 .await

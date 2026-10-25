@@ -18,9 +18,7 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::charging::{
-    ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend, DEFAULT_DATASET_ITEM_EVENT,
-};
+use crate::charging::{ChargeOptions, ChargeResult, ChargingError, ChargingManager, ChargingStorageBackend};
 use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
@@ -677,7 +675,7 @@ impl Actor {
         events: &[&str],
     ) -> Result<ChargeResult, ChargingError> {
         // Serialized once, straight from `data`: the items are not built as a `Value` tree first.
-        let mut items = serialize_items(data)?;
+        let items = serialize_items(data)?;
         let dataset = state().services.open_dataset(&StorageIdentifier::Default).await?;
         let charging = &state().charging;
         if !charging.is_pay_per_event() {
@@ -696,31 +694,15 @@ impl Actor {
         }
         // Storing an item also charges the per-item event when the dataset is the Actor's own.
         let is_default_dataset = state().smart.is_some();
-        let limit = charging.reserve_items(items.len(), events, is_default_dataset);
-        if limit == 0 {
-            return Ok(ChargeResult {
-                event_charge_limit_reached: !items.is_empty(),
-                charged_count: 0,
-                chargeable_within_limit: charging.chargeable_within_limit(),
-            });
-        }
-        items.truncate(limit);
-        if let Err(err) = ChargingManager::with_items_reserved(dataset.push_items(items)).await {
-            charging.unreserve_items(events, is_default_dataset, limit);
-            return Err(err.into());
-        }
-        charging.send_item_charges(events, is_default_dataset, limit).await?;
-        let reached = if events.is_empty() {
-            charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
-        } else {
-            events.iter().any(|event| charging.is_event_charge_limit_reached(event))
-        };
-        Ok(ChargeResult {
-            event_charge_limit_reached: reached,
-            // Without the default dataset item event, `push_data` charges nothing.
-            charged_count: if events.is_empty() && !is_default_dataset { 0 } else { limit as u64 },
-            chargeable_within_limit: charging.chargeable_within_limit(),
-        })
+        charging.push_reserving_charges(&dataset, items, events, is_default_dataset).await
+    }
+
+    /// Stores the items buffered so far in the datasets the Actor opened through its services,
+    /// when buffered dataset writes are on (`CRAWLEE_DATASET_BUFFER`, an extra of crawlee-rs).
+    /// They are also stored on `Actor::exit`, on the `PersistState`, `Migrating` and `Aborting`
+    /// events, and when a crawler finishes.
+    pub async fn flush_data() -> crawlee::core::StorageResult<()> {
+        state().services.flush_datasets().await
     }
 
     /// A value of the default key-value store.

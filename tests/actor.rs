@@ -411,6 +411,26 @@ async fn buffered_pay_per_event_pushes_of_a_crawl_are_charged_per_flush() {
 }
 
 #[tokio::test]
+async fn a_buffered_item_too_large_fails_only_its_own_request() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut vars = platform_env(&api, None);
+    vars.push(("CRAWLEE_DATASET_BUFFER", "1".to_owned()));
+    vars.push(("CRAWLEE_DATASET_BUFFER_STAGES", "0:200ms".to_owned()));
+    assert_exit(&run_child("buffered-too-large", &vars, dir.path()).await, 0);
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 6);
+}
+
+#[tokio::test]
+async fn exit_fails_when_buffered_items_cannot_be_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = [("CRAWLEE_DATASET_BUFFER", "1".to_owned()), ("CRAWLEE_DATASET_BUFFER_STAGES", "0:3600".to_owned())];
+    let output = run_child("buffered-unstored", &vars, dir.path()).await;
+    assert_exit(&output, apify::exit_codes::ERROR_UNKNOWN);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("could not be stored"));
+}
+
+#[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
     let vars = [
@@ -580,6 +600,44 @@ fn child() {
                     let stats = crawler.run(urls).await?;
                     assert_eq!(stats.requests_succeeded, 30);
                     assert_eq!(charged.load(std::sync::atomic::Ordering::SeqCst), 21);
+                    Ok(())
+                })
+                .await
+            }
+            "buffered-too-large" => {
+                Actor::main(|| async move {
+                    // All at once, so that their items share flushes.
+                    let crawler = crawlee::BasicCrawler::builder()
+                        .fixed_concurrency(7)
+                        .max_request_retries(0)
+                        .request_handler(|ctx: crawlee::BasicContext| async move {
+                            let url = ctx.request().url.clone();
+                            // Over the 9 MB payload limit of the API, pushed once the others are
+                            // buffered.
+                            let text = if url.ends_with("/3") {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                "x".repeat(9_500_000)
+                            } else {
+                                String::new()
+                            };
+                            Actor::push_data(&json!({ "url": url, "text": text })).await?;
+                            Ok(())
+                        })
+                        .build()?;
+                    let urls: Vec<String> = (0..7).map(|n| format!("https://example.com/{n}")).collect();
+                    let stats = crawler.run(urls).await?;
+                    assert_eq!((stats.requests_succeeded, stats.requests_failed), (6, 1));
+                    Ok(())
+                })
+                .await
+            }
+            "buffered-unstored" => {
+                let storage: std::sync::Arc<dyn crawlee::core::StorageBackend> =
+                    std::sync::Arc::new(common::DownDatasets::default());
+                let init = apify::InitOptions { storage: Some(storage), ..apify::InitOptions::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    // Buffered: the push returns before the item is (not) stored.
+                    Actor::push_data(&json!({ "n": 1 })).await?;
                     Ok(())
                 })
                 .await

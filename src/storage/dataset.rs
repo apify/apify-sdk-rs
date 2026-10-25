@@ -79,7 +79,8 @@ impl DatasetBackend for ApifyDataset {
         ))
     }
 
-    async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+    /// Items over the API's size limit are rejected before they are sent, or buffered.
+    fn validate_items(&self, items: &[DatasetItem]) -> StorageResult<()> {
         for (index, item) in items.iter().enumerate() {
             let bytes = item.get().len();
             if bytes > MAX_ITEM_BYTES {
@@ -88,6 +89,23 @@ impl DatasetBackend for ApifyDataset {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Invalid items, and the API rejecting the payload (400, 413).
+    fn rejects_items(&self, error: &StorageError) -> bool {
+        match error {
+            StorageError::InvalidArgument(_) => true,
+            StorageError::Backend(source) => matches!(
+                source.downcast_ref::<apify_client::ApifyClientError>(),
+                Some(apify_client::ApifyClientError::Api(api)) if matches!(api.status_code, 400 | 413)
+            ),
+            _ => false,
+        }
+    }
+
+    async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+        self.validate_items(&items)?;
         // Pushed one after another, to keep the order of the items.
         // Each chunk is sent as the JSON array of its items, copied as they are: they were
         // serialized once already and are not parsed again.
@@ -130,6 +148,29 @@ mod tests {
 
     fn items(texts: &[&str]) -> Vec<DatasetItem> {
         texts.iter().map(|text| RawValue::from_string((*text).to_owned()).unwrap()).collect()
+    }
+
+    fn dataset() -> ApifyDataset {
+        let configuration = crate::Configuration::default();
+        let client = crate::new_client(&configuration, None, Default::default()).dataset("d");
+        let drop_hook = DropHook {
+            opened: std::sync::Weak::new(),
+            kind: crawlee::core::storage::backend::StorageKind::Dataset,
+            id: "d".to_owned(),
+        };
+        ApifyDataset { client, drop_hook }
+    }
+
+    #[test]
+    fn items_over_the_size_limit_are_rejected_before_they_are_buffered() {
+        let dataset = dataset();
+        let big = format!(r#"{{"text":"{}"}}"#, "x".repeat(MAX_ITEM_BYTES));
+        let err = dataset.validate_items(&items(&[r#"{"a":1}"#, &big])).unwrap_err();
+        assert!(matches!(err, StorageError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("Data item at index 1 is too large"), "{err}");
+        assert!(dataset.validate_items(&items(&[r#"{"a":1}"#])).is_ok());
+        assert!(dataset.rejects_items(&err));
+        assert!(!dataset.rejects_items(&backend_error(apify_client::ApifyClientError::Timeout)));
     }
 
     #[test]

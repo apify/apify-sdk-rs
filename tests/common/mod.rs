@@ -805,3 +805,60 @@ async fn delete_lock(
     request.lock = None;
     StatusCode::NO_CONTENT.into_response()
 }
+
+/// Memory storage whose datasets cannot store anything.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct DownDatasets(crawlee::core::MemoryStorageBackend);
+
+#[allow(dead_code)]
+struct DownDataset(std::sync::Arc<dyn crawlee::core::storage::backend::DatasetBackend>);
+
+#[async_trait::async_trait]
+impl crawlee::core::storage::backend::DatasetBackend for DownDataset {
+    async fn get_metadata(&self) -> crawlee::core::StorageResult<crawlee::core::storage::backend::DatasetInfo> {
+        self.0.get_metadata().await
+    }
+    async fn drop_storage(&self) -> crawlee::core::StorageResult<()> {
+        self.0.drop_storage().await
+    }
+    async fn purge(&self) -> crawlee::core::StorageResult<()> {
+        self.0.purge().await
+    }
+    async fn push_data(
+        &self,
+        _items: Vec<crawlee::core::storage::backend::DatasetItem>,
+    ) -> crawlee::core::StorageResult<()> {
+        Err(crawlee::core::StorageError::Backend("the dataset is down".into()))
+    }
+    async fn get_data(
+        &self,
+        options: crawlee::core::storage::backend::DatasetListOptions,
+    ) -> crawlee::core::StorageResult<
+        crawlee::core::storage::backend::PaginatedList<crawlee::core::storage::backend::DatasetItem>,
+    > {
+        self.0.get_data(options).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crawlee::core::StorageBackend for DownDatasets {
+    async fn create_dataset_backend(
+        &self,
+        id: &crawlee::StorageIdentifier,
+    ) -> crawlee::core::StorageResult<std::sync::Arc<dyn crawlee::core::storage::backend::DatasetBackend>> {
+        Ok(std::sync::Arc::new(DownDataset(self.0.create_dataset_backend(id).await?)))
+    }
+    async fn create_key_value_store_backend(
+        &self,
+        id: &crawlee::StorageIdentifier,
+    ) -> crawlee::core::StorageResult<std::sync::Arc<dyn crawlee::core::storage::backend::KeyValueStoreBackend>> {
+        self.0.create_key_value_store_backend(id).await
+    }
+    async fn create_request_queue_backend(
+        &self,
+        id: &crawlee::StorageIdentifier,
+    ) -> crawlee::core::StorageResult<std::sync::Arc<dyn crawlee::core::storage::backend::RequestQueueBackend>> {
+        self.0.create_request_queue_backend(id).await
+    }
+}

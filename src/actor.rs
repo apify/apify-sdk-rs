@@ -510,17 +510,25 @@ impl Actor {
             });
         }
 
+        let mut exit_code = options.exit_code;
         let teardown = async {
             events.wait_for_all_listeners_to_complete().await;
             // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
             if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
+            // Buffered dataset items (`CRAWLEE_DATASET_BUFFER`) are stored before the storage goes.
+            if let Err(err) = state().services.flush_datasets_with_retries(3).await {
+                tracing::error!("Buffered dataset items could not be stored: {err}");
+                if exit_code == exit_codes::SUCCESS {
+                    exit_code = exit_codes::ERROR_UNKNOWN;
+                }
+            }
             if let Err(err) = state().storage.teardown().await {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
             if let Some(message) = &options.status_message {
-                let level = Some(if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
+                let level = Some(if exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
                 Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
             }
         };
@@ -536,7 +544,7 @@ impl Actor {
 
         state().exiting.store(false, Ordering::Release);
         if options.exit {
-            flush_and_exit(options.exit_code);
+            flush_and_exit(exit_code);
         }
     }
 
@@ -700,7 +708,8 @@ impl Actor {
     /// Stores the items buffered so far in the datasets the Actor opened through its services,
     /// when buffered dataset writes are on (`CRAWLEE_DATASET_BUFFER`, an extra of crawlee-rs).
     /// They are also stored on `Actor::exit`, on the `PersistState`, `Migrating` and `Aborting`
-    /// events, and when a crawler finishes.
+    /// events, and when a crawler finishes. `Err` when items could not be stored: they stay
+    /// buffered and are retried, and `Actor::exit` fails the run if they still cannot be stored.
     pub async fn flush_data() -> crawlee::core::StorageResult<()> {
         state().services.flush_datasets().await
     }

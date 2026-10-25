@@ -102,6 +102,11 @@ on for an Actor with `CRAWLEE_DATASET_BUFFER=1`, tune it with `CRAWLEE_DATASET_B
 - **When items are stored.** At the end of the linger, at the byte cap, on the `persistState`,
   `migrating` and `aborting` platform events and on `Actor::exit`, when a crawler finishes, and on
   `Actor::flush_data()`. Items keep their push order.
+- **Failures.** An item over the API's 9 MB limit fails its own push right away, as without
+  buffering, rather than the flush it would share with others. Items no request waits for
+  (pushed outside a crawler's requests) are kept and retried when a flush fails; if they still
+  cannot be stored, `Actor::flush_data()` returns the error and `Actor::exit` logs it and exits
+  with code 92 instead of 0. Pushes in a crawler's error handlers are stored before they return.
 - **Requests.** A crawler marks a request as handled only once the items pushed while handling it
   (with `ctx.push_data` or `Actor::push_data*`, in the request's task) are stored, and retries it
   if they cannot be. A migration or crash never leaves a request handled without its items.
@@ -109,8 +114,11 @@ on for an Actor with `CRAWLEE_DATASET_BUFFER=1`, tune it with `CRAWLEE_DATASET_B
   pushed, so `ChargeResult`, `event_charge_limit_reached` and `ACTOR_MAX_TOTAL_CHARGE_USD` stop a
   run at the same item as without buffering. The charge calls are sent when the items are stored:
   one per event per flush, with the counts of all the flush's items summed, instead of one per
-  push. If a flush fails, its charges are given back, as for a failed push. A charge call that
-  fails after its items were stored is logged, not returned (the push returned already).
+  push. This holds for any buffered default dataset, a storage of your own
+  (`InitOptions::storage`) included. When items are given up (their request is retried, or the
+  API rejects them), their charges are given back, as for a failed push; items that are retried
+  keep their charges reserved until they are stored. A charge call that fails after its items
+  were stored is logged, not returned (the push returned already).
 
 ## Testing
 

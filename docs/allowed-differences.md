@@ -46,8 +46,9 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   marks a request as handled only once its items are stored. Pay-per-event charges are still
   reserved when items are pushed, so the budget stops a run exactly as in JS, but the charge calls
   are sent once per flush with the counts summed by event, and the local charging log has one
-  entry per event per flush. Without the variable, every push is stored and charged at once, as
-  in the JS SDK.
+  entry per event per flush. Buffered items nobody waits for are retried when a flush fails, and
+  `Actor::exit` exits with code 92 if they still cannot be stored. Without the variable, every
+  push is stored and charged at once, as in the JS SDK.
 
 ## Input
 

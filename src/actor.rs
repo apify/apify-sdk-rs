@@ -11,6 +11,7 @@ use apify_client::ApifyClient;
 use apify_client::models::ActorRun;
 use crawlee::core::events::ListenerId;
 use crawlee::core::storage::backend::StorageBackend;
+use crawlee::core::storage::dataset::serialize_items;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
 use crawlee::{Dataset, KeyValueStore, RequestQueue, Services, StorageIdentifier};
 use parking_lot::Mutex;
@@ -675,18 +676,17 @@ impl Actor {
         data: &T,
         events: &[&str],
     ) -> Result<ChargeResult, ChargingError> {
-        let mut items = match serde_json::to_value(data)? {
-            Value::Array(items) => items,
-            item => vec![item],
-        };
+        // Serialized once, straight from `data`: the items are not built as a `Value` tree first.
+        let mut items = serialize_items(data)?;
         let dataset = state().services.open_dataset(&StorageIdentifier::Default).await?;
         let charging = &state().charging;
         if !charging.is_pay_per_event() {
-            dataset.push_data(&items).await?;
+            let count = items.len() as u64;
+            dataset.push_items(items).await?;
             // Warns that the Actor is not pay-per-event.
             let mut result = None;
             for event in events {
-                result = Some(charging.charge(ChargeOptions::new(*event, items.len() as u64)).await?);
+                result = Some(charging.charge(ChargeOptions::new(*event, count)).await?);
             }
             return Ok(result.unwrap_or_else(|| ChargeResult {
                 event_charge_limit_reached: false,
@@ -705,7 +705,7 @@ impl Actor {
             });
         }
         items.truncate(limit);
-        if let Err(err) = ChargingManager::with_items_reserved(dataset.push_data(&items)).await {
+        if let Err(err) = ChargingManager::with_items_reserved(dataset.push_items(items)).await {
             charging.unreserve_items(events, is_default_dataset, limit);
             return Err(err.into());
         }

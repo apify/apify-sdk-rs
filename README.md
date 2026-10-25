@@ -82,6 +82,36 @@ input schema. Copy it and `apify push`.
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
 | **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 
+## Extra features (not in the Apify SDK for JS)
+
+Opt-in and off by default: unless turned on, the SDK behaves as the JS one.
+
+### Buffered dataset writes
+
+crawlee-rs can collect dataset pushes and store them together ("Buffered dataset writes" in the
+[crawlee-rs README](https://github.com/apify-projects/crawlee-rs#buffered-dataset-writes)). Turn it
+on for an Actor with `CRAWLEE_DATASET_BUFFER=1`, tune it with `CRAWLEE_DATASET_BUFFER_STAGES`
+(default `10:1s,100:2s`: the first 10 items right away, then at most 1 s of waiting, from the
+100th item on at most 2 s) and `CRAWLEE_DATASET_BUFFER_MAX_BYTES` (default 1 MiB), or set
+`Configuration::crawlee.dataset_buffer` in code (for example from the Actor input) and pass it in
+`InitOptions::configuration`.
+
+- **What is buffered.** The datasets opened through the Actor's services: the default dataset of
+  `Actor::push_data`, `push_data_and_charge(_events)` and of crawlers' `ctx.push_data`. Handles
+  from `Actor::open_dataset` are not buffered.
+- **When items are stored.** At the end of the linger, at the byte cap, on the `persistState`,
+  `migrating` and `aborting` platform events and on `Actor::exit`, when a crawler finishes, and on
+  `Actor::flush_data()`. Items keep their push order.
+- **Requests.** A crawler marks a request as handled only once the items pushed while handling it
+  (with `ctx.push_data` or `Actor::push_data*`, in the request's task) are stored, and retries it
+  if they cannot be. A migration or crash never leaves a request handled without its items.
+- **Charging.** Pay-per-event charges are still reserved against the budget when items are
+  pushed, so `ChargeResult`, `event_charge_limit_reached` and `ACTOR_MAX_TOTAL_CHARGE_USD` stop a
+  run at the same item as without buffering. The charge calls are sent when the items are stored:
+  one per event per flush, with the counts of all the flush's items summed, instead of one per
+  push. If a flush fails, its charges are given back, as for a failed push. A charge call that
+  fails after its items were stored is logged, not returned (the push returned already).
+
 ## Testing
 
 | Layer | What runs | Needs |

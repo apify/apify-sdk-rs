@@ -39,6 +39,16 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   `StreamedLog` logs such a chunk without its last character, which looks like a bug; here the
   line is logged once it is complete (or when the stream ends).
 
+## Opt-in extras
+
+- **Buffered dataset writes (off by default).** With `CRAWLEE_DATASET_BUFFER=1` (an extra of
+  crawlee-rs), pushes to the default dataset are collected and stored together, and a crawler
+  marks a request as handled only once its items are stored. Pay-per-event charges are still
+  reserved when items are pushed, so the budget stops a run exactly as in JS, but the charge calls
+  are sent once per flush with the counts summed by event, and the local charging log has one
+  entry per event per flush. Without the variable, every push is stored and charged at once, as
+  in the JS SDK.
+
 ## Input
 
 - **Encrypted PKCS#8 keys are not supported for input secrets.** The platform's key is a legacy

@@ -1,5 +1,7 @@
 //! A dataset on the Apify platform.
 
+use std::ops::Range;
+
 use apify_client::DatasetListItemsOptions;
 use apify_client::clients::dataset::DatasetClient;
 use async_trait::async_trait;
@@ -22,28 +24,25 @@ pub(crate) struct ApifyDataset {
     pub(crate) drop_hook: DropHook,
 }
 
-/// Groups serialized items into JSON arrays of at most `limit` bytes, keeping their order.
-/// Assumes that no single item exceeds the limit.
-fn chunk_by_size(items: &[DatasetItem], limit: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    for item in items {
-        let item = item.get();
+/// Splits the items into consecutive chunks whose JSON arrays are at most `limit` bytes, keeping
+/// their order. Assumes that no single item exceeds the limit.
+fn chunk_by_size(items: &[DatasetItem], limit: usize) -> Vec<Range<usize>> {
+    let mut chunks: Vec<Range<usize>> = Vec::new();
+    // The bytes of the current chunk's array so far, without its closing ']'.
+    let mut bytes = 0;
+    for (index, item) in items.iter().enumerate() {
+        let item = item.get().len();
         match chunks.last_mut() {
             // +1 for the ',' separator, +1 for the closing ']'.
-            Some(chunk) if chunk.len() + item.len() + 2 <= limit => {
-                chunk.push(',');
-                chunk.push_str(item);
+            Some(chunk) if bytes + item + 2 <= limit => {
+                chunk.end = index + 1;
+                bytes += item + 1;
             }
             _ => {
-                let mut chunk = String::with_capacity(item.len() + 2);
-                chunk.push('[');
-                chunk.push_str(item);
-                chunks.push(chunk);
+                chunks.push(index..index + 1);
+                bytes = item + 1;
             }
         }
-    }
-    for chunk in &mut chunks {
-        chunk.push(']');
     }
     chunks
 }
@@ -90,9 +89,10 @@ impl DatasetBackend for ApifyDataset {
             }
         }
         // Pushed one after another, to keep the order of the items.
+        // Each chunk is sent as the JSON array of its items, copied as they are: they were
+        // serialized once already and are not parsed again.
         for chunk in chunk_by_size(&items, EFFECTIVE_LIMIT_BYTES) {
-            let payload = RawValue::from_string(chunk)?;
-            self.client.push_items(&payload).await.map_err(backend_error)?;
+            self.client.push_items(&&items[chunk]).await.map_err(backend_error)?;
         }
         Ok(())
     }
@@ -135,11 +135,18 @@ mod tests {
     #[test]
     fn items_are_chunked_by_size_in_order() {
         let items = items(&[r#"{"a":1}"#, r#"{"b":2}"#, r#"{"c":3}"#]);
-        assert_eq!(chunk_by_size(&items, 1000), [r#"[{"a":1},{"b":2},{"c":3}]"#]);
-        // `[{"a":1},{"b":2}]` is 17 bytes.
-        assert_eq!(chunk_by_size(&items, 17), [r#"[{"a":1},{"b":2}]"#, r#"[{"c":3}]"#]);
-        assert_eq!(chunk_by_size(&items, 16), [r#"[{"a":1}]"#, r#"[{"b":2}]"#, r#"[{"c":3}]"#]);
+        assert_eq!(chunk_by_size(&items, 1000), vec![0..3]);
+        assert_eq!(chunk_by_size(&items, 17), [0..2, 2..3]);
+        assert_eq!(chunk_by_size(&items, 16), [0..1, 1..2, 2..3]);
         assert!(chunk_by_size(&[], 10).is_empty());
+    }
+
+    /// A chunk goes to the API as the JSON array of its items, copied as they are: the items were
+    /// serialized once already, and are not parsed again.
+    #[test]
+    fn a_chunk_is_sent_as_the_array_of_its_items() {
+        let items = items(&[r#"{"a":1}"#, r#"{"b":[1,2]}"#]);
+        assert_eq!(serde_json::to_string(&items[0..2]).unwrap(), r#"[{"a":1},{"b":[1,2]}]"#);
     }
 
     #[test]

@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 # Pinned revisions: neither crate is released in the versions this SDK needs.
-crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "817be72" }
+crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "88e712d" }
 # The client's own transport (reqwest 0.12) is compiled without TLS and not used: requests go through
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
 apify-client = { git = "https://github.com/apify/apify-client-rust", rev = "8a4d19753448bbe0c443cfba04824dfcba4be252", default-features = false }

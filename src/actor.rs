@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apify_client::ApifyClient;
 use apify_client::models::ActorRun;
@@ -368,8 +368,15 @@ impl Actor {
             match &configuration.actor_events_ws_url {
                 Some(url) => {
                     let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
+                    let started = Instant::now();
                     match crate::events::connect(url, events.clone(), memory).await {
-                        Ok(relaying) => *state.websocket.lock() = Some(relaying),
+                        Ok(relaying) => {
+                            tracing::debug!(
+                                "Connected to the platform events websocket in {} ms",
+                                started.elapsed().as_millis()
+                            );
+                            *state.websocket.lock() = Some(relaying);
+                        }
                         Err(err) => {
                             events.close().await;
                             return Err(InitError::EventsConnection(err));
@@ -382,9 +389,13 @@ impl Actor {
             }
         }
 
+        let started = Instant::now();
         state.services.purge_on_start().await?;
         state.child_runs.load().await.map_err(InitError::ChildRuns)?;
+        tracing::debug!("Loaded the tracked child runs in {} ms", started.elapsed().as_millis());
+        let started = Instant::now();
         state.charging.init(state.storage.as_ref()).await?;
+        tracing::debug!("Initialized charging in {} ms", started.elapsed().as_millis());
         if state.charging.is_pay_per_event() && state.smart.is_none() {
             tracing::warn!(
                 "Items pushed to the default dataset will not be charged for, because this run does not use Apify \
@@ -497,8 +508,9 @@ impl Actor {
             events.off(id);
         }
 
+        let started = Instant::now();
         events.close().await;
-        tracing::debug!("Events closed");
+        tracing::debug!("Events closed in {} ms", started.elapsed().as_millis());
         *state().exit_options.lock() = Some(options.clone());
         events.emit(Event::Exit(options.to_event_options()));
 
@@ -513,14 +525,18 @@ impl Actor {
         }
 
         let teardown = async {
+            let started = Instant::now();
             events.wait_for_all_listeners_to_complete().await;
+            tracing::debug!("Event listeners completed in {} ms", started.elapsed().as_millis());
             // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
             if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
+            let started = Instant::now();
             if let Err(err) = state().storage.teardown().await {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
+            tracing::debug!("Storage torn down in {} ms", started.elapsed().as_millis());
             if let Some(message) = &options.status_message {
                 let level = Some(if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
                 Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;

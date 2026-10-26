@@ -374,9 +374,14 @@ impl Actor {
             Self::register_graceful_shutdown(options.graceful_shutdown_delay);
         }
         // Crawlers report their status as `StatusMessage` events.
-        let forwarder = events.on(EventKind::StatusMessage, |event| async move {
-            if let Event::StatusMessage(status) = event {
-                Self::update_run_status_message(&status.message, status.is_terminal).await;
+        let forwarder = events.on(EventKind::StatusMessage, |event| {
+            // Numbered when emitted, not when the listener runs, so that the update is ordered
+            // with the status messages set after the event.
+            let number = Self::next_status_message_number();
+            async move {
+                if let Event::StatusMessage(status) = event {
+                    Self::send_status_message(number, &status.message, status.is_terminal).await;
+                }
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
@@ -618,7 +623,7 @@ impl Actor {
     /// it. [`exit`](Self::exit) waits for the update, so it is not lost when the process exits.
     pub fn set_status_message_in_background(message: &str, options: StatusMessageOptions) {
         Self::log_status_message(message, options.level);
-        let number = state().status_messages.made.fetch_add(1, Ordering::AcqRel) + 1;
+        let number = Self::next_status_message_number();
         let message = message.to_owned();
         let update = tokio::spawn(async move {
             Self::send_status_message(number, &message, options.is_terminal).await;
@@ -646,8 +651,12 @@ impl Actor {
     }
 
     async fn update_run_status_message(message: &str, is_terminal: bool) -> Option<ActorRun> {
-        let number = state().status_messages.made.fetch_add(1, Ordering::AcqRel) + 1;
-        Self::send_status_message(number, message, is_terminal).await
+        Self::send_status_message(Self::next_status_message_number(), message, is_terminal).await
+    }
+
+    /// The number of a new status message update, which orders it after those made before.
+    fn next_status_message_number() -> u64 {
+        state().status_messages.made.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Sends the `number`-th status message update, unless a later one was sent already. Best

@@ -463,6 +463,19 @@ async fn status_messages_set_in_the_background_keep_their_order_and_are_waited_f
     assert_eq!(messages, expected);
 }
 
+/// A status message set in the background right after a crawler emitted one (as at its end) is
+/// the last one, even though the crawler's is forwarded in a listener that may run later.
+#[tokio::test]
+async fn a_status_message_set_after_a_crawler_one_is_the_last() {
+    let api = FakeApi::start().await;
+    api.delay("PUT /v2/actor-runs/run-1", Duration::from_millis(100));
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("status-after-crawler", &platform_env(&api, None), dir.path()).await, 0);
+    let messages: Vec<String> =
+        api.run_updates().iter().map(|update| update["statusMessage"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(messages.last().map(String::as_str), Some("Scraper finished"), "{messages:?}");
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
@@ -616,6 +629,19 @@ fn child() {
                 Actor::set_status_message_in_background("First", apify::StatusMessageOptions::default());
                 Actor::set_status_message("Second", apify::StatusMessageOptions::default()).await;
                 Actor::set_status_message_in_background("Last", apify::StatusMessageOptions::default());
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "status-after-crawler" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                for _ in 0..20 {
+                    Actor::events().emit(crawlee::core::Event::StatusMessage(crawlee::core::StatusMessage {
+                        crawler_id: "0".to_owned(),
+                        message: "Finished!".to_owned(),
+                        is_terminal: true,
+                        level: crawlee::core::StatusLevel::Info,
+                    }));
+                }
+                Actor::set_status_message_in_background("Scraper finished", apify::StatusMessageOptions::default());
                 Actor::exit(apify::ExitOptions::default()).await;
             }
             "fail-default" | "fail-code" => {

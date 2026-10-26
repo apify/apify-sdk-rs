@@ -18,6 +18,23 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 
 ## Actor lifecycle
 
+- **`init` makes its API calls at the same time.** The JS SDK connects to the platform events
+  websocket, then loads the tracked child runs, then reads the run for its pricing, one after
+  another. Here the three are made at once, and an error of the websocket is still reported first.
+- **The default storages and some records are read ahead during `init`.** On the platform,
+  `init` starts reading the metadata of the default dataset and key-value store (which opening
+  them reads), the input record, the tracked child runs and the records of
+  `InitOptions::prefetch_records` in the background, and the first read of each takes what was
+  read. What is written through the SDK before it is read (a record, items of the dataset) is
+  read again; what another client changes in the meantime is not. The JS SDK reads each when
+  asked.
+- **Status messages can be set in the background.** `Actor::set_status_message_in_background` is
+  `Actor.setStatusMessage(...)` without `await`: the message is logged at once and the run updated
+  later. Updates are sent one at a time in the order they were made, and an update is dropped when
+  a later one was sent already (in JS, concurrent updates can land in any order); `exit` waits for
+  them before the terminal status message.
+- **The API clients share one HTTP client.** Every API client of the SDK (the Actor's, the
+  storages', those of `Actor::new_client`) sends its requests through the same connection pool.
 - **The final status message is awaited.** The JS SDK gives the request that sets the terminal
   status message 1 ms before exiting. Here it gets up to 1 s (the status message timeout), since
   a process exit in Rust cuts off requests in flight.

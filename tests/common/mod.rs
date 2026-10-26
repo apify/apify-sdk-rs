@@ -101,6 +101,8 @@ struct Shared {
     rate_limited: Arc<AtomicU32>,
     /// How many head listings a newly added request stays out of the head.
     head_lag: Arc<AtomicU32>,
+    /// How long the calls starting with a prefix (`"METHOD /path"`) take.
+    delays: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
 }
 
 /// A running fake API. Cheap to clone.
@@ -168,6 +170,11 @@ impl FakeApi {
     /// Requests added from now on show in the queue head only after `listings` head listings.
     pub fn set_head_lag(&self, listings: u32) {
         self.shared.head_lag.store(listings, Ordering::SeqCst);
+    }
+
+    /// The calls starting with `prefix` (`"METHOD /path"`) take `delay` from now on.
+    pub fn delay(&self, prefix: &str, delay: std::time::Duration) {
+        self.shared.delays.lock().push((prefix.to_owned(), delay));
     }
 
     /// The API calls made so far, as `"METHOD /path"`.
@@ -246,7 +253,11 @@ impl FakeApi {
 
 async fn gate(State(shared): State<Shared>, request: Request, next: Next) -> Response {
     let call = format!("{} {}", request.method(), request.uri().path());
+    let delay = shared.delays.lock().iter().find(|(prefix, _)| call.starts_with(prefix.as_str())).map(|(_, d)| *d);
     shared.data.lock().calls.push(call);
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let authorized = request
         .headers()
         .get(header::AUTHORIZATION)

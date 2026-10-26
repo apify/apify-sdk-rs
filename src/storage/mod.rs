@@ -3,6 +3,7 @@
 
 mod dataset;
 mod key_value_store;
+mod prefetch;
 mod request_queue;
 mod request_queue_shared;
 
@@ -125,6 +126,8 @@ pub struct ApifyStorageBackend {
     client_key: String,
     aliases: tokio::sync::Mutex<AliasCache>,
     opened: Arc<Mutex<OpenedStorages>>,
+    prefetched_stores: Arc<key_value_store::PrefetchedStores>,
+    prefetched_datasets: Arc<prefetch::Prefetched<String, crawlee::core::storage::backend::DatasetInfo>>,
 }
 
 #[derive(Default)]
@@ -168,7 +171,25 @@ impl ApifyStorageBackend {
             client_key,
             aliases: tokio::sync::Mutex::default(),
             opened: Arc::default(),
+            prefetched_stores: Arc::default(),
+            prefetched_datasets: Arc::default(),
         }
+    }
+
+    /// Starts reading the metadata of the key-value store `store_id` and its records `keys` in the
+    /// background, so that the first reads of each take what was read instead of waiting for the
+    /// API (opening a storage reads its metadata). A record written or deleted before it is read
+    /// is read again, and so is the metadata of a store written to.
+    pub fn prefetch_key_value_store<'a>(&self, store_id: &str, keys: impl IntoIterator<Item = &'a str>) {
+        self.prefetched_stores.prefetch(&self.client.key_value_store(store_id), store_id, keys);
+    }
+
+    /// Starts reading the metadata of the dataset `dataset_id` in the background, like
+    /// [`prefetch_key_value_store`](Self::prefetch_key_value_store). It is read again once items
+    /// were pushed.
+    pub fn prefetch_dataset(&self, dataset_id: &str) {
+        let dataset = self.client.dataset(dataset_id);
+        self.prefetched_datasets.start(dataset_id.to_owned(), async move { dataset::get_metadata(&dataset).await });
     }
 
     /// How request queues are consumed (see [`RequestQueueAccess`]).
@@ -334,7 +355,12 @@ impl StorageBackend for ApifyStorageBackend {
         let mut opened = self.opened.lock();
         let backend = opened.datasets.entry(id.clone()).or_insert_with(|| {
             let drop_hook = self.drop_hook(StorageKind::Dataset, &id);
-            Arc::new(dataset::ApifyDataset { client: self.client.dataset(id), drop_hook })
+            Arc::new(dataset::ApifyDataset {
+                client: self.client.dataset(id.clone()),
+                id: id.clone(),
+                drop_hook,
+                prefetched: self.prefetched_datasets.clone(),
+            })
         });
         Ok(backend.clone())
     }
@@ -347,7 +373,12 @@ impl StorageBackend for ApifyStorageBackend {
         let mut opened = self.opened.lock();
         let backend = opened.key_value_stores.entry(id.clone()).or_insert_with(|| {
             let drop_hook = self.drop_hook(StorageKind::KeyValueStore, &id);
-            Arc::new(key_value_store::ApifyKeyValueStore { client: self.client.key_value_store(id), drop_hook })
+            Arc::new(key_value_store::ApifyKeyValueStore {
+                client: self.client.key_value_store(id.clone()),
+                id: id.clone(),
+                drop_hook,
+                prefetched: self.prefetched_stores.clone(),
+            })
         });
         Ok(backend.clone())
     }

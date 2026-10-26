@@ -116,8 +116,11 @@ pub struct ReqwestBackend {
 }
 
 impl ReqwestBackend {
+    /// A backend on the HTTP client the SDK's API clients share, so that they share its
+    /// connections (and the root certificates are loaded once).
     pub fn new(rate_limits: RateLimitCounter) -> Self {
-        ReqwestBackend::with_client(reqwest::Client::new(), rate_limits)
+        static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        ReqwestBackend::with_client(SHARED.get_or_init(reqwest::Client::new).clone(), rate_limits)
     }
 
     pub fn with_client(client: reqwest::Client, rate_limits: RateLimitCounter) -> Self {

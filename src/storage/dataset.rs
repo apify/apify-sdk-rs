@@ -10,6 +10,9 @@ use crawlee::core::errors::StorageError;
 use crawlee::core::storage::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, PaginatedList};
 use serde_json::value::RawValue;
 
+use std::sync::Arc;
+
+use super::prefetch::Prefetched;
 use super::{DropHook, backend_error, date, extra_date, unsupported};
 
 /// The API rejects payloads over 9 MB (`MAX_PAYLOAD_SIZE_BYTES` in `@apify/consts`).
@@ -20,8 +23,27 @@ const EFFECTIVE_LIMIT_BYTES: usize = MAX_PAYLOAD_SIZE_BYTES - MAX_PAYLOAD_SIZE_B
 const MAX_ITEM_BYTES: usize = EFFECTIVE_LIMIT_BYTES - 2;
 
 pub(crate) struct ApifyDataset {
+    pub(crate) id: String,
     pub(crate) client: DatasetClient,
     pub(crate) drop_hook: DropHook,
+    /// The metadata of datasets read ahead, by id.
+    pub(crate) prefetched: Arc<Prefetched<String, DatasetInfo>>,
+}
+
+pub(crate) async fn get_metadata(client: &DatasetClient) -> StorageResult<DatasetInfo> {
+    let dataset = client
+        .get()
+        .await
+        .map_err(backend_error)?
+        .ok_or_else(|| StorageError::NotFound("Dataset not found or has been deleted.".to_owned()))?;
+    Ok(DatasetInfo {
+        created_at: date(dataset.created_at),
+        modified_at: date(dataset.modified_at),
+        accessed_at: extra_date(&dataset.extra, "accessedAt"),
+        item_count: dataset.item_count.unwrap_or(0).max(0) as u64,
+        id: dataset.id,
+        name: dataset.name,
+    })
 }
 
 /// Splits the items into consecutive chunks whose JSON arrays are at most `limit` bytes, keeping
@@ -50,20 +72,7 @@ fn chunk_by_size(items: &[DatasetItem], limit: usize) -> Vec<Range<usize>> {
 #[async_trait]
 impl DatasetBackend for ApifyDataset {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
-        let dataset = self
-            .client
-            .get()
-            .await
-            .map_err(backend_error)?
-            .ok_or_else(|| StorageError::NotFound("Dataset not found or has been deleted.".to_owned()))?;
-        Ok(DatasetInfo {
-            created_at: date(dataset.created_at),
-            modified_at: date(dataset.modified_at),
-            accessed_at: extra_date(&dataset.extra, "accessedAt"),
-            item_count: dataset.item_count.unwrap_or(0).max(0) as u64,
-            id: dataset.id,
-            name: dataset.name,
-        })
+        self.prefetched.take_or(&self.id, || get_metadata(&self.client)).await
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
@@ -80,6 +89,8 @@ impl DatasetBackend for ApifyDataset {
     }
 
     async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+        // The item count read ahead is outdated now.
+        self.prefetched.forget(&self.id);
         for (index, item) in items.iter().enumerate() {
             let bytes = item.get().len();
             if bytes > MAX_ITEM_BYTES {

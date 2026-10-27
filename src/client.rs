@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use apify_client::http_client::{HttpBackend, HttpMethod, HttpRequest, HttpResponse};
 use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult};
@@ -115,8 +116,11 @@ pub struct ReqwestBackend {
 }
 
 impl ReqwestBackend {
+    /// A backend on the HTTP client the SDK's API clients share, so that they share its
+    /// connections (and the root certificates are loaded once).
     pub fn new(rate_limits: RateLimitCounter) -> Self {
-        ReqwestBackend::with_client(reqwest::Client::new(), rate_limits)
+        static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        ReqwestBackend::with_client(SHARED.get_or_init(reqwest::Client::new).clone(), rate_limits)
     }
 
     pub fn with_client(client: reqwest::Client, rate_limits: RateLimitCounter) -> Self {
@@ -187,7 +191,14 @@ impl HttpBackend for ReqwestBackend {
             builder = builder.body(body);
         }
 
-        let response = builder.send().await.map_err(transport_error)?;
+        let started = Instant::now();
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                log_call(&request.method, &request.url, None, started, attempt);
+                return Err(transport_error(err));
+            }
+        };
         let status = response.status().as_u16();
         if status == 429 {
             self.rate_limits.add(attempt);
@@ -201,11 +212,37 @@ impl HttpBackend for ReqwestBackend {
             .iter()
             .filter_map(|(name, value)| Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned())))
             .collect();
-        let body = response.bytes().await.map_err(transport_error)?.to_vec();
+        let body = response.bytes().await.map_err(transport_error);
+        log_call(&request.method, &request.url, Some(status), started, attempt);
+        let body = body?.to_vec();
         if is_batch_add && status < 300 {
             self.count_unprocessed(&body);
         }
         Ok(HttpResponse { status, headers, body })
+    }
+}
+
+/// Logs an API call at debug level: its method, path, status (none for a transport error),
+/// duration and attempt.
+fn log_call(method: &HttpMethod, url: &str, status: Option<u16>, started: Instant, attempt: usize) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let status = status.map_or_else(|| "transport error".to_owned(), |status| status.to_string());
+    tracing::debug!(
+        "API {} {} {status} in {} ms (attempt {attempt})",
+        method.as_str(),
+        logged_path(url),
+        started.elapsed().as_millis()
+    );
+}
+
+/// The path of `url`, without the scheme, host and query (which may hold secrets).
+fn logged_path(url: &str) -> &str {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    match url.find("://") {
+        Some(scheme) => url[scheme + 3..].find('/').map_or("/", |host| &url[scheme + 3 + host..]),
+        None => url,
     }
 }
 
@@ -217,11 +254,14 @@ pub fn user_agent_suffix() -> String {
 /// A client for the API `configuration` points to, authenticated with `token` or else with
 /// [`Configuration::token`]. Its rate-limited responses are counted in `rate_limits`.
 pub fn new_client(configuration: &Configuration, token: Option<&str>, rate_limits: RateLimitCounter) -> ApifyClient {
+    let started = Instant::now();
+    let backend = Arc::new(ReqwestBackend::new(rate_limits));
+    tracing::debug!("Created an API client for {} in {} ms", configuration.api_base_url, started.elapsed().as_millis());
     let mut builder = ApifyClient::builder()
         .base_url(configuration.api_base_url.as_str())
         .public_base_url(configuration.api_public_base_url.as_str())
         .user_agent_suffix(user_agent_suffix())
-        .http_backend(Arc::new(ReqwestBackend::new(rate_limits)));
+        .http_backend(backend);
     if let Some(token) = token.or(configuration.token.as_deref()) {
         builder = builder.token(token);
     }
@@ -278,6 +318,16 @@ mod tests {
         assert_eq!(dataset.item_count, Some(3));
         assert_eq!(hits.load(Ordering::SeqCst), 3, "both rate-limited attempts were retried");
         assert_eq!(rate_limits.get(), 0, "a call that got through on its third attempt is not counted");
+    }
+
+    #[test]
+    fn logged_paths_have_no_query() {
+        assert_eq!(
+            logged_path("https://api.apify.com/v2/key-value-stores/s/records/INPUT?token=secret"),
+            "/v2/key-value-stores/s/records/INPUT"
+        );
+        assert_eq!(logged_path("http://localhost:8080/v2/actor-runs/r#x"), "/v2/actor-runs/r");
+        assert_eq!(logged_path("https://api.apify.com"), "/");
     }
 
     /// A client of the API at `base` that retries without waiting.

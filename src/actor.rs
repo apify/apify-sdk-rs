@@ -3,9 +3,9 @@
 use std::future::Future;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apify_client::ApifyClient;
 use apify_client::models::ActorRun;
@@ -51,6 +51,10 @@ pub struct InitOptions {
     pub graceful_shutdown: bool,
     /// How long to wait before the graceful exit or reboot.
     pub graceful_shutdown_delay: Duration,
+    /// Records of the default key-value store to read in the background during `init`, on the
+    /// platform, so that their first reads do not wait for the API (the input and the tracked
+    /// child runs are always read ahead). A record written before it is read is read again.
+    pub prefetch_records: Vec<String>,
 }
 
 impl Default for InitOptions {
@@ -61,6 +65,7 @@ impl Default for InitOptions {
             request_queue_access: RequestQueueAccess::default(),
             graceful_shutdown: true,
             graceful_shutdown_delay: Duration::ZERO,
+            prefetch_records: Vec::new(),
         }
     }
 }
@@ -141,7 +146,20 @@ struct Inner {
     websocket: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The options of the exit in progress.
     exit_options: Mutex<Option<ExitOptions>>,
+    status_messages: StatusMessages,
     child_runs: ChildRunTracker,
+}
+
+/// The status message updates of the run: sent one at a time, in the order they were made, so
+/// that an update never overwrites a later one.
+#[derive(Default)]
+struct StatusMessages {
+    sending: tokio::sync::Mutex<()>,
+    /// The number of the last update made, and of the last one sent.
+    made: AtomicU64,
+    sent: AtomicU64,
+    /// The updates sent in the background, which `exit` waits for.
+    in_background: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// The Actor run of this process, like the static `Actor` of the JS SDK: [`Actor::init`] once,
@@ -292,9 +310,19 @@ impl Actor {
         let (storage, smart): (Arc<dyn StorageBackend>, _) = match options.storage {
             Some(storage) => (storage, None),
             None => {
-                let cloud: Arc<dyn StorageBackend> = Arc::new(
-                    ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access),
-                );
+                let cloud =
+                    ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access);
+                // What every run reads first, read while the run connects to the platform: the
+                // default storages' metadata (which opening them reads), the input and the child runs.
+                if configuration.is_at_home && !configuration.default_key_value_store_id.is_empty() {
+                    let keys = [configuration.input_key.as_str(), crate::child_runs::CHILD_RUNS_KVS_KEY];
+                    let keys = keys.into_iter().chain(options.prefetch_records.iter().map(String::as_str));
+                    cloud.prefetch_key_value_store(&configuration.default_key_value_store_id, keys);
+                }
+                if configuration.is_at_home && !configuration.default_dataset_id.is_empty() {
+                    cloud.prefetch_dataset(&configuration.default_dataset_id);
+                }
+                let cloud: Arc<dyn StorageBackend> = Arc::new(cloud);
                 let local = SmartStorageBackend::local_backend(&configuration);
                 // The default datasets charge for their items under pay-per-event pricing.
                 let charged = |inner| -> Arc<dyn StorageBackend> {
@@ -333,6 +361,7 @@ impl Actor {
             handlers: Mutex::default(),
             websocket: Mutex::default(),
             exit_options: Mutex::default(),
+            status_messages: StatusMessages::default(),
             child_runs: ChildRunTracker::new(child_run_services),
         };
         if STATE.set(inner).is_err() {
@@ -345,9 +374,14 @@ impl Actor {
             Self::register_graceful_shutdown(options.graceful_shutdown_delay);
         }
         // Crawlers report their status as `StatusMessage` events.
-        let forwarder = events.on(EventKind::StatusMessage, |event| async move {
-            if let Event::StatusMessage(status) = event {
-                Self::update_run_status_message(&status.message, status.is_terminal).await;
+        let forwarder = events.on(EventKind::StatusMessage, |event| {
+            // Numbered when emitted, not when the listener runs, so that the update is ordered
+            // with the status messages set after the event.
+            let number = Self::next_status_message_number();
+            async move {
+                if let Event::StatusMessage(status) = event {
+                    Self::send_status_message(number, &status.message, status.is_terminal).await;
+                }
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
@@ -364,27 +398,49 @@ impl Actor {
         }
 
         // Connected once the listeners are in place, so that no early event is missed.
-        if configuration.is_at_home {
-            match &configuration.actor_events_ws_url {
-                Some(url) => {
-                    let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
-                    match crate::events::connect(url, events.clone(), memory).await {
-                        Ok(relaying) => *state.websocket.lock() = Some(relaying),
-                        Err(err) => {
-                            events.close().await;
-                            return Err(InitError::EventsConnection(err));
-                        }
+        let websocket = async {
+            let url = match &configuration.actor_events_ws_url {
+                Some(url) if configuration.is_at_home => url,
+                Some(_) => return Ok(()),
+                None => {
+                    if configuration.is_at_home {
+                        tracing::debug!(
+                            "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform \
+                             will be emitted."
+                        );
                     }
+                    return Ok(());
                 }
-                None => tracing::debug!(
-                    "Environment variable ACTOR_EVENTS_WEBSOCKET_URL is not set, no events from Apify platform will be emitted."
-                ),
-            }
+            };
+            let memory = configuration.crawlee.memory_mbytes.map(|mb| mb * 1024 * 1024);
+            let started = Instant::now();
+            let relaying = crate::events::connect(url, events.clone(), memory).await?;
+            tracing::debug!("Connected to the platform events websocket in {} ms", started.elapsed().as_millis());
+            *state.websocket.lock() = Some(relaying);
+            Ok::<_, String>(())
+        };
+        // Independent of the websocket and of each other, so made at the same time (the JS SDK
+        // makes them one after the other).
+        let child_runs = async {
+            let started = Instant::now();
+            state.services.purge_on_start().await?;
+            state.child_runs.load().await.map_err(InitError::ChildRuns)?;
+            tracing::debug!("Loaded the tracked child runs in {} ms", started.elapsed().as_millis());
+            Ok::<_, InitError>(())
+        };
+        let charging = async {
+            let started = Instant::now();
+            state.charging.init(state.storage.as_ref()).await?;
+            tracing::debug!("Initialized charging in {} ms", started.elapsed().as_millis());
+            Ok::<_, InitError>(())
+        };
+        let (websocket, child_runs, charging) = tokio::join!(websocket, child_runs, charging);
+        if let Err(err) = websocket {
+            events.close().await;
+            return Err(InitError::EventsConnection(err));
         }
-
-        state.services.purge_on_start().await?;
-        state.child_runs.load().await.map_err(InitError::ChildRuns)?;
-        state.charging.init(state.storage.as_ref()).await?;
+        child_runs?;
+        charging?;
         if state.charging.is_pay_per_event() && state.smart.is_none() {
             tracing::warn!(
                 "Items pushed to the default dataset will not be charged for, because this run does not use Apify \
@@ -497,8 +553,9 @@ impl Actor {
             events.off(id);
         }
 
+        let started = Instant::now();
         events.close().await;
-        tracing::debug!("Events closed");
+        tracing::debug!("Events closed in {} ms", started.elapsed().as_millis());
         *state().exit_options.lock() = Some(options.clone());
         events.emit(Event::Exit(options.to_event_options()));
 
@@ -513,14 +570,20 @@ impl Actor {
         }
 
         let teardown = async {
+            let started = Instant::now();
             events.wait_for_all_listeners_to_complete().await;
+            tracing::debug!("Event listeners completed in {} ms", started.elapsed().as_millis());
             // Final status messages are forwarded by now; later ones must not overwrite the terminal one.
             if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
-            if let Err(err) = state().storage.teardown().await {
+            let started = Instant::now();
+            // The status messages still being set must not overwrite the terminal one.
+            let (teardown, ()) = tokio::join!(state().storage.teardown(), Self::wait_for_status_messages());
+            if let Err(err) = teardown {
                 tracing::error!("Tearing down the storage failed: {err}");
             }
+            tracing::debug!("Storage torn down and status messages set in {} ms", started.elapsed().as_millis());
             if let Some(message) = &options.status_message {
                 let level = Some(if options.exit_code > 0 { StatusLevel::Error } else { StatusLevel::Info });
                 Self::set_status_message(message, StatusMessageOptions { is_terminal: true, level }).await;
@@ -551,18 +614,62 @@ impl Actor {
     /// Sets the status message of the run, and logs it. Returns the updated run, or `None` when no
     /// run was updated: off the platform, or when the update failed or timed out (which is logged).
     pub async fn set_status_message(message: &str, options: StatusMessageOptions) -> Option<ActorRun> {
-        match options.level {
+        Self::log_status_message(message, options.level);
+        Self::update_run_status_message(message, options.is_terminal).await
+    }
+
+    /// [`set_status_message`](Self::set_status_message) without waiting for the API: the message
+    /// is logged now and the run updated in the background, after the status messages set before
+    /// it. [`exit`](Self::exit) waits for the update, so it is not lost when the process exits.
+    pub fn set_status_message_in_background(message: &str, options: StatusMessageOptions) {
+        Self::log_status_message(message, options.level);
+        let number = Self::next_status_message_number();
+        let message = message.to_owned();
+        let update = tokio::spawn(async move {
+            Self::send_status_message(number, &message, options.is_terminal).await;
+        });
+        let mut in_background = state().status_messages.in_background.lock();
+        in_background.retain(|update| !update.is_finished());
+        in_background.push(update);
+    }
+
+    fn log_status_message(message: &str, level: Option<StatusLevel>) {
+        match level {
             Some(StatusLevel::Debug) => tracing::debug!("[Status message]: {message}"),
             Some(StatusLevel::Warning) => tracing::warn!("[Status message]: {message}"),
             Some(StatusLevel::Error) => tracing::error!("[Status message]: {message}"),
             Some(StatusLevel::Info) | None => tracing::info!("[Status message]: {message}"),
         }
-        Self::update_run_status_message(message, options.is_terminal).await
     }
 
-    /// Best effort: a failure or a slow API is only logged.
+    /// Waits for the status messages being set in the background.
+    async fn wait_for_status_messages() {
+        let in_background = std::mem::take(&mut *state().status_messages.in_background.lock());
+        for update in in_background {
+            let _ = update.await;
+        }
+    }
+
     async fn update_run_status_message(message: &str, is_terminal: bool) -> Option<ActorRun> {
+        Self::send_status_message(Self::next_status_message_number(), message, is_terminal).await
+    }
+
+    /// The number of a new status message update, which orders it after those made before.
+    fn next_status_message_number() -> u64 {
+        state().status_messages.made.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Sends the `number`-th status message update, unless a later one was sent already. Best
+    /// effort: a failure or a slow API is only logged.
+    async fn send_status_message(number: u64, message: &str, is_terminal: bool) -> Option<ActorRun> {
         let run_id = state().configuration.actor_run_id.as_ref()?;
+        let messages = &state().status_messages;
+        let _sending = messages.sending.lock().await;
+        if messages.sent.load(Ordering::Acquire) > number {
+            tracing::debug!("Not setting the status message \"{message}\": a later one was set already");
+            return None;
+        }
+        messages.sent.store(number, Ordering::Release);
         let body = serde_json::json!({ "statusMessage": message, "isStatusMessageTerminal": is_terminal });
         let run = state().client.run(run_id.clone());
         match tokio::time::timeout(STATUS_MESSAGE_TIMEOUT, run.update(&body)).await {

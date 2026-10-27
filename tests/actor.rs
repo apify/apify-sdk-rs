@@ -421,6 +421,61 @@ async fn secret_input_fields_are_decrypted() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("Failed to decrypt the secret fields of the input."));
 }
 
+/// The API calls of `init` are made at the same time, and the records every run reads (and those
+/// asked for) are read during `init`, so reading them later does not wait for the API.
+#[tokio::test]
+async fn init_makes_its_calls_at_once_and_reads_records_ahead() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
+    api.put_record(DEFAULT_STORE, "STATE", br#"{"count":1}"#, "application/json; charset=utf-8");
+    let slow = Duration::from_millis(500);
+    // The run, for its pricing, the storages and the records: one after another, they would take 3 s.
+    api.delay("GET /v2/actor-runs/run-1", slow);
+    api.delay("GET /v2/key-value-stores", slow);
+    api.delay("GET /v2/datasets", slow);
+    let events = common::serve_events(Duration::ZERO, Vec::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("prefetch", &platform_env(&api, Some(events)), dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let elapsed: u64 =
+        stdout.split("ELAPSED ").nth(1).and_then(|rest| rest.split_whitespace().next()).unwrap().parse().unwrap();
+    assert!(elapsed < 1000, "init and the reads took {elapsed} ms:\n{stdout}");
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/INPUT"), 1);
+    assert_eq!(api.count_calls("GET /v2/datasets/default-dataset"), 1);
+    // Read once ahead, and again after it was written.
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/STATE"), 2, "{:?}", api.calls());
+}
+
+/// A status message set in the background is set before the process exits, and does not overwrite
+/// a later one.
+#[tokio::test]
+async fn status_messages_set_in_the_background_keep_their_order_and_are_waited_for() {
+    let api = FakeApi::start().await;
+    api.delay("PUT /v2/actor-runs/run-1", Duration::from_millis(200));
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("status-background", &platform_env(&api, None), dir.path()).await, 0);
+    let messages: Vec<String> =
+        api.run_updates().iter().map(|update| update["statusMessage"].as_str().unwrap().to_owned()).collect();
+    // The first one is sent before the second, or not at all.
+    let expected = if messages.len() == 3 { vec!["First", "Second", "Last"] } else { vec!["Second", "Last"] };
+    assert_eq!(messages, expected);
+}
+
+/// A status message set in the background right after a crawler emitted one (as at its end) is
+/// the last one, even though the crawler's is forwarded in a listener that may run later.
+#[tokio::test]
+async fn a_status_message_set_after_a_crawler_one_is_the_last() {
+    let api = FakeApi::start().await;
+    api.delay("PUT /v2/actor-runs/run-1", Duration::from_millis(100));
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("status-after-crawler", &platform_env(&api, None), dir.path()).await, 0);
+    let messages: Vec<String> =
+        api.run_updates().iter().map(|update| update["statusMessage"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(messages.last().map(String::as_str), Some("Scraper finished"), "{messages:?}");
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
@@ -552,6 +607,42 @@ fn child() {
                 let run = Actor::set_status_message("Working", apify::StatusMessageOptions::default()).await;
                 assert!(run.is_some(), "the updated run");
                 Actor::exit(apify::ExitOptions::message("Echoed")).await;
+            }
+            "prefetch" => {
+                let started = Instant::now();
+                let options = apify::InitOptions { prefetch_records: vec!["STATE".to_owned()], ..Default::default() };
+                Actor::init(options).await.unwrap();
+                let input: Value = Actor::get_input().await.unwrap();
+                assert_eq!(input["greeting"], "hi");
+                let state: Value = Actor::get_value("STATE").await.unwrap().unwrap();
+                assert_eq!(state["count"], 1);
+                Actor::services().open_dataset(&crawlee::StorageIdentifier::Default).await.unwrap();
+                println!("ELAPSED {}", started.elapsed().as_millis());
+                Actor::set_value("STATE", &json!({ "count": 2 })).await.unwrap();
+                let state: Value = Actor::get_value("STATE").await.unwrap().unwrap();
+                assert_eq!(state["count"], 2);
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "status-background" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                // Sent after the second, which it must not overwrite.
+                Actor::set_status_message_in_background("First", apify::StatusMessageOptions::default());
+                Actor::set_status_message("Second", apify::StatusMessageOptions::default()).await;
+                Actor::set_status_message_in_background("Last", apify::StatusMessageOptions::default());
+                Actor::exit(apify::ExitOptions::default()).await;
+            }
+            "status-after-crawler" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                for _ in 0..20 {
+                    Actor::events().emit(crawlee::core::Event::StatusMessage(crawlee::core::StatusMessage {
+                        crawler_id: "0".to_owned(),
+                        message: "Finished!".to_owned(),
+                        is_terminal: true,
+                        level: crawlee::core::StatusLevel::Info,
+                    }));
+                }
+                Actor::set_status_message_in_background("Scraper finished", apify::StatusMessageOptions::default());
+                Actor::exit(apify::ExitOptions::default()).await;
             }
             "fail-default" | "fail-code" => {
                 Actor::init(apify::InitOptions::default()).await.unwrap();

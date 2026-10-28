@@ -304,8 +304,8 @@ async fn a_resurrected_run_gets_every_pending_request_whatever_is_in_progress() 
     }
     assert_eq!(in_progress.len(), 1500, "all of them in progress at once");
     assert_eq!(api.count_calls(HEAD), 0);
-    // The prefetch (1,000 of 1,500), then the pending requests in two pages.
-    assert_eq!(count_exact(&api, LIST), 3);
+    // The prefetch (1,000 of 1,500), then the pending requests in pages of 500.
+    assert_eq!(count_exact(&api, LIST), 4);
     assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 0, "listed with their data");
 
     for request in &mut in_progress {
@@ -313,6 +313,39 @@ async fn a_resurrected_run_gets_every_pending_request_whatever_is_in_progress() 
     }
     assert_eq!(check_readiness(&queue).await, (true, true));
     assert_eq!(api.count_calls(HEAD), 1);
+}
+
+/// The first page is served as soon as it is listed; the next ones are listed in the background
+/// while the local head still has requests. On more than one thread, as the crawler runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pending_requests_are_listed_ahead_in_the_background() {
+    let api = FakeApi::start().await;
+    for n in 0..1200 {
+        api.add_request(DEFAULT_QUEUE, &format!("https://before.test/{n}"));
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.delay(LIST, std::time::Duration::from_millis(500));
+
+    let mut in_progress = vec![queue.fetch_next_request().await.unwrap().unwrap()];
+    assert_eq!(count_exact(&api, LIST), 1, "one page before the first request");
+    // The next page is listed in the background: these come from the local head right away.
+    let started = std::time::Instant::now();
+    for _ in 0..400 {
+        in_progress.push(queue.fetch_next_request().await.unwrap().unwrap());
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(250), "{:?}", started.elapsed());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(count_exact(&api, LIST), 2, "the next page is on its way");
+
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+    }
+    assert_eq!(in_progress.len(), 1200);
+    assert_eq!(count_exact(&api, LIST), 3, "three pages of 500");
+    let mut urls: Vec<String> = in_progress.iter().map(|request| request.url.clone()).collect();
+    urls.sort();
+    urls.dedup();
+    assert_eq!(urls.len(), 1200, "each request once");
 }
 
 /// This client owns the queue: what other clients add comes through the head listing that

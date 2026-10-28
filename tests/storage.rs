@@ -223,6 +223,62 @@ async fn a_lagging_head_does_not_finish_the_queue_early() {
     assert!(queue.is_finished().await.unwrap());
 }
 
+/// The readiness check of the crawler: `is_empty`, then `is_finished`.
+async fn check_readiness(queue: &crawlee::RequestQueue) -> (bool, bool) {
+    (queue.is_empty().await.unwrap(), queue.is_finished().await.unwrap())
+}
+
+const HEAD: &str = "GET /v2/request-queues/default-queue/head";
+
+#[tokio::test]
+async fn a_queue_this_client_filled_is_not_listed_until_nothing_is_left() {
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let urls: Vec<String> = (0..300).map(|n| format!("https://a.test/{n}")).collect();
+    queue.add_requests(urls.iter().map(|url| url.as_str().into()).collect(), false).await.unwrap();
+
+    // Everything in progress, the local head empty: the queue had no other requests when this
+    // client first added to it, so it knows there is nothing more to fetch.
+    let mut in_progress = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+        assert!(!check_readiness(&queue).await.1);
+    }
+    assert_eq!(in_progress.len(), 300);
+    assert_eq!(check_readiness(&queue).await, (true, false));
+    assert_eq!(api.count_calls(HEAD), 0, "no head listing while requests are in progress");
+
+    for request in &mut in_progress {
+        queue.mark_request_as_handled(request).await.unwrap();
+    }
+    // One listing confirms the end.
+    assert_eq!(check_readiness(&queue).await, (true, true));
+    assert_eq!(api.count_calls(HEAD), 1);
+}
+
+#[tokio::test]
+async fn requests_in_the_queue_before_the_run_are_listed_until_a_listing_comes_back_short() {
+    let api = FakeApi::start().await;
+    for n in 0..250 {
+        api.add_request(DEFAULT_QUEUE, &format!("https://before.test/{n}"));
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+
+    let (mut fetched, mut readiness) = (0, (false, false));
+    while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+        fetched += 1;
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+        readiness = check_readiness(&queue).await;
+    }
+    assert_eq!(fetched, 251);
+    assert_eq!(readiness, (true, true));
+    // 200 of the 250, then the rest (fewer than asked for, so nothing else is left), then the end.
+    assert_eq!(api.count_calls(HEAD), 3);
+}
+
+/// This client owns the queue: what other clients add comes through the head listing that
+/// confirms the end.
 #[tokio::test]
 async fn requests_of_other_producers_come_through_the_head() {
     let api = FakeApi::start().await;
@@ -230,6 +286,8 @@ async fn requests_of_other_producers_come_through_the_head() {
     assert!(queue.is_finished().await.unwrap());
 
     api.add_request(DEFAULT_QUEUE, "https://other.test/1");
+    assert!(queue.fetch_next_request().await.unwrap().is_none(), "not listed before the end");
+    assert_eq!(check_readiness(&queue).await, (true, false), "the listing at the end finds it");
     let mut request = queue.fetch_next_request().await.unwrap().unwrap();
     assert_eq!(request.url, "https://other.test/1");
     assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 1, "fetched by id once");

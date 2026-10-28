@@ -155,6 +155,11 @@ struct State {
     handled: HashSet<String>,
     /// Ids of requests being processed by this client.
     in_progress: HashSet<String>,
+    /// Whether every unhandled request of the queue is in `head` or `in_progress`, so the head
+    /// needs no listing: from the first add to a queue without unhandled requests, or from a head
+    /// listing that returned fewer items than asked for. Only requests other clients add later
+    /// are missing; the listing in `is_finished` finds them.
+    head_complete: bool,
     /// Local estimates of the counters, which lag behind on the platform.
     estimated_total: u64,
     estimated_handled: u64,
@@ -181,8 +186,12 @@ impl State {
 /// request is locked.
 ///
 /// Constraints, as in the JS SDK: only one client may fetch and process requests; others may add
-/// requests (their forefront requests may be picked up late); nobody else may delete or modify
-/// requests.
+/// requests; nobody else may delete or modify requests.
+///
+/// Unlike the JS SDK, this client lists the queue head (a paid read per listed request, including
+/// the requests in progress) only until it knows every unhandled request, and then once more to
+/// confirm the end. Requests other clients add after that are picked up only by that last
+/// listing, when this client has nothing else left (see docs/allowed-differences.md).
 pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
     state: Mutex<State>,
@@ -200,6 +209,7 @@ impl ApifySingleRequestQueue {
                 cached: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
                 handled: HashSet::new(),
                 in_progress: HashSet::new(),
+                head_complete: false,
                 estimated_total: 0,
                 estimated_handled: 0,
             }),
@@ -217,7 +227,8 @@ impl ApifySingleRequestQueue {
 
     /// One-time prefetch of the queue contents, so that the requests a resurrected run adds again
     /// are deduplicated locally (one read for the whole cache) instead of on the platform (one
-    /// paid write per request).
+    /// paid write per request). It runs before this client first adds requests: when the queue
+    /// has no unhandled request then, this client knows every request it will have to process.
     async fn init_caches(&self) {
         let options = ListRequestsOptions { limit: Some(INIT_CACHES_REQUEST_LIMIT), ..ListRequestsOptions::default() };
         let page = match self.client.list_requests(options).await {
@@ -229,28 +240,43 @@ impl ApifySingleRequestQueue {
             }
         };
         let mut state = self.state.lock();
+        let mut complete = (page.items.len() as i64) < INIT_CACHES_REQUEST_LIMIT;
         for request in page.items {
-            let Ok(request) = from_api_request(request) else { continue };
+            let Ok(request) = from_api_request(request) else {
+                complete = false;
+                continue;
+            };
             let Some(id) = request.id.clone() else { continue };
             if request.handled_at.is_some() {
                 state.handled.insert(id);
             } else {
+                complete = false;
                 state.cache(request);
             }
+        }
+        if complete {
+            state.head_complete = true;
         }
     }
 
     async fn ensure_head_is_non_empty(&self) -> StorageResult<()> {
-        let limit = {
+        {
             let state = self.state.lock();
-            if state.head.len() > 1 {
+            if state.head.len() > 1 || state.head_complete {
                 return Ok(());
             }
-            // The head listing includes the requests in progress, so ask for enough to find new ones.
-            MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + state.in_progress.len())
-        };
+        }
+        self.list_head().await
+    }
+
+    /// Adds the requests of the platform's queue head this client does not know to the local head.
+    async fn list_head(&self) -> StorageResult<()> {
+        // The head listing includes the requests in progress, so ask for enough to find new ones.
+        let limit = MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + self.state.lock().in_progress.len());
         let head = self.client.list_head(Some(limit as i64)).await.map_err(backend_error)?;
         let mut state = self.state.lock();
+        // Fewer than asked for: the listing has every unhandled request.
+        state.head_complete = head.items.len() < limit;
         for item in head.items {
             let Some(id) = item.id else { continue };
             if state.in_progress.contains(&id) || state.handled.contains(&id) || state.head.contains(&id) {
@@ -460,6 +486,16 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
-        Ok(self.is_empty().await? && self.state.lock().in_progress.is_empty())
+        {
+            let state = self.state.lock();
+            if !state.head.is_empty() || !state.in_progress.is_empty() {
+                return Ok(false);
+            }
+        }
+        // Nothing left that this client knows of: a listing confirms it, and finds the requests
+        // other clients added.
+        self.list_head().await?;
+        let state = self.state.lock();
+        Ok(state.head.is_empty() && state.in_progress.is_empty())
     }
 }

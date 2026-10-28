@@ -256,8 +256,14 @@ async fn a_queue_this_client_filled_is_not_listed_until_nothing_is_left() {
     assert_eq!(api.count_calls(HEAD), 1);
 }
 
+const LIST: &str = "GET /v2/request-queues/default-queue/requests";
+
+fn count_exact(api: &FakeApi, call: &str) -> usize {
+    api.calls().iter().filter(|made| *made == call).count()
+}
+
 #[tokio::test]
-async fn requests_in_the_queue_before_the_run_are_listed_until_a_listing_comes_back_short() {
+async fn requests_in_the_queue_before_the_run_are_listed_once() {
     let api = FakeApi::start().await;
     for n in 0..250 {
         api.add_request(DEFAULT_QUEUE, &format!("https://before.test/{n}"));
@@ -273,8 +279,40 @@ async fn requests_in_the_queue_before_the_run_are_listed_until_a_listing_comes_b
     }
     assert_eq!(fetched, 251);
     assert_eq!(readiness, (true, true));
-    // 200 of the 250, then the rest (fewer than asked for, so nothing else is left), then the end.
-    assert_eq!(api.count_calls(HEAD), 3);
+    // The prefetch that deduplicates, then the pending requests; the head only at the end.
+    assert_eq!(count_exact(&api, LIST), 2);
+    assert_eq!(api.count_calls(HEAD), 1);
+}
+
+/// A head listing returns at most 1,000 requests, the requests in progress included, so it could
+/// never show the rest of a queue with 1,000 requests in progress.
+#[tokio::test]
+async fn a_resurrected_run_gets_every_pending_request_whatever_is_in_progress() {
+    let api = FakeApi::start().await;
+    let urls: Vec<String> = (0..1500).map(|n| format!("https://before.test/{n}")).collect();
+    for url in &urls {
+        api.add_request(DEFAULT_QUEUE, url);
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    // The run adds its start requests again.
+    queue.add_requests(urls[..10].iter().map(|url| url.as_str().into()).collect(), false).await.unwrap();
+
+    let mut in_progress = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+        assert!(!check_readiness(&queue).await.1);
+    }
+    assert_eq!(in_progress.len(), 1500, "all of them in progress at once");
+    assert_eq!(api.count_calls(HEAD), 0);
+    // The prefetch (1,000 of 1,500), then the pending requests in two pages.
+    assert_eq!(count_exact(&api, LIST), 3);
+    assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 0, "listed with their data");
+
+    for request in &mut in_progress {
+        queue.mark_request_as_handled(request).await.unwrap();
+    }
+    assert_eq!(check_readiness(&queue).await, (true, true));
+    assert_eq!(api.count_calls(HEAD), 1);
 }
 
 /// This client owns the queue: what other clients add comes through the head listing that

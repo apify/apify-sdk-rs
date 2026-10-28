@@ -43,6 +43,8 @@ const MAX_HEAD_ITEMS: usize = 1000;
 const DESIRED_NEW_HEAD_ITEMS: usize = 200;
 /// How many existing requests to prefetch into the local caches on the first add.
 const INIT_CACHES_REQUEST_LIMIT: i64 = 10_000;
+/// The longest page of the request listing the API returns.
+const MAX_LISTED_REQUESTS: i64 = 10_000;
 
 fn to_api_request(request: &Request) -> StorageResult<RequestQueueRequest> {
     Ok(serde_json::from_value(serde_json::to_value(request)?)?)
@@ -155,10 +157,11 @@ struct State {
     handled: HashSet<String>,
     /// Ids of requests being processed by this client.
     in_progress: HashSet<String>,
-    /// Whether every unhandled request of the queue is in `head` or `in_progress`, so the head
-    /// needs no listing: from the first add to a queue without unhandled requests, or from a head
-    /// listing that returned fewer items than asked for. Only requests other clients add later
-    /// are missing; the listing in `is_finished` finds them.
+    /// Whether every unhandled request of the queue is in `head` or `in_progress`, so nothing
+    /// needs listing: from the first add to a queue without unhandled requests, from a listing of
+    /// the pending requests, or from a head listing that returned fewer items than asked for.
+    /// Only requests other clients add later are missing; the head listing in `is_finished`
+    /// finds them.
     head_complete: bool,
     /// Local estimates of the counters, which lag behind on the platform.
     estimated_total: u64,
@@ -188,14 +191,17 @@ impl State {
 /// Constraints, as in the JS SDK: only one client may fetch and process requests; others may add
 /// requests; nobody else may delete or modify requests.
 ///
-/// Unlike the JS SDK, this client lists the queue head (a paid read per listed request, including
-/// the requests in progress) only until it knows every unhandled request, and then once more to
+/// Unlike the JS SDK, this client lists the queue's requests (a paid read per listed request)
+/// only until it knows every unhandled request: all pending requests at once, page by page, not
+/// the head (at most 1,000 requests, those in progress included). It lists the head once more to
 /// confirm the end. Requests other clients add after that are picked up only by that last
 /// listing, when this client has nothing else left (see docs/allowed-differences.md).
 pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
     state: Mutex<State>,
     caches_initialized: tokio::sync::OnceCell<()>,
+    /// Held while the pending requests are listed, so concurrent fetches list them once.
+    listing: tokio::sync::Mutex<()>,
     drop_hook: DropHook,
 }
 
@@ -214,6 +220,7 @@ impl ApifySingleRequestQueue {
                 estimated_handled: 0,
             }),
             caches_initialized: tokio::sync::OnceCell::new(),
+            listing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -240,7 +247,7 @@ impl ApifySingleRequestQueue {
             }
         };
         let mut state = self.state.lock();
-        let mut complete = (page.items.len() as i64) < INIT_CACHES_REQUEST_LIMIT;
+        let mut complete = page.next_cursor.is_none() && (page.items.len() as i64) < INIT_CACHES_REQUEST_LIMIT;
         for request in page.items {
             let Ok(request) = from_api_request(request) else {
                 complete = false;
@@ -260,16 +267,59 @@ impl ApifySingleRequestQueue {
     }
 
     async fn ensure_head_is_non_empty(&self) -> StorageResult<()> {
-        {
+        let needs_listing = || {
             let state = self.state.lock();
-            if state.head.len() > 1 || state.head_complete {
-                return Ok(());
+            state.head.len() <= 1 && !state.head_complete
+        };
+        if !needs_listing() {
+            return Ok(());
+        }
+        let _listing = self.listing.lock().await;
+        if needs_listing() {
+            self.list_pending().await?;
+        }
+        Ok(())
+    }
+
+    /// Adds every pending request of the queue this client does not know to the local head, in
+    /// the queue's order, page by page.
+    async fn list_pending(&self) -> StorageResult<()> {
+        let mut cursor = None;
+        loop {
+            let options = ListRequestsOptions {
+                limit: Some(MAX_LISTED_REQUESTS),
+                cursor: cursor.take(),
+                filter: Some(vec!["pending".to_owned()]),
+                ..ListRequestsOptions::default()
+            };
+            let page = self.client.list_requests(options).await.map_err(backend_error)?;
+            let mut state = self.state.lock();
+            let mut in_head: HashSet<String> = state.head.iter().cloned().collect();
+            for request in page.items {
+                let Ok(request) = from_api_request(request) else { continue };
+                let Some(id) = request.id.clone() else { continue };
+                if request.handled_at.is_some()
+                    || state.in_progress.contains(&id)
+                    || state.handled.contains(&id)
+                    || !in_head.insert(id.clone())
+                {
+                    continue;
+                }
+                state.cache(request);
+                state.head.push_back(id);
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
             }
         }
-        self.list_head().await
+        self.state.lock().head_complete = true;
+        Ok(())
     }
 
     /// Adds the requests of the platform's queue head this client does not know to the local head.
+    /// Used to confirm the end: when nothing is in progress, it returns only requests this client
+    /// does not know.
     async fn list_head(&self) -> StorageResult<()> {
         // The head listing includes the requests in progress, so ask for enough to find new ones.
         let limit = MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + self.state.lock().in_progress.len());

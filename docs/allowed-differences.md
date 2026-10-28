@@ -26,11 +26,10 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   requests (the prefetch that deduplicates added requests shows that). Otherwise (a resurrected
   run, a queue filled before the run), it lists all pending requests once with the request
   listing's `pending` filter, in the queue's order and with their data (so no request is read
-  again): 500 per page, the next page in the background while the current one is processed. After that it lists the head only
-  when it has nothing left (no request in its local head or in progress), in `is_finished`,
-  which also returns `false` without a listing while anything is left. The queue is the run's
-  own: requests another client adds after that are fetched only once this client has run out of
-  its own, at that last listing, not as soon as the platform head shows them.
+  again): 500 per page, the next page in the background while the current one is processed. It
+  never lists the head, and `is_finished` makes no API call: it is true once nothing it knows of
+  is left in its local head or in progress. The queue is the run's own: requests another client
+  adds after that are not fetched (the JS SDK picks them up from the head).
 
 ## Actor lifecycle
 

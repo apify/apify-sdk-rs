@@ -251,9 +251,8 @@ async fn a_queue_this_client_filled_is_not_listed_until_nothing_is_left() {
     for request in &mut in_progress {
         queue.mark_request_as_handled(request).await.unwrap();
     }
-    // One listing confirms the end.
     assert_eq!(check_readiness(&queue).await, (true, true));
-    assert_eq!(api.count_calls(HEAD), 1);
+    assert_eq!(api.count_calls(HEAD), 0, "the end needs no head listing");
 }
 
 const LIST: &str = "GET /v2/request-queues/default-queue/requests";
@@ -279,9 +278,9 @@ async fn requests_in_the_queue_before_the_run_are_listed_once() {
     }
     assert_eq!(fetched, 251);
     assert_eq!(readiness, (true, true));
-    // The prefetch that deduplicates, then the pending requests; the head only at the end.
+    // The prefetch that deduplicates, then the pending requests.
     assert_eq!(count_exact(&api, LIST), 2);
-    assert_eq!(api.count_calls(HEAD), 1);
+    assert_eq!(api.count_calls(HEAD), 0, "the end needs no head listing");
 }
 
 /// A head listing returns at most 1,000 requests, the requests in progress included, so it could
@@ -312,7 +311,7 @@ async fn a_resurrected_run_gets_every_pending_request_whatever_is_in_progress() 
         queue.mark_request_as_handled(request).await.unwrap();
     }
     assert_eq!(check_readiness(&queue).await, (true, true));
-    assert_eq!(api.count_calls(HEAD), 1);
+    assert_eq!(api.count_calls(HEAD), 0, "the end needs no head listing");
 }
 
 /// The first page is served as soon as it is listed; the next ones are listed in the background
@@ -348,22 +347,23 @@ async fn the_pending_requests_are_listed_ahead_in_the_background() {
     assert_eq!(urls.len(), 1200, "each request once");
 }
 
-/// This client owns the queue: what other clients add comes through the head listing that
-/// confirms the end.
+/// This client owns the queue: requests other clients add once it knows every request are not
+/// fetched; those already in the queue are, through the listing of the pending requests.
 #[tokio::test]
-async fn requests_of_other_producers_come_through_the_head() {
+async fn requests_others_add_are_fetched_only_until_this_client_knows_the_queue() {
     let api = FakeApi::start().await;
+    api.add_request(DEFAULT_QUEUE, "https://other.test/before");
     let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
-    assert!(queue.is_finished().await.unwrap());
-
-    api.add_request(DEFAULT_QUEUE, "https://other.test/1");
-    assert!(queue.fetch_next_request().await.unwrap().is_none(), "not listed before the end");
-    assert_eq!(check_readiness(&queue).await, (true, false), "the listing at the end finds it");
     let mut request = queue.fetch_next_request().await.unwrap().unwrap();
-    assert_eq!(request.url, "https://other.test/1");
-    assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 1, "fetched by id once");
+    assert_eq!(request.url, "https://other.test/before");
+    assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 0, "listed with its data");
     queue.mark_request_as_handled(&mut request).await.unwrap();
     assert!(queue.is_finished().await.unwrap());
+
+    api.add_request(DEFAULT_QUEUE, "https://other.test/after");
+    assert_eq!(check_readiness(&queue).await, (true, true), "the queue is this client's");
+    assert!(queue.fetch_next_request().await.unwrap().is_none());
+    assert_eq!(api.count_calls(HEAD), 0);
 
     // Marking a request the queue does not have does not add it.
     let mut unknown = crawlee::Request::new("https://unknown.test");

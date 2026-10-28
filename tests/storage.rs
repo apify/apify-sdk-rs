@@ -223,6 +223,133 @@ async fn a_lagging_head_does_not_finish_the_queue_early() {
     assert!(queue.is_finished().await.unwrap());
 }
 
+/// The readiness check of the crawler: `is_empty`, then `is_finished`.
+async fn check_readiness(queue: &crawlee::RequestQueue) -> (bool, bool) {
+    (queue.is_empty().await.unwrap(), queue.is_finished().await.unwrap())
+}
+
+const HEAD: &str = "GET /v2/request-queues/default-queue/head";
+
+#[tokio::test]
+async fn a_queue_this_client_filled_is_not_listed_until_nothing_is_left() {
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let urls: Vec<String> = (0..300).map(|n| format!("https://a.test/{n}")).collect();
+    queue.add_requests(urls.iter().map(|url| url.as_str().into()).collect(), false).await.unwrap();
+
+    // Everything in progress, the local head empty: the queue had no other requests when this
+    // client first added to it, so it knows there is nothing more to fetch.
+    let mut in_progress = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+        assert!(!check_readiness(&queue).await.1);
+    }
+    assert_eq!(in_progress.len(), 300);
+    assert_eq!(check_readiness(&queue).await, (true, false));
+    assert_eq!(api.count_calls(HEAD), 0, "no head listing while requests are in progress");
+
+    for request in &mut in_progress {
+        queue.mark_request_as_handled(request).await.unwrap();
+    }
+    // One listing confirms the end.
+    assert_eq!(check_readiness(&queue).await, (true, true));
+    assert_eq!(api.count_calls(HEAD), 1);
+}
+
+const LIST: &str = "GET /v2/request-queues/default-queue/requests";
+
+fn count_exact(api: &FakeApi, call: &str) -> usize {
+    api.calls().iter().filter(|made| *made == call).count()
+}
+
+#[tokio::test]
+async fn requests_in_the_queue_before_the_run_are_listed_once() {
+    let api = FakeApi::start().await;
+    for n in 0..250 {
+        api.add_request(DEFAULT_QUEUE, &format!("https://before.test/{n}"));
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+
+    let (mut fetched, mut readiness) = (0, (false, false));
+    while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+        fetched += 1;
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+        readiness = check_readiness(&queue).await;
+    }
+    assert_eq!(fetched, 251);
+    assert_eq!(readiness, (true, true));
+    // The prefetch that deduplicates, then the pending requests; the head only at the end.
+    assert_eq!(count_exact(&api, LIST), 2);
+    assert_eq!(api.count_calls(HEAD), 1);
+}
+
+/// A head listing returns at most 1,000 requests, the requests in progress included, so it could
+/// never show the rest of a queue with 1,000 requests in progress.
+#[tokio::test]
+async fn a_resurrected_run_gets_every_pending_request_whatever_is_in_progress() {
+    let api = FakeApi::start().await;
+    let urls: Vec<String> = (0..1500).map(|n| format!("https://before.test/{n}")).collect();
+    for url in &urls {
+        api.add_request(DEFAULT_QUEUE, url);
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    // The run adds its start requests again.
+    queue.add_requests(urls[..10].iter().map(|url| url.as_str().into()).collect(), false).await.unwrap();
+
+    let mut in_progress = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+        assert!(!check_readiness(&queue).await.1);
+    }
+    assert_eq!(in_progress.len(), 1500, "all of them in progress at once");
+    assert_eq!(api.count_calls(HEAD), 0);
+    // The prefetch (1,000 of 1,500), then the pending requests in pages of 500.
+    assert_eq!(count_exact(&api, LIST), 4);
+    assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 0, "listed with their data");
+
+    for request in &mut in_progress {
+        queue.mark_request_as_handled(request).await.unwrap();
+    }
+    assert_eq!(check_readiness(&queue).await, (true, true));
+    assert_eq!(api.count_calls(HEAD), 1);
+}
+
+/// The first page is served as soon as it is listed; the next ones are listed in the background
+/// while the local head still has requests. On more than one thread, as the crawler runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pending_requests_are_listed_ahead_in_the_background() {
+    let api = FakeApi::start().await;
+    for n in 0..1200 {
+        api.add_request(DEFAULT_QUEUE, &format!("https://before.test/{n}"));
+    }
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.delay(LIST, std::time::Duration::from_millis(500));
+
+    let mut in_progress = vec![queue.fetch_next_request().await.unwrap().unwrap()];
+    assert_eq!(count_exact(&api, LIST), 1, "one page before the first request");
+    // The next page is listed in the background: these come from the local head right away.
+    let started = std::time::Instant::now();
+    for _ in 0..400 {
+        in_progress.push(queue.fetch_next_request().await.unwrap().unwrap());
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(250), "{:?}", started.elapsed());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(count_exact(&api, LIST), 2, "the next page is on its way");
+
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        in_progress.push(request);
+    }
+    assert_eq!(in_progress.len(), 1200);
+    assert_eq!(count_exact(&api, LIST), 3, "three pages of 500");
+    let mut urls: Vec<String> = in_progress.iter().map(|request| request.url.clone()).collect();
+    urls.sort();
+    urls.dedup();
+    assert_eq!(urls.len(), 1200, "each request once");
+}
+
+/// This client owns the queue: what other clients add comes through the head listing that
+/// confirms the end.
 #[tokio::test]
 async fn requests_of_other_producers_come_through_the_head() {
     let api = FakeApi::start().await;
@@ -230,6 +357,8 @@ async fn requests_of_other_producers_come_through_the_head() {
     assert!(queue.is_finished().await.unwrap());
 
     api.add_request(DEFAULT_QUEUE, "https://other.test/1");
+    assert!(queue.fetch_next_request().await.unwrap().is_none(), "not listed before the end");
+    assert_eq!(check_readiness(&queue).await, (true, false), "the listing at the end finds it");
     let mut request = queue.fetch_next_request().await.unwrap().unwrap();
     assert_eq!(request.url, "https://other.test/1");
     assert_eq!(api.count_calls("GET /v2/request-queues/default-queue/requests/"), 1, "fetched by id once");

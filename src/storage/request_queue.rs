@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use apify_client::clients::request_queue::{BatchAddRequestsOptions, ListRequestsOptions, RequestQueueClient};
 use apify_client::models::RequestQueueRequest;
@@ -43,6 +44,9 @@ const MAX_HEAD_ITEMS: usize = 1000;
 const DESIRED_NEW_HEAD_ITEMS: usize = 200;
 /// How many existing requests to prefetch into the local caches on the first add.
 const INIT_CACHES_REQUEST_LIMIT: i64 = 10_000;
+/// How many pending requests to list per page. Their data (user data, payloads) comes with them,
+/// so a page is small enough to start on right away; the next one is listed in the background.
+const PENDING_PAGE: usize = 500;
 
 fn to_api_request(request: &Request) -> StorageResult<RequestQueueRequest> {
     Ok(serde_json::from_value(serde_json::to_value(request)?)?)
@@ -145,6 +149,43 @@ pub(super) fn newly_added(result: &BatchAddRequestsResult) -> u64 {
     result.processed_requests.iter().filter(|p| !p.was_already_present && !p.was_already_handled).count() as u64
 }
 
+/// Adds the next page of the queue's pending requests this client does not know to the local
+/// head, in the queue's order, with their data. The last page leaves the head complete.
+async fn list_pending_page(
+    client: &RequestQueueClient,
+    state: &Mutex<State>,
+    cursor: &mut Option<String>,
+) -> StorageResult<()> {
+    if state.lock().head_complete {
+        return Ok(());
+    }
+    let options = ListRequestsOptions {
+        limit: Some(PENDING_PAGE as i64),
+        cursor: cursor.clone(),
+        filter: Some(vec!["pending".to_owned()]),
+        ..ListRequestsOptions::default()
+    };
+    let page = client.list_requests(options).await.map_err(backend_error)?;
+    let mut state = state.lock();
+    let mut in_head: HashSet<String> = state.head.iter().cloned().collect();
+    for request in page.items {
+        let Ok(request) = from_api_request(request) else { continue };
+        let Some(id) = request.id.clone() else { continue };
+        if request.handled_at.is_some()
+            || state.in_progress.contains(&id)
+            || state.handled.contains(&id)
+            || !in_head.insert(id.clone())
+        {
+            continue;
+        }
+        state.cache(request);
+        state.head.push_back(id);
+    }
+    *cursor = page.next_cursor;
+    state.head_complete = cursor.is_none();
+    Ok(())
+}
+
 /// What this client knows about the queue.
 struct State {
     /// Local estimate of the queue head: request ids in the order they should be fetched.
@@ -155,6 +196,12 @@ struct State {
     handled: HashSet<String>,
     /// Ids of requests being processed by this client.
     in_progress: HashSet<String>,
+    /// Whether every unhandled request of the queue is in `head` or `in_progress`, so nothing
+    /// needs listing: from the first add to a queue without unhandled requests, from a listing of
+    /// the pending requests, or from a head listing that returned fewer items than asked for.
+    /// Only requests other clients add later are missing; the head listing in `is_finished`
+    /// finds them.
+    head_complete: bool,
     /// Local estimates of the counters, which lag behind on the platform.
     estimated_total: u64,
     estimated_handled: u64,
@@ -181,12 +228,20 @@ impl State {
 /// request is locked.
 ///
 /// Constraints, as in the JS SDK: only one client may fetch and process requests; others may add
-/// requests (their forefront requests may be picked up late); nobody else may delete or modify
-/// requests.
+/// requests; nobody else may delete or modify requests.
+///
+/// Unlike the JS SDK, this client lists the queue's requests (a paid read per listed request)
+/// only until it knows every unhandled request: all pending requests, a page ahead in the
+/// background, not the head (at most 1,000 requests, those in progress included). It lists the head once more to
+/// confirm the end. Requests other clients add after that are picked up only by that last
+/// listing, when this client has nothing else left (see docs/allowed-differences.md).
 pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     caches_initialized: tokio::sync::OnceCell<()>,
+    /// The cursor of the next page of pending requests (`None` for the first), held while a page
+    /// is listed, so that each page is listed once.
+    listing: Arc<tokio::sync::Mutex<Option<String>>>,
     drop_hook: DropHook,
 }
 
@@ -195,15 +250,17 @@ impl ApifySingleRequestQueue {
         ApifySingleRequestQueue {
             client,
             drop_hook,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 head: VecDeque::new(),
                 cached: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
                 handled: HashSet::new(),
                 in_progress: HashSet::new(),
+                head_complete: false,
                 estimated_total: 0,
                 estimated_handled: 0,
-            }),
+            })),
             caches_initialized: tokio::sync::OnceCell::new(),
+            listing: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -217,7 +274,8 @@ impl ApifySingleRequestQueue {
 
     /// One-time prefetch of the queue contents, so that the requests a resurrected run adds again
     /// are deduplicated locally (one read for the whole cache) instead of on the platform (one
-    /// paid write per request).
+    /// paid write per request). It runs before this client first adds requests: when the queue
+    /// has no unhandled request then, this client knows every request it will have to process.
     async fn init_caches(&self) {
         let options = ListRequestsOptions { limit: Some(INIT_CACHES_REQUEST_LIMIT), ..ListRequestsOptions::default() };
         let page = match self.client.list_requests(options).await {
@@ -229,28 +287,70 @@ impl ApifySingleRequestQueue {
             }
         };
         let mut state = self.state.lock();
+        let mut complete = page.next_cursor.is_none() && (page.items.len() as i64) < INIT_CACHES_REQUEST_LIMIT;
         for request in page.items {
-            let Ok(request) = from_api_request(request) else { continue };
+            let Ok(request) = from_api_request(request) else {
+                complete = false;
+                continue;
+            };
             let Some(id) = request.id.clone() else { continue };
             if request.handled_at.is_some() {
                 state.handled.insert(id);
             } else {
+                complete = false;
                 state.cache(request);
             }
+        }
+        if complete {
+            state.head_complete = true;
         }
     }
 
     async fn ensure_head_is_non_empty(&self) -> StorageResult<()> {
-        let limit = {
+        let needs_page = || {
             let state = self.state.lock();
-            if state.head.len() > 1 {
-                return Ok(());
-            }
-            // The head listing includes the requests in progress, so ask for enough to find new ones.
-            MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + state.in_progress.len())
+            state.head.len() <= 1 && !state.head_complete
         };
+        if needs_page() {
+            // Waits for the page being listed in the background, if any.
+            let mut cursor = self.listing.clone().lock_owned().await;
+            if needs_page() {
+                list_pending_page(&self.client, &self.state, &mut cursor).await?;
+            }
+        }
+        self.list_ahead();
+        Ok(())
+    }
+
+    /// Lists the next page of pending requests in the background once the local head has less
+    /// than a page left, unless a page is being listed already.
+    fn list_ahead(&self) {
+        {
+            let state = self.state.lock();
+            if state.head_complete || state.head.len() >= PENDING_PAGE {
+                return;
+            }
+        }
+        let Ok(mut cursor) = self.listing.clone().try_lock_owned() else { return };
+        let (client, state) = (self.client.clone(), self.state.clone());
+        tokio::spawn(async move {
+            if let Err(err) = list_pending_page(&client, &state, &mut cursor).await {
+                // Listed again when the local head runs out.
+                tracing::warn!("Failed to list the pending requests of the request queue: {err}");
+            }
+        });
+    }
+
+    /// Adds the requests of the platform's queue head this client does not know to the local head.
+    /// Used to confirm the end: when nothing is in progress, it returns only requests this client
+    /// does not know.
+    async fn list_head(&self) -> StorageResult<()> {
+        // The head listing includes the requests in progress, so ask for enough to find new ones.
+        let limit = MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + self.state.lock().in_progress.len());
         let head = self.client.list_head(Some(limit as i64)).await.map_err(backend_error)?;
         let mut state = self.state.lock();
+        // Fewer than asked for: the listing has every unhandled request.
+        state.head_complete = head.items.len() < limit;
         for item in head.items {
             let Some(id) = item.id else { continue };
             if state.in_progress.contains(&id) || state.handled.contains(&id) || state.head.contains(&id) {
@@ -460,6 +560,24 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
-        Ok(self.is_empty().await? && self.state.lock().in_progress.is_empty())
+        loop {
+            {
+                let state = self.state.lock();
+                if !state.head.is_empty() || !state.in_progress.is_empty() {
+                    return Ok(false);
+                }
+                if state.head_complete {
+                    break;
+                }
+            }
+            // The next page of pending requests (all of them known to this client, or there
+            // would be some in the local head).
+            self.ensure_head_is_non_empty().await?;
+        }
+        // Nothing left that this client knows of: a listing confirms it, and finds the requests
+        // other clients added.
+        self.list_head().await?;
+        let state = self.state.lock();
+        Ok(state.head.is_empty() && state.in_progress.is_empty())
     }
 }

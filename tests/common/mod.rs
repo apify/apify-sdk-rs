@@ -539,12 +539,22 @@ async fn list_requests(
 ) -> Response {
     let data = shared.data.lock();
     let Some(queue) = data.queues.get(&id) else { return not_found() };
-    let limit = number(&query, "limit").unwrap_or(1000);
-    let mut requests: Vec<&QueuedRequest> = queue.requests.values().collect();
+    let limit = number(&query, "limit").unwrap_or(1000).min(MAX_LISTED_REQUESTS);
+    let pending_only = query.get("filter").is_some_and(|filter| filter.split(',').any(|state| state == "pending"));
+    // The cursor is the offset of the page.
+    let offset = query.get("cursor").and_then(|cursor| cursor.parse::<usize>().ok()).unwrap_or(0);
+    let mut requests: Vec<&QueuedRequest> =
+        queue.requests.values().filter(|r| !pending_only || r.body["handledAt"].is_null()).collect();
     requests.sort_by_key(|r| r.order);
-    let items: Vec<Value> = requests.into_iter().take(limit).map(|r| r.body.clone()).collect();
-    envelope(StatusCode::OK, json!({ "limit": limit, "items": items }))
+    let total = requests.len();
+    let items: Vec<Value> = requests.into_iter().skip(offset).take(limit).map(|r| r.body.clone()).collect();
+    let next = offset + items.len();
+    let next_cursor = (next < total).then(|| next.to_string());
+    envelope(StatusCode::OK, json!({ "limit": limit, "nextCursor": next_cursor, "items": items }))
 }
+
+/// The longest page of the request listing; the API allows 10,000, fewer shows the paging in tests.
+const MAX_LISTED_REQUESTS: usize = 1000;
 
 async fn batch_add(
     State(shared): State<Shared>,

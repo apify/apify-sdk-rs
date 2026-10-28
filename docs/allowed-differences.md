@@ -15,6 +15,22 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **Listed keys have an empty content type.** The API does not report content types when it lists
   the keys of a key-value store. The JS SDK leaves the field undefined; crawlee-rs requires a
   string, so it is empty.
+- **A single-consumer request queue lists its requests only until it knows all of them.** The
+  platform bills one read per listed request. The JS SDK lists the queue head (at most 1,000
+  requests, the ones in progress included) whenever its local head is nearly empty, twice per
+  `isFinished`, which the crawler calls after every request and every 500 ms. So a run with 1,000
+  requests in progress paid up to 2,000 reads per check, and once 1,000 were in progress the
+  listing showed none of the others: a resurrected run could not run more than about 1,000
+  requests at once.
+  Here the queue knows every unhandled request from its first add to a queue without unhandled
+  requests (the prefetch that deduplicates added requests shows that). Otherwise (a resurrected
+  run, a queue filled before the run), it lists all pending requests once with the request
+  listing's `pending` filter, in the queue's order and with their data (so no request is read
+  again): 500 per page, the next page in the background while the current one is processed. After that it lists the head only
+  when it has nothing left (no request in its local head or in progress), in `is_finished`,
+  which also returns `false` without a listing while anything is left. The queue is the run's
+  own: requests another client adds after that are fetched only once this client has run out of
+  its own, at that last listing, not as soon as the platform head shows them.
 
 ## Actor lifecycle
 

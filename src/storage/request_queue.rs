@@ -38,10 +38,6 @@ pub enum RequestQueueAccess {
 
 /// Maximum number of requests cached locally.
 const MAX_CACHED_REQUESTS: usize = 1_000_000;
-/// The API returns at most this many head items.
-const MAX_HEAD_ITEMS: usize = 1000;
-/// How many new head items to aim for per head listing.
-const DESIRED_NEW_HEAD_ITEMS: usize = 200;
 /// How many existing requests to prefetch into the local caches on the first add.
 const INIT_CACHES_REQUEST_LIMIT: i64 = 10_000;
 /// How many pending requests to list per page. Their data (user data, payloads) comes with them,
@@ -197,10 +193,9 @@ struct State {
     /// Ids of requests being processed by this client.
     in_progress: HashSet<String>,
     /// Whether every unhandled request of the queue is in `head` or `in_progress`, so nothing
-    /// needs listing: from the first add to a queue without unhandled requests, from a listing of
-    /// the pending requests, or from a head listing that returned fewer items than asked for.
-    /// Only requests other clients add later are missing; the head listing in `is_finished`
-    /// finds them.
+    /// needs listing: from the first add to a queue without unhandled requests, or from a listing
+    /// of the pending requests. Only requests other clients add later are missing, and they are
+    /// not fetched: the queue is this client's.
     head_complete: bool,
     /// Local estimates of the counters, which lag behind on the platform.
     estimated_total: u64,
@@ -232,9 +227,9 @@ impl State {
 ///
 /// Unlike the JS SDK, this client lists the queue's requests (a paid read per listed request)
 /// only until it knows every unhandled request: all pending requests, a page ahead in the
-/// background, not the head (at most 1,000 requests, those in progress included). It lists the head once more to
-/// confirm the end. Requests other clients add after that are picked up only by that last
-/// listing, when this client has nothing else left (see docs/allowed-differences.md).
+/// background, not the head (at most 1,000 requests, those in progress included). It never
+/// lists the head: requests other clients add after that are not fetched, as the queue is this
+/// client's (see docs/allowed-differences.md).
 pub(crate) struct ApifySingleRequestQueue {
     client: RequestQueueClient,
     state: Arc<Mutex<State>>,
@@ -339,26 +334,6 @@ impl ApifySingleRequestQueue {
                 tracing::warn!("Failed to list the pending requests of the request queue: {err}");
             }
         });
-    }
-
-    /// Adds the requests of the platform's queue head this client does not know to the local head.
-    /// Used to confirm the end: when nothing is in progress, it returns only requests this client
-    /// does not know.
-    async fn list_head(&self) -> StorageResult<()> {
-        // The head listing includes the requests in progress, so ask for enough to find new ones.
-        let limit = MAX_HEAD_ITEMS.min(DESIRED_NEW_HEAD_ITEMS + self.state.lock().in_progress.len());
-        let head = self.client.list_head(Some(limit as i64)).await.map_err(backend_error)?;
-        let mut state = self.state.lock();
-        // Fewer than asked for: the listing has every unhandled request.
-        state.head_complete = head.items.len() < limit;
-        for item in head.items {
-            let Some(id) = item.id else { continue };
-            if state.in_progress.contains(&id) || state.handled.contains(&id) || state.head.contains(&id) {
-                continue;
-            }
-            state.head.push_back(id);
-        }
-        Ok(())
     }
 
     /// Whether the queue has the request, asking the platform only when this client does not know it.
@@ -485,7 +460,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
                 let cached = state.cached.get(&id).cloned();
                 (id, cached)
             };
-            // Only requests added by another producer (found through the head listing) are fetched.
+            // Only requests evicted from the cache are fetched.
             let request = match cached {
                 Some(request) => Some(request),
                 None => self.get_request_by_id(&id).await?,
@@ -574,10 +549,7 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
             // would be some in the local head).
             self.ensure_head_is_non_empty().await?;
         }
-        // Nothing left that this client knows of: a listing confirms it, and finds the requests
-        // other clients added.
-        self.list_head().await?;
-        let state = self.state.lock();
-        Ok(state.head.is_empty() && state.in_progress.is_empty())
+        // The queue is this client's, and nothing it knows of is left.
+        Ok(true)
     }
 }

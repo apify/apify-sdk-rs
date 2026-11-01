@@ -408,6 +408,18 @@ async fn pushes_repair_drop_or_return_the_items_the_schema_rejects() {
 }
 
 #[tokio::test]
+async fn the_first_buffered_pushes_are_stored_at_once() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("buffered-first", &platform_env(&api, None), dir.path()).await, 0);
+
+    let stored: Vec<Value> = api.dataset_items(DEFAULT_DATASET).into_iter().map(|item| item["n"].clone()).collect();
+    assert_eq!(stored, [json!(1), json!(2), json!(3), json!(4)]);
+    // The first two on their own, then the buffered ones together.
+    assert_eq!(api.count_calls(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items")), 3);
+}
+
+#[tokio::test]
 async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -639,7 +651,9 @@ fn child() {
                 .await
             }
             "buffered" => {
-                Actor::main(|| async move {
+                // All buffered.
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
                     let started = std::time::Instant::now();
                     // Three pushes within the buffer's window: one request.
                     let first = Actor::push_data_and_charge_buffered(&[json!({ "n": 1 }), json!({ "n": 2 })], "page")?;
@@ -675,8 +689,29 @@ fn child() {
                 })
                 .await
             }
+            "buffered-first" => {
+                let init = apify::InitOptions { unbuffered_first_pushes: 2, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    // Stored without waiting for the buffer's window.
+                    for n in [1, 2] {
+                        let started = std::time::Instant::now();
+                        Actor::push_data_buffered(&json!({ "n": n }))?.await?;
+                        let elapsed = started.elapsed();
+                        assert!(elapsed < Duration::from_millis(300), "push {n} stored after {elapsed:?}");
+                    }
+                    // Buffered from then on.
+                    let third = Actor::push_data_buffered(&json!({ "n": 3 }))?;
+                    let fourth = Actor::push_data_buffered(&json!({ "n": 4 }))?;
+                    third.await?;
+                    fourth.await?;
+                    Ok(())
+                })
+                .await
+            }
             "buffered-repair" => {
-                Actor::main(|| async move {
+                // All buffered.
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
                     use apify::{OnInvalidItems, PushOptions};
                     let options = |on_invalid_items| PushOptions { on_invalid_items, ..Default::default() };
                     let repaired = Actor::push_data_buffered_with(

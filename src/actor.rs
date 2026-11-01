@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use apify_client::ApifyClient;
 use apify_client::models::ActorRun;
 use crawlee::core::events::ListenerId;
+use crawlee::core::storage::backend::DatasetItem;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::storage::dataset::serialize_items;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
@@ -25,6 +26,10 @@ use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
+use crate::push_buffer::{BufferedPush, PushBuffer};
+use crate::schema_validation::{
+    Entry, PushError, PushOptions, PushResult, Rejected, charge_of_stored, store_validated,
+};
 use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 /// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
@@ -45,6 +50,9 @@ pub struct InitOptions {
     /// A storage backend used instead of the platform storages (on the platform) or the local
     /// files (elsewhere).
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// How long [`Actor::push_data_buffered`] buffers items before it stores them, counted from
+    /// the first item of a batch. 0.5 s by default.
+    pub push_buffer_window: Duration,
     /// How request queues on the platform are consumed.
     pub request_queue_access: RequestQueueAccess,
     /// Exit when the run is aborted, and reboot when it is migrated. Default `true`.
@@ -62,6 +70,7 @@ impl Default for InitOptions {
         InitOptions {
             configuration: None,
             storage: None,
+            push_buffer_window: Duration::from_millis(500),
             request_queue_access: RequestQueueAccess::default(),
             graceful_shutdown: true,
             graceful_shutdown_delay: Duration::ZERO,
@@ -148,6 +157,7 @@ struct Inner {
     exit_options: Mutex<Option<ExitOptions>>,
     status_messages: StatusMessages,
     child_runs: ChildRunTracker,
+    push_buffer: Arc<PushBuffer>,
 }
 
 /// The status message updates of the run: sent one at a time, in the order they were made, so
@@ -349,6 +359,7 @@ impl Actor {
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
         let child_run_services = services.clone();
+        let push_buffer = PushBuffer::new(options.push_buffer_window, services.clone(), charging.clone());
         let inner = Inner {
             configuration: configuration.clone(),
             client,
@@ -363,6 +374,7 @@ impl Actor {
             exit_options: Mutex::default(),
             status_messages: StatusMessages::default(),
             child_runs: ChildRunTracker::new(child_run_services),
+            push_buffer,
         };
         if STATE.set(inner).is_err() {
             return Err(InitError::ServicesAlreadySet);
@@ -385,6 +397,13 @@ impl Actor {
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
+        // Buffered items are stored with the rest of the state: on a migration or an abort, after
+        // the running requests.
+        let push_buffer = state.push_buffer.clone();
+        events.on(EventKind::PersistState, move |_| {
+            let push_buffer = push_buffer.clone();
+            async move { push_buffer.flush().await }
+        });
         {
             let mut listeners = LISTENERS.lock();
             let pending = std::mem::take(&mut listeners.pending);
@@ -577,6 +596,8 @@ impl Actor {
             if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
+            // Items buffered by listeners.
+            state().push_buffer.flush().await;
             let started = Instant::now();
             // The status messages still being set must not overwrite the terminal one.
             let (teardown, ()) = tokio::join!(state().storage.teardown(), Self::wait_for_status_messages());
@@ -774,6 +795,117 @@ impl Actor {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
         Self::push_items_charging(data, events).await
+    }
+
+    /// [`push_data`](Self::push_data), buffered: the items pushed within
+    /// [`InitOptions::push_buffer_window`] (0.5 s) of each other are stored with one request, and
+    /// charged with one charge call. The budget is reserved at once
+    /// ([`BufferedPush::charge_result`]); await the [`BufferedPush`] to know whether the items were
+    /// stored. Items the dataset's schema rejects come back as [`PushError::Invalid`](crate::PushError),
+    /// uncharged, and the others are stored. Buffered items are stored on every `PersistState`
+    /// event and when the Actor exits; not awaiting the push risks losing them on a crash.
+    pub fn push_data_buffered<T: serde::Serialize + ?Sized>(data: &T) -> Result<BufferedPush, ChargingError> {
+        Self::push_data_buffered_with(data, &PushOptions::default())
+    }
+
+    /// [`push_data_and_charge`](Self::push_data_and_charge), buffered as
+    /// [`push_data_buffered`](Self::push_data_buffered) is.
+    pub fn push_data_and_charge_buffered<T: serde::Serialize + ?Sized>(
+        data: &T,
+        event_name: &str,
+    ) -> Result<BufferedPush, ChargingError> {
+        let options = PushOptions { charge_events: vec![event_name.to_owned()], ..Default::default() };
+        Self::push_data_buffered_with(data, &options)
+    }
+
+    /// [`push_data_buffered`](Self::push_data_buffered) with options: the events to charge for
+    /// each item, and what happens to the items the dataset's schema rejects
+    /// ([`OnInvalidItems`](crate::OnInvalidItems): given back, repaired or dropped).
+    pub fn push_data_buffered_with<T: serde::Serialize + ?Sized>(
+        data: &T,
+        options: &PushOptions,
+    ) -> Result<BufferedPush, ChargingError> {
+        let (items, events, is_default_dataset, charge) = Self::reserve_push(data, options)?;
+        if items.is_empty() {
+            return Ok(BufferedPush::new(charge, None));
+        }
+        let stored =
+            state().push_buffer.add(items, events, is_default_dataset, options.on_invalid_items, charge.clone());
+        Ok(BufferedPush::new(charge, Some(stored)))
+    }
+
+    /// Pushes items to the default dataset as [`push_data_and_charge_events`](Self::push_data_and_charge_events)
+    /// does, with the events of `options`, and with the items the dataset's schema rejects handled
+    /// as `options` asks ([`OnInvalidItems`](crate::OnInvalidItems)): given back in
+    /// [`PushResult::invalid_items`](crate::PushResult), repaired or dropped. The other items are
+    /// stored and charged. [`push_data`](Self::push_data) fails then, as in JS, with none of the
+    /// items stored.
+    pub async fn push_data_with<T: serde::Serialize + ?Sized>(
+        data: &T,
+        options: &PushOptions,
+    ) -> Result<PushResult, PushError> {
+        let (items, events, is_default_dataset, charge) =
+            Self::reserve_push(data, options).map_err(|err| PushError::Charge(Arc::new(err)))?;
+        if items.is_empty() {
+            return Ok(PushResult { charge, invalid_items: Vec::new() });
+        }
+        let charging = &state().charging;
+        let events: Vec<&str> = events.iter().map(String::as_str).collect();
+        let len = items.len();
+        let entries = items.into_iter().enumerate().map(|(index, item)| Entry::new(0, index, item)).collect();
+        let policies = [options.on_invalid_items];
+        let (stored, rejected) = match state().services.open_dataset(&StorageIdentifier::Default).await {
+            Ok(dataset) => store_validated(&dataset, entries, &policies).await,
+            Err(err) => (Err(err), vec![Rejected::default()]),
+        };
+        let rejected = rejected.into_iter().next().unwrap_or_default();
+        if let Err(err) = stored {
+            charging.unreserve_items(&events, is_default_dataset, len);
+            return Err(PushError::Failed(Arc::new(err)));
+        }
+        charging.unreserve_items(&events, is_default_dataset, rejected.count());
+        charging
+            .send_item_charges(&events, is_default_dataset, len - rejected.count())
+            .await
+            .map_err(|err| PushError::Charge(Arc::new(err)))?;
+        Ok(PushResult {
+            charge: charge_of_stored(&charge, rejected.count(), charging),
+            invalid_items: rejected.invalid,
+        })
+    }
+
+    /// Serializes the items of a push and reserves the charges of as many as the budget allows:
+    /// the items to store, the events, whether the default dataset item event is charged too, and
+    /// the charges reserved.
+    fn reserve_push<T: serde::Serialize + ?Sized>(
+        data: &T,
+        options: &PushOptions,
+    ) -> Result<(Vec<DatasetItem>, Vec<String>, bool, ChargeResult), ChargingError> {
+        let events: Vec<&str> = options.charge_events.iter().map(String::as_str).collect();
+        if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
+            return Err(ChargingError::SyntheticEvent((*event).to_owned()));
+        }
+        let mut items = serialize_items(data)?;
+        let charging = &state().charging;
+        let is_default_dataset = state().smart.is_some();
+        let limit = charging.reserve_items(items.len(), &events, is_default_dataset);
+        let reached = !items.is_empty() && limit < items.len()
+            || if events.is_empty() {
+                charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
+            } else {
+                events.iter().any(|event| charging.is_event_charge_limit_reached(event))
+            };
+        items.truncate(limit);
+        let charge = ChargeResult {
+            event_charge_limit_reached: charging.is_pay_per_event() && reached,
+            charged_count: if !charging.is_pay_per_event() || (events.is_empty() && !is_default_dataset) {
+                0
+            } else {
+                limit as u64
+            },
+            chargeable_within_limit: charging.chargeable_within_limit(),
+        };
+        Ok((items, options.charge_events.clone(), is_default_dataset, charge))
     }
 
     /// Stores as many items as the budget allows for `events` (plus the default dataset item

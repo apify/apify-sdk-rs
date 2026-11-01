@@ -810,18 +810,18 @@ impl Actor {
         data: &T,
         event_name: &str,
     ) -> Result<BufferedPush, ChargingError> {
-        let options = BufferedPushOptions { charge_event: Some(event_name.to_owned()), ..Default::default() };
+        let options = BufferedPushOptions { charge_events: vec![event_name.to_owned()], ..Default::default() };
         Self::push_data_buffered_with(data, &options)
     }
 
-    /// [`push_data_buffered`](Self::push_data_buffered) with options: the event to charge for each
-    /// item, and what happens to the items the dataset's schema rejects
+    /// [`push_data_buffered`](Self::push_data_buffered) with options: the events to charge for
+    /// each item, and what happens to the items the dataset's schema rejects
     /// ([`OnInvalidItems`](crate::push_buffer::OnInvalidItems): given back, repaired or dropped).
     pub fn push_data_buffered_with<T: serde::Serialize + ?Sized>(
         data: &T,
         options: &BufferedPushOptions,
     ) -> Result<BufferedPush, ChargingError> {
-        let events: Vec<&str> = options.charge_event.as_deref().into_iter().collect();
+        let events: Vec<&str> = options.charge_events.iter().map(String::as_str).collect();
         if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }

@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::charging::{ChargeResult, ChargingError, ChargingManager};
+use crate::charging::{ChargeResult, ChargingError, ChargingManager, DEFAULT_DATASET_ITEM_EVENT};
 use crate::schema_repair::{RepairedItem, field_issue, format_fields};
 
 /// The most bytes of items in one request, below the platform's payload limit.
@@ -107,9 +107,10 @@ pub enum OnInvalidItems {
 /// Options of [`Actor::push_data_buffered_with`](crate::Actor::push_data_buffered_with).
 #[derive(Clone, Debug, Default)]
 pub struct BufferedPushOptions {
-    /// The event to charge for each item, as
-    /// [`Actor::push_data_and_charge`](crate::Actor::push_data_and_charge) charges it.
-    pub charge_event: Option<String>,
+    /// The events to charge for each item, as
+    /// [`Actor::push_data_and_charge_events`](crate::Actor::push_data_and_charge_events) charges
+    /// them.
+    pub charge_events: Vec<String>,
     pub on_invalid_items: OnInvalidItems,
 }
 
@@ -136,8 +137,8 @@ struct Entry {
     repair: Option<RepairedItem>,
 }
 
-/// The pushes of a batch that charge the same events, and how many of their items were stored.
-type ChargeGroups<'a> = IndexMap<(&'a [String], bool), (usize, Vec<usize>)>;
+/// Per event, how many items of a batch were stored, and the pushes that charge it.
+type ChargeTotals<'a> = IndexMap<&'a str, (usize, Vec<usize>)>;
 
 /// One push in a batch.
 struct Push {
@@ -231,21 +232,29 @@ impl PushBuffer {
         let policies: Vec<OnInvalidItems> = pushes.iter().map(|push| push.on_invalid_items).collect();
         let failed = self.store_entries(&mut entries, &mut invalid, &policies).await.err().map(Arc::new);
 
-        // Reservations of the items not stored are taken back; the stored ones are charged, once
-        // per kind of push.
-        let mut groups = ChargeGroups::new();
+        // Reservations of the items not stored are taken back; the stored ones are charged with
+        // one call per event, whatever the events of each push.
+        let mut totals = ChargeTotals::new();
         for (index, push) in pushes.iter().enumerate() {
             let stored = if failed.is_some() { 0 } else { push.len - invalid[index].len() };
             let events: Vec<&str> = push.events.iter().map(String::as_str).collect();
             self.charging.unreserve_items(&events, push.is_default_dataset, push.len - stored);
-            let group = groups.entry((&push.events, push.is_default_dataset)).or_default();
-            group.0 += stored;
-            group.1.push(index);
+            let default_item = push.is_default_dataset.then_some(DEFAULT_DATASET_ITEM_EVENT);
+            for event in events.into_iter().chain(default_item) {
+                let total = totals.entry(event).or_default();
+                total.0 += stored;
+                total.1.push(index);
+            }
         }
         let mut charge_failed: Vec<Option<Arc<ChargingError>>> = pushes.iter().map(|_| None).collect();
-        for ((events, is_default_dataset), (stored, members)) in groups {
-            let events: Vec<&str> = events.iter().map(String::as_str).collect();
-            if let Err(err) = self.charging.send_item_charges(&events, is_default_dataset, stored).await {
+        for (event, (stored, members)) in totals {
+            // The default dataset item event goes as it is reserved, with the items' other events.
+            let charged = if event == DEFAULT_DATASET_ITEM_EVENT {
+                self.charging.send_item_charges(&[], true, stored).await
+            } else {
+                self.charging.send_item_charges(&[event], false, stored).await
+            };
+            if let Err(err) = charged {
                 let err = Arc::new(err);
                 for index in members {
                     charge_failed[index] = Some(err.clone());

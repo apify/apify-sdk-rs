@@ -361,6 +361,7 @@ async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_
     let dir = tempfile::tempdir().unwrap();
     let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
         "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "profile": { "eventTitle": "Profile", "eventPriceUsd": 1.0 },
         "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
     }}});
     let mut vars = platform_env(&api, None);
@@ -379,8 +380,9 @@ async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_
         .filter(|(path, _, _)| path.ends_with("/charge"))
         .map(|(_, _, body)| body)
         .collect();
-    // One charge for the batch's stored items; the invalid one is not charged.
-    assert_eq!(charges, [json!({ "eventName": "page", "count": 5 })]);
+    // One charge per event for the batch's stored items, whatever the events of each push; the
+    // invalid item is not charged.
+    assert_eq!(charges, [json!({ "eventName": "page", "count": 5 }), json!({ "eventName": "profile", "count": 1 })]);
 }
 
 #[tokio::test]
@@ -637,8 +639,12 @@ fn child() {
                         &[json!({ "n": 3 }), json!({ "n": 4, "invalid": true }), json!({ "n": 5 })],
                         "page",
                     )?;
-                    // Not awaited: stored all the same.
-                    drop(Actor::push_data_and_charge_buffered(&json!({ "n": 6 }), "page")?);
+                    // Not awaited: stored all the same. Charges two events.
+                    let both = apify::BufferedPushOptions {
+                        charge_events: vec!["page".to_owned(), "profile".to_owned()],
+                        ..Default::default()
+                    };
+                    drop(Actor::push_data_buffered_with(&json!({ "n": 6 }), &both)?);
                     // The budget is reserved at once, before the items are stored.
                     assert_eq!(first.charge_result().charged_count, 2);
                     assert_eq!(second.charge_result().charged_count, 3);

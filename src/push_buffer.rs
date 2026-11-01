@@ -91,20 +91,36 @@ struct Batch {
     pushes: Vec<Push>,
 }
 
+/// The batch being buffered.
+#[derive(Default)]
+struct Pending {
+    batch: Batch,
+    /// How many pushes were added in the run.
+    added: usize,
+}
+
 /// The buffer of the default dataset's pushes.
 pub(crate) struct PushBuffer {
     window: Duration,
+    /// How many of the first pushes are stored at once.
+    unbuffered_first: usize,
     services: Services,
     charging: Arc<ChargingManager>,
-    pending: Mutex<Batch>,
+    pending: Mutex<Pending>,
     /// Held while a batch is stored: batches are stored one at a time, in order.
     storing: tokio::sync::Mutex<()>,
 }
 
 impl PushBuffer {
-    pub(crate) fn new(window: Duration, services: Services, charging: Arc<ChargingManager>) -> Arc<Self> {
+    pub(crate) fn new(
+        window: Duration,
+        unbuffered_first: usize,
+        services: Services,
+        charging: Arc<ChargingManager>,
+    ) -> Arc<Self> {
         Arc::new(PushBuffer {
             window,
+            unbuffered_first,
             services,
             charging,
             pending: Mutex::default(),
@@ -113,7 +129,8 @@ impl PushBuffer {
     }
 
     /// Buffers the items of a push whose charges are reserved: stored `window` after the first
-    /// item of the batch, or sooner when the batch is full.
+    /// item of the batch, or sooner when the batch is full. The first `unbuffered_first` pushes
+    /// of the run are stored at once.
     pub(crate) fn add(
         self: &Arc<Self>,
         items: Vec<DatasetItem>,
@@ -125,17 +142,25 @@ impl PushBuffer {
         let (done, stored) = oneshot::channel();
         let bytes: usize = items.iter().map(|item| item.get().len() + 1).sum();
         let mut pending = self.pending.lock();
-        if !pending.items.is_empty() && pending.bytes + bytes > MAX_BATCH_BYTES {
-            let full = std::mem::take(&mut *pending);
+        let unbuffered = pending.added < self.unbuffered_first;
+        pending.added += 1;
+        let batch = &mut pending.batch;
+        if !batch.items.is_empty() && batch.bytes + bytes > MAX_BATCH_BYTES {
+            let full = std::mem::take(batch);
             let this = self.clone();
             tokio::spawn(async move { this.store(full).await });
         }
-        let first = pending.pushes.is_empty();
-        pending.bytes += bytes;
-        pending.pushes.push(Push { len: items.len(), events, is_default_dataset, on_invalid_items, charge, done });
-        pending.items.extend(items);
-        drop(pending);
-        if first {
+        let first = batch.pushes.is_empty();
+        batch.bytes += bytes;
+        batch.pushes.push(Push { len: items.len(), events, is_default_dataset, on_invalid_items, charge, done });
+        batch.items.extend(items);
+        if unbuffered {
+            let batch = std::mem::take(batch);
+            drop(pending);
+            let this = self.clone();
+            tokio::spawn(async move { this.store(batch).await });
+        } else if first {
+            drop(pending);
             let this = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(this.window).await;
@@ -147,7 +172,7 @@ impl PushBuffer {
 
     /// Stores the items buffered now, after the batches being stored.
     pub(crate) async fn flush(&self) {
-        let batch = std::mem::take(&mut *self.pending.lock());
+        let batch = std::mem::take(&mut self.pending.lock().batch);
         self.store(batch).await;
     }
 

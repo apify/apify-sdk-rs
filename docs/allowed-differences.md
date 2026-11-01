@@ -67,7 +67,9 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **Buffered pushes (extra).** `Actor::push_data_buffered`, `push_data_and_charge_buffered` and
   `push_data_buffered_with` store the items pushed within 0.5 s of each other
   (`InitOptions::push_buffer_window`) with one request, and charge them with one charge call per
-  event; the JS SDK stores and charges every push on its own. The budget is reserved at once, and
+  event; the JS SDK stores and charges every push on its own. The first 20 pushes of the run
+  (`InitOptions::unbuffered_first_pushes`) are stored at once, so that the first results, and all
+  of a short run's, come without the delay. The budget is reserved at once, and
   the returned `BufferedPush` can be awaited for what was stored. Buffered items are stored on
   every `PersistState` event and at the exit.
 - **Pushes that handle the rejections of the dataset's schema (extra).** When a dataset's schema

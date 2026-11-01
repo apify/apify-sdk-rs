@@ -53,6 +53,10 @@ pub struct InitOptions {
     /// How long [`Actor::push_data_buffered`] buffers items before it stores them, counted from
     /// the first item of a batch. 0.5 s by default.
     pub push_buffer_window: Duration,
+    /// How many of the first buffered pushes of the run are stored at once, without waiting for
+    /// the window, so that the first results (or all of a short run's) come without the delay.
+    /// 20 by default.
+    pub unbuffered_first_pushes: usize,
     /// How request queues on the platform are consumed.
     pub request_queue_access: RequestQueueAccess,
     /// Exit when the run is aborted, and reboot when it is migrated. Default `true`.
@@ -71,6 +75,7 @@ impl Default for InitOptions {
             configuration: None,
             storage: None,
             push_buffer_window: Duration::from_millis(500),
+            unbuffered_first_pushes: 20,
             request_queue_access: RequestQueueAccess::default(),
             graceful_shutdown: true,
             graceful_shutdown_delay: Duration::ZERO,
@@ -359,7 +364,12 @@ impl Actor {
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
         let child_run_services = services.clone();
-        let push_buffer = PushBuffer::new(options.push_buffer_window, services.clone(), charging.clone());
+        let push_buffer = PushBuffer::new(
+            options.push_buffer_window,
+            options.unbuffered_first_pushes,
+            services.clone(),
+            charging.clone(),
+        );
         let inner = Inner {
             configuration: configuration.clone(),
             client,
@@ -799,10 +809,12 @@ impl Actor {
 
     /// [`push_data`](Self::push_data), buffered: the items pushed within
     /// [`InitOptions::push_buffer_window`] (0.5 s) of each other are stored with one request, and
-    /// charged with one charge call. The budget is reserved at once
-    /// ([`BufferedPush::charge_result`]); await the [`BufferedPush`] to know whether the items were
-    /// stored. Items the dataset's schema rejects come back as [`PushError::Invalid`](crate::PushError),
-    /// uncharged, and the others are stored. Buffered items are stored on every `PersistState`
+    /// charged with one charge call per event. The first pushes of the run
+    /// ([`InitOptions::unbuffered_first_pushes`], 20) are stored at once. The budget is reserved at
+    /// once ([`BufferedPush::charge_result`]); await the [`BufferedPush`] to know whether the items
+    /// were stored. Items the dataset's schema rejects come back in
+    /// [`PushResult::invalid_items`](crate::PushResult), uncharged, and the others are stored.
+    /// Buffered items are stored on every `PersistState`
     /// event and when the Actor exits; not awaiting the push risks losing them on a crash.
     pub fn push_data_buffered<T: serde::Serialize + ?Sized>(data: &T) -> Result<BufferedPush, ChargingError> {
         Self::push_data_buffered_with(data, &PushOptions::default())

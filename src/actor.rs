@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use apify_client::ApifyClient;
 use apify_client::models::ActorRun;
 use crawlee::core::events::ListenerId;
+use crawlee::core::storage::backend::DatasetItem;
 use crawlee::core::storage::backend::StorageBackend;
 use crawlee::core::storage::dataset::serialize_items;
 use crawlee::core::{Event, EventKind, EventManager, StatusLevel};
@@ -25,7 +26,10 @@ use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
-use crate::push_buffer::{BufferedPush, BufferedPushOptions, PushBuffer};
+use crate::push_buffer::{BufferedPush, PushBuffer};
+use crate::schema_validation::{
+    Entry, PushError, PushOptions, PushResult, Rejected, charge_of_stored, store_validated,
+};
 use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 /// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
@@ -801,7 +805,7 @@ impl Actor {
     /// uncharged, and the others are stored. Buffered items are stored on every `PersistState`
     /// event and when the Actor exits; not awaiting the push risks losing them on a crash.
     pub fn push_data_buffered<T: serde::Serialize + ?Sized>(data: &T) -> Result<BufferedPush, ChargingError> {
-        Self::push_data_buffered_with(data, &BufferedPushOptions::default())
+        Self::push_data_buffered_with(data, &PushOptions::default())
     }
 
     /// [`push_data_and_charge`](Self::push_data_and_charge), buffered as
@@ -810,26 +814,81 @@ impl Actor {
         data: &T,
         event_name: &str,
     ) -> Result<BufferedPush, ChargingError> {
-        let options = BufferedPushOptions { charge_events: vec![event_name.to_owned()], ..Default::default() };
+        let options = PushOptions { charge_events: vec![event_name.to_owned()], ..Default::default() };
         Self::push_data_buffered_with(data, &options)
     }
 
     /// [`push_data_buffered`](Self::push_data_buffered) with options: the events to charge for
     /// each item, and what happens to the items the dataset's schema rejects
-    /// ([`OnInvalidItems`](crate::push_buffer::OnInvalidItems): given back, repaired or dropped).
+    /// ([`OnInvalidItems`](crate::OnInvalidItems): given back, repaired or dropped).
     pub fn push_data_buffered_with<T: serde::Serialize + ?Sized>(
         data: &T,
-        options: &BufferedPushOptions,
+        options: &PushOptions,
     ) -> Result<BufferedPush, ChargingError> {
+        let (items, events, is_default_dataset, charge) = Self::reserve_push(data, options)?;
+        if items.is_empty() {
+            return Ok(BufferedPush::new(charge, None));
+        }
+        let stored =
+            state().push_buffer.add(items, events, is_default_dataset, options.on_invalid_items, charge.clone());
+        Ok(BufferedPush::new(charge, Some(stored)))
+    }
+
+    /// Pushes items to the default dataset as [`push_data_and_charge_events`](Self::push_data_and_charge_events)
+    /// does, with the events of `options`, and with the items the dataset's schema rejects handled
+    /// as `options` asks ([`OnInvalidItems`](crate::OnInvalidItems)): given back in
+    /// [`PushResult::invalid_items`](crate::PushResult), repaired or dropped. The other items are
+    /// stored and charged. [`push_data`](Self::push_data) fails then, as in JS, with none of the
+    /// items stored.
+    pub async fn push_data_with<T: serde::Serialize + ?Sized>(
+        data: &T,
+        options: &PushOptions,
+    ) -> Result<PushResult, PushError> {
+        let (items, events, is_default_dataset, charge) =
+            Self::reserve_push(data, options).map_err(|err| PushError::Charge(Arc::new(err)))?;
+        if items.is_empty() {
+            return Ok(PushResult { charge, invalid_items: Vec::new() });
+        }
+        let charging = &state().charging;
+        let events: Vec<&str> = events.iter().map(String::as_str).collect();
+        let len = items.len();
+        let entries = items.into_iter().enumerate().map(|(index, item)| Entry::new(0, index, item)).collect();
+        let policies = [options.on_invalid_items];
+        let (stored, rejected) = match state().services.open_dataset(&StorageIdentifier::Default).await {
+            Ok(dataset) => store_validated(&dataset, entries, &policies).await,
+            Err(err) => (Err(err), vec![Rejected::default()]),
+        };
+        let rejected = rejected.into_iter().next().unwrap_or_default();
+        if let Err(err) = stored {
+            charging.unreserve_items(&events, is_default_dataset, len);
+            return Err(PushError::Failed(Arc::new(err)));
+        }
+        charging.unreserve_items(&events, is_default_dataset, rejected.count());
+        charging
+            .send_item_charges(&events, is_default_dataset, len - rejected.count())
+            .await
+            .map_err(|err| PushError::Charge(Arc::new(err)))?;
+        Ok(PushResult {
+            charge: charge_of_stored(&charge, rejected.count(), charging),
+            invalid_items: rejected.invalid,
+        })
+    }
+
+    /// Serializes the items of a push and reserves the charges of as many as the budget allows:
+    /// the items to store, the events, whether the default dataset item event is charged too, and
+    /// the charges reserved.
+    fn reserve_push<T: serde::Serialize + ?Sized>(
+        data: &T,
+        options: &PushOptions,
+    ) -> Result<(Vec<DatasetItem>, Vec<String>, bool, ChargeResult), ChargingError> {
         let events: Vec<&str> = options.charge_events.iter().map(String::as_str).collect();
         if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
-        let events = &events[..];
         let mut items = serialize_items(data)?;
         let charging = &state().charging;
         let is_default_dataset = state().smart.is_some();
-        let limit = charging.reserve_items(items.len(), events, is_default_dataset);
+        let limit = charging.reserve_items(items.len(), &events, is_default_dataset);
         let reached = !items.is_empty() && limit < items.len()
             || if events.is_empty() {
                 charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
@@ -846,12 +905,7 @@ impl Actor {
             },
             chargeable_within_limit: charging.chargeable_within_limit(),
         };
-        if items.is_empty() {
-            return Ok(BufferedPush::new(charge, None));
-        }
-        let events = events.iter().map(|event| (*event).to_owned()).collect();
-        let stored = state().push_buffer.add(items, events, is_default_dataset, options.on_invalid_items);
-        Ok(BufferedPush::new(charge, Some(stored)))
+        Ok((items, options.charge_events.clone(), is_default_dataset, charge))
     }
 
     /// Stores as many items as the budget allows for `events` (plus the default dataset item

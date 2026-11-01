@@ -64,17 +64,20 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   with `null`. Here the `ACTOR_*` variable is read first and the `APIFY_*` one is the fallback.
 - **`use_state` uses the Actor's services.** The JS SDK opens the store with the global
   configuration, whatever the Actor was configured with.
-- **Buffered pushes (extra).** `Actor::push_data_buffered` and `push_data_and_charge_buffered`
-  store the items pushed within 0.5 s of each other (`InitOptions::push_buffer_window`) with one
-  request, and charge them with one charge call per event; the JS SDK stores and charges every push
-  on its own. The budget is reserved at once, and the returned `BufferedPush` can be awaited for
-  the items to be stored. When the dataset's schema rejects items, the platform stores none of the
-  request's items: the rejected ones go back to the push they came from (`PushError::Invalid`, with
-  their index and the platform's validation errors), uncharged, and the others are pushed again.
-  With `push_data_buffered_with`, a push can instead have its rejected items repaired, with the
-  rules of `pushDataWithSchemaRepair` of `@apify/actor-utils`, which the JS SDK does not do
-  itself (repairs are logged; items that cannot be repaired come back), or dropped (logged).
-  Buffered items are stored on every `PersistState` event and at the exit.
+- **Buffered pushes (extra).** `Actor::push_data_buffered`, `push_data_and_charge_buffered` and
+  `push_data_buffered_with` store the items pushed within 0.5 s of each other
+  (`InitOptions::push_buffer_window`) with one request, and charge them with one charge call per
+  event; the JS SDK stores and charges every push on its own. The budget is reserved at once, and
+  the returned `BufferedPush` can be awaited for what was stored. Buffered items are stored on
+  every `PersistState` event and at the exit.
+- **Pushes that handle the rejections of the dataset's schema (extra).** When a dataset's schema
+  rejects items, the platform stores none of the request's items, and `pushData` fails (as
+  `push_data` does). `Actor::push_data_with` and the buffered pushes handle the rejected items as
+  the push asks (`OnInvalidItems`): given back in `PushResult::invalid_items` (with their index
+  in the push and the platform's validation errors), repaired with the rules of
+  `pushDataWithSchemaRepair` of `@apify/actor-utils` (logged; the items that cannot be repaired
+  are given back), or dropped (logged). The other items are stored and charged; rejected items
+  are not charged.
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.
 

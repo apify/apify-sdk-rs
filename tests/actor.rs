@@ -386,16 +386,24 @@ async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_
 }
 
 #[tokio::test]
-async fn buffered_pushes_repair_drop_or_return_the_items_the_schema_rejects() {
+async fn pushes_repair_drop_or_return_the_items_the_schema_rejects() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
     assert_exit(&run_child("buffered-repair", &platform_env(&api, None), dir.path()).await, 0);
 
     // Repaired: the failing field removed, the missing name filled in over two rounds. Dropped and
-    // returned items are not stored.
+    // returned items are not stored. Buffered first, then unbuffered.
     assert_eq!(
         api.dataset_items(DEFAULT_DATASET),
-        [json!({ "n": 1 }), json!({ "n": 2, "needsName": true, "name": "" }), json!({ "n": 5 })]
+        [
+            json!({ "n": 1 }),
+            json!({ "n": 2, "needsName": true, "name": "" }),
+            json!({ "n": 5 }),
+            json!({ "n": 7 }),
+            json!({ "n": 8, "needsName": true, "name": "" }),
+            json!({ "n": 9 }),
+            json!({ "n": 10 }),
+        ]
     );
 }
 
@@ -640,7 +648,7 @@ fn child() {
                         "page",
                     )?;
                     // Not awaited: stored all the same. Charges two events.
-                    let both = apify::BufferedPushOptions {
+                    let both = apify::PushOptions {
                         charge_events: vec!["page".to_owned(), "profile".to_owned()],
                         ..Default::default()
                     };
@@ -649,17 +657,16 @@ fn child() {
                     assert_eq!(first.charge_result().charged_count, 2);
                     assert_eq!(second.charge_result().charged_count, 3);
 
-                    first.await?;
-                    match second.await {
-                        Err(apify::PushError::Invalid(invalid)) => {
-                            assert_eq!(invalid.len(), 1);
-                            assert_eq!(invalid[0].index, 1, "the index in the items of this push");
-                            let item: Value = serde_json::from_str(invalid[0].item.get())?;
-                            assert_eq!(item, json!({ "n": 4, "invalid": true }));
-                            assert_eq!(invalid[0].validation_errors[0]["message"], "must be equal to constant");
-                        }
-                        other => panic!("expected the invalid item back, got {other:?}"),
-                    }
+                    assert!(first.await?.invalid_items.is_empty());
+                    // The push succeeded, its valid items stored; the invalid one comes back.
+                    let second = second.await?;
+                    let invalid = &second.invalid_items;
+                    assert_eq!(invalid.len(), 1);
+                    assert_eq!(invalid[0].index, 1, "the index in the items of this push");
+                    let item: Value = serde_json::from_str(invalid[0].item.get())?;
+                    assert_eq!(item, json!({ "n": 4, "invalid": true }));
+                    assert_eq!(invalid[0].validation_errors[0]["message"], "must be equal to constant");
+                    assert_eq!(second.charge.charged_count, 2, "the invalid item is not charged");
                     let elapsed = started.elapsed();
                     assert!(elapsed < Duration::from_secs(2), "stored after {elapsed:?}");
                     // Left in the buffer: the exit stores it.
@@ -670,8 +677,8 @@ fn child() {
             }
             "buffered-repair" => {
                 Actor::main(|| async move {
-                    use apify::{BufferedPushOptions, OnInvalidItems};
-                    let options = |on_invalid_items| BufferedPushOptions { on_invalid_items, ..Default::default() };
+                    use apify::{OnInvalidItems, PushOptions};
+                    let options = |on_invalid_items| PushOptions { on_invalid_items, ..Default::default() };
                     let repaired = Actor::push_data_buffered_with(
                         &[
                             json!({ "n": 1, "invalid": true }),
@@ -688,18 +695,32 @@ fn child() {
 
                     // A required integer has no placeholder: that item comes back, with the error
                     // that kept it from being repaired.
-                    match repaired.await {
-                        Err(apify::PushError::Invalid(invalid)) => {
-                            assert_eq!(invalid.len(), 1);
-                            assert_eq!(invalid[0].index, 2);
-                            let item: Value = serde_json::from_str(invalid[0].item.get())?;
-                            assert_eq!(item, json!({ "n": 3, "needsCount": true }), "as it was pushed");
-                            assert_eq!(invalid[0].validation_errors[0]["params"]["type"], "integer");
-                        }
-                        other => panic!("expected the unrepairable item back, got {other:?}"),
-                    }
-                    dropped.await?;
-                    assert!(matches!(returned.await, Err(apify::PushError::Invalid(invalid)) if invalid.len() == 1));
+                    let invalid = repaired.await?.invalid_items;
+                    assert_eq!(invalid.len(), 1);
+                    assert_eq!(invalid[0].index, 2);
+                    let item: Value = serde_json::from_str(invalid[0].item.get())?;
+                    assert_eq!(item, json!({ "n": 3, "needsCount": true }), "as it was pushed");
+                    assert_eq!(invalid[0].validation_errors[0]["params"]["type"], "integer");
+                    assert!(dropped.await?.invalid_items.is_empty());
+                    assert_eq!(returned.await?.invalid_items.len(), 1);
+
+                    // The same without the buffer.
+                    let result = Actor::push_data_with(
+                        &[json!({ "n": 7, "invalid": true }), json!({ "n": 8, "needsName": true }), json!({ "n": 9 })],
+                        &options(OnInvalidItems::Repair),
+                    )
+                    .await?;
+                    assert!(result.invalid_items.is_empty());
+                    let result = Actor::push_data_with(
+                        &[json!({ "n": 10 }), json!({ "n": 11, "invalid": true })],
+                        &options(OnInvalidItems::Return),
+                    )
+                    .await?;
+                    assert_eq!(result.invalid_items.iter().map(|item| item.index).collect::<Vec<_>>(), [1]);
+                    let result =
+                        Actor::push_data_with(&json!({ "n": 12, "invalid": true }), &options(OnInvalidItems::Drop))
+                            .await?;
+                    assert!(result.invalid_items.is_empty());
                     Ok(())
                 })
                 .await

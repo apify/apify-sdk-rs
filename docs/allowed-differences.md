@@ -71,6 +71,9 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   the items to be stored. When the dataset's schema rejects items, the platform stores none of the
   request's items: the rejected ones go back to the push they came from (`PushError::Invalid`, with
   their index and the platform's validation errors), uncharged, and the others are pushed again.
+  With `push_data_buffered_with`, a push can instead have its rejected items repaired, with the
+  rules of `pushDataWithSchemaRepair` of `@apify/actor-utils`, which the JS SDK does not do
+  itself (repairs are logged; items that cannot be repaired come back), or dropped (logged).
   Buffered items are stored on every `PersistState` event and at the exit.
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.

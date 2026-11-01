@@ -360,17 +360,43 @@ async fn push_items(State(shared): State<Shared>, Path(id): Path<String>, body: 
         Ok(item @ Value::Object(_)) => vec![item],
         _ => return error(StatusCode::BAD_REQUEST, "invalid-input"),
     };
-    // A dataset schema that rejects items with `"invalid": true`, as the platform rejects items that
-    // fail the schema of an Actor's dataset: none of the items is stored then.
+    // A dataset schema, which the platform checks as it checks the schema of an Actor's dataset:
+    // none of the items is stored when one fails. It rejects `"invalid": true`; with
+    // `"needsName": true`, it requires a string `name`, and with `"needsCount": true`, an integer
+    // `count`.
     let invalid: Vec<Value> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.get("invalid") == Some(&Value::Bool(true)))
-        .map(|(position, _)| {
-            json!({ "itemPosition": position, "validationErrors": [{
-                "instancePath": "/invalid", "schemaPath": "#/properties/invalid/const", "keyword": "const",
-                "params": { "allowedValue": false }, "message": "must be equal to constant",
-            }]})
+        .filter_map(|(position, item)| {
+            let mut errors = Vec::new();
+            if item.get("invalid") == Some(&Value::Bool(true)) {
+                errors.push(json!({
+                    "instancePath": "/invalid", "schemaPath": "#/properties/invalid/const", "keyword": "const",
+                    "params": { "allowedValue": false }, "message": "must be equal to constant",
+                }));
+            }
+            for (flag, field, kind) in [("needsName", "name", "string"), ("needsCount", "count", "integer")] {
+                if item.get(flag) != Some(&Value::Bool(true)) {
+                    continue;
+                }
+                let valid = match item.get(field) {
+                    None => {
+                        errors.push(json!({
+                            "instancePath": "", "schemaPath": "#/required", "keyword": "required",
+                            "params": { "missingProperty": field }, "message": format!("must have required property '{field}'"),
+                        }));
+                        continue;
+                    }
+                    Some(value) => if kind == "string" { value.is_string() } else { value.is_i64() },
+                };
+                if !valid {
+                    errors.push(json!({
+                        "instancePath": format!("/{field}"), "schemaPath": format!("#/properties/{field}/type"),
+                        "keyword": "type", "params": { "type": kind }, "message": format!("must be {kind}"),
+                    }));
+                }
+            }
+            (!errors.is_empty()).then(|| json!({ "itemPosition": position, "validationErrors": errors }))
         })
         .collect();
     if !invalid.is_empty() {

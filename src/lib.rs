@@ -15,6 +15,7 @@ pub mod platform;
 pub mod proxy;
 pub mod push_buffer;
 mod run_log;
+mod schema_repair;
 pub mod storage;
 pub mod url_filters;
 
@@ -29,7 +30,7 @@ pub use crate::platform::{
     AbortOptions, ApifyEnv, CallOptions, MetamorphOptions, ResurrectOptions, RunLog, RunTimeout, WebhookOptions,
 };
 pub use crate::proxy::{ProxyConfiguration, ProxyConfigurationOptions};
-pub use crate::push_buffer::{BufferedPush, InvalidItem, PushError};
+pub use crate::push_buffer::{BufferedPush, BufferedPushOptions, InvalidItem, OnInvalidItems, PushError};
 pub use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 pub use apify_client::{ApiError, ApifyClient, ApifyClientError, ApifyClientResult};

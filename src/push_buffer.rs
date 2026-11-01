@@ -4,9 +4,10 @@
 //!
 //! Each push gets a [`BufferedPush`], which can be awaited (or not) for its items to be stored.
 //! When the dataset's schema rejects items, the platform stores none of the request's items: the
-//! rejected ones go back to the push they came from ([`PushError::Invalid`]), and the others are
-//! pushed again.
+//! rejected ones are handled as their push asks ([`OnInvalidItems`]: given back to it as
+//! [`PushError::Invalid`] by default, repaired or dropped), and the others are pushed again.
 
+use std::collections::BTreeSet;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,12 +23,15 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::charging::{ChargeResult, ChargingError, ChargingManager};
+use crate::schema_repair::{RepairedItem, field_issue, format_fields};
 
 /// The most bytes of items in one request, below the platform's payload limit.
 const MAX_BATCH_BYTES: usize = 9_000_000;
 
-/// How many times a batch is pushed again without the items the dataset's schema rejected.
-const MAX_VALIDATION_ROUNDS: usize = 3;
+/// How many times a batch is pushed again after the dataset's schema rejected items. Repairs take
+/// up to three rounds (a missing field: a placeholder, then its type); the last push is only for
+/// the items that passed, without the ones still failing.
+const MAX_VALIDATION_ROUNDS: usize = 5;
 
 /// The error type of the platform when a dataset's schema rejects items.
 const SCHEMA_VALIDATION_ERROR: &str = "schema-validation-error";
@@ -83,6 +87,32 @@ pub enum PushError {
     Charge(Arc<ChargingError>),
 }
 
+/// What happens to the items of a push that the dataset's schema rejects. The other items are
+/// stored either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnInvalidItems {
+    /// They come back to the push as [`PushError::Invalid`].
+    #[default]
+    Return,
+    /// They are repaired and pushed again, as `pushDataWithSchemaRepair` of `@apify/actor-utils`
+    /// repairs them: a field that fails the schema is removed, a missing required field gets an
+    /// empty placeholder (`""`, `[]`, `{}` or `null`), and a property the schema does not allow
+    /// is removed. No other value is made up. The repairs are logged; the items that cannot be
+    /// repaired come back as [`PushError::Invalid`], with the errors that kept them from it.
+    Repair,
+    /// They are dropped, which is logged; the push succeeds.
+    Drop,
+}
+
+/// Options of [`Actor::push_data_buffered_with`](crate::Actor::push_data_buffered_with).
+#[derive(Clone, Debug, Default)]
+pub struct BufferedPushOptions {
+    /// The event to charge for each item, as
+    /// [`Actor::push_data_and_charge`](crate::Actor::push_data_and_charge) charges it.
+    pub charge_event: Option<String>,
+    pub on_invalid_items: OnInvalidItems,
+}
+
 /// An item the dataset's schema rejected.
 #[derive(Debug)]
 pub struct InvalidItem {
@@ -91,7 +121,19 @@ pub struct InvalidItem {
     /// The item, as it was pushed.
     pub item: DatasetItem,
     /// Why, as the platform reports it: `instancePath`, `keyword`, `params`, `message`, ...
+    /// For an item that could not be repaired, the errors that kept it from it.
     pub validation_errors: Vec<Value>,
+}
+
+/// An item of a batch being stored.
+struct Entry {
+    /// The push it comes from, and its index there.
+    push: usize,
+    index: usize,
+    item: DatasetItem,
+    /// The item as pushed, once it is repaired.
+    original: Option<DatasetItem>,
+    repair: Option<RepairedItem>,
 }
 
 /// The pushes of a batch that charge the same events, and how many of their items were stored.
@@ -102,6 +144,7 @@ struct Push {
     len: usize,
     events: Vec<String>,
     is_default_dataset: bool,
+    on_invalid_items: OnInvalidItems,
     done: oneshot::Sender<Result<(), PushError>>,
 }
 
@@ -141,6 +184,7 @@ impl PushBuffer {
         items: Vec<DatasetItem>,
         events: Vec<String>,
         is_default_dataset: bool,
+        on_invalid_items: OnInvalidItems,
     ) -> oneshot::Receiver<Result<(), PushError>> {
         let (done, stored) = oneshot::channel();
         let bytes: usize = items.iter().map(|item| item.get().len() + 1).sum();
@@ -152,7 +196,7 @@ impl PushBuffer {
         }
         let first = pending.pushes.is_empty();
         pending.bytes += bytes;
-        pending.pushes.push(Push { len: items.len(), events, is_default_dataset, done });
+        pending.pushes.push(Push { len: items.len(), events, is_default_dataset, on_invalid_items, done });
         pending.items.extend(items);
         drop(pending);
         if first {
@@ -179,10 +223,13 @@ impl PushBuffer {
         let Batch { items, pushes, .. } = batch;
         // The items still to store, with the push each comes from and its index there.
         let owners = pushes.iter().enumerate().flat_map(|(push, p)| (0..p.len).map(move |index| (push, index)));
-        let mut entries: Vec<(usize, usize, DatasetItem)> =
-            owners.zip(items).map(|((push, index), item)| (push, index, item)).collect();
+        let mut entries: Vec<Entry> = owners
+            .zip(items)
+            .map(|((push, index), item)| Entry { push, index, item, original: None, repair: None })
+            .collect();
         let mut invalid: Vec<Vec<InvalidItem>> = pushes.iter().map(|_| Vec::new()).collect();
-        let failed = self.store_entries(&mut entries, &mut invalid).await.err().map(Arc::new);
+        let policies: Vec<OnInvalidItems> = pushes.iter().map(|push| push.on_invalid_items).collect();
+        let failed = self.store_entries(&mut entries, &mut invalid, &policies).await.err().map(Arc::new);
 
         // Reservations of the items not stored are taken back; the stored ones are charged, once
         // per kind of push.
@@ -212,7 +259,10 @@ impl PushBuffer {
             let result = match (&failed, &charge_failed[index]) {
                 (Some(err), _) => Err(PushError::Failed(err.clone())),
                 (None, Some(err)) => Err(PushError::Charge(err.clone())),
-                (None, None) if !rejected.is_empty() => Err(PushError::Invalid(rejected)),
+                // Dropped items were logged.
+                (None, None) if !rejected.is_empty() && push.on_invalid_items != OnInvalidItems::Drop => {
+                    Err(PushError::Invalid(rejected))
+                }
                 (None, None) => Ok(()),
             };
             if let Err(err) = &result
@@ -225,34 +275,79 @@ impl PushBuffer {
         }
     }
 
-    /// Pushes the entries; the ones the dataset's schema rejects go to `invalid` instead, and the
-    /// others are pushed again.
+    /// Pushes the entries. The ones the dataset's schema rejects are repaired, when their push
+    /// asks for it, or go to `invalid`; the others are pushed again.
     async fn store_entries(
         &self,
-        entries: &mut Vec<(usize, usize, DatasetItem)>,
+        entries: &mut Vec<Entry>,
         invalid: &mut [Vec<InvalidItem>],
+        policies: &[OnInvalidItems],
     ) -> Result<(), StorageError> {
         let dataset = self.services.open_dataset(&StorageIdentifier::Default).await?;
-        for _ in 0..=MAX_VALIDATION_ROUNDS {
+        for round in 0..=MAX_VALIDATION_ROUNDS {
             if entries.is_empty() {
                 return Ok(());
             }
-            let items = entries.iter().map(|(_, _, item)| item.clone()).collect();
+            let items = entries.iter().map(|entry| entry.item.clone()).collect();
             let err = match ChargingManager::with_items_reserved(dataset.push_items(items)).await {
                 Ok(()) => return Ok(()),
                 Err(err) => err,
             };
             let Some(rejected) = schema_validation_errors(&err, entries.len()) else { return Err(err) };
+            // The last push is for the items that passed: the ones still failing are not repaired.
+            let may_repair = round + 1 < MAX_VALIDATION_ROUNDS;
+            let (mut repaired, mut repaired_fields, mut dropped, mut dropped_fields) =
+                (0, BTreeSet::new(), 0, BTreeSet::new());
             // Back to front, so that the positions of the others stay valid.
-            for (position, validation_errors) in rejected.into_iter().rev() {
-                let (push, index, item) = entries.remove(position);
-                invalid[push].push(InvalidItem { index, item, validation_errors });
+            for (position, mut validation_errors) in rejected.into_iter().rev() {
+                let policy = policies[entries[position].push];
+                if policy == OnInvalidItems::Repair && may_repair {
+                    match repair(&mut entries[position], &validation_errors) {
+                        Ok(()) => {
+                            repaired += 1;
+                            repaired_fields.extend(validation_errors.iter().map(field_issue));
+                            continue;
+                        }
+                        Err(blocking) => validation_errors = blocking,
+                    }
+                }
+                if policy != OnInvalidItems::Return {
+                    dropped += 1;
+                    dropped_fields.extend(validation_errors.iter().map(field_issue));
+                }
+                let entry = entries.remove(position);
+                let item = entry.original.unwrap_or(entry.item);
+                invalid[entry.push].push(InvalidItem { index: entry.index, item, validation_errors });
+            }
+            if repaired > 0 {
+                tracing::warn!(
+                    "The dataset's schema rejected {repaired} item(s), pushing them again repaired; fields: {}",
+                    format_fields(&repaired_fields)
+                );
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    "The dataset's schema rejected {dropped} item(s) that were not repaired, dropping them; fields: {}",
+                    format_fields(&dropped_fields)
+                );
             }
         }
         Err(StorageError::Backend(
             format!("The dataset's schema still rejected items after {MAX_VALIDATION_ROUNDS} rounds").into(),
         ))
     }
+}
+
+/// Repairs an entry for the errors of a rejection; `Err` holds the errors that kept it from it.
+fn repair(entry: &mut Entry, validation_errors: &[Value]) -> Result<(), Vec<Value>> {
+    let item = &entry.item;
+    let repair =
+        entry.repair.get_or_insert_with(|| RepairedItem::new(serde_json::from_str(item.get()).unwrap_or(Value::Null)));
+    repair.repair(validation_errors)?;
+    let repaired = serde_json::value::to_raw_value(&repair.value).map_err(|_| validation_errors.to_vec())?;
+    let original = std::mem::replace(&mut entry.item, repaired);
+    entry.original.get_or_insert(original);
+    Ok(())
 }
 
 /// The positions (in a request of `len` items) and errors of the items a dataset's schema

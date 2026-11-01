@@ -25,7 +25,7 @@ use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
-use crate::push_buffer::{BufferedPush, PushBuffer};
+use crate::push_buffer::{BufferedPush, BufferedPushOptions, PushBuffer};
 use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 /// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
@@ -801,7 +801,7 @@ impl Actor {
     /// uncharged, and the others are stored. Buffered items are stored on every `PersistState`
     /// event and when the Actor exits; not awaiting the push risks losing them on a crash.
     pub fn push_data_buffered<T: serde::Serialize + ?Sized>(data: &T) -> Result<BufferedPush, ChargingError> {
-        Self::push_items_buffered(data, &[])
+        Self::push_data_buffered_with(data, &BufferedPushOptions::default())
     }
 
     /// [`push_data_and_charge`](Self::push_data_and_charge), buffered as
@@ -810,16 +810,22 @@ impl Actor {
         data: &T,
         event_name: &str,
     ) -> Result<BufferedPush, ChargingError> {
-        if event_name.starts_with("apify-") {
-            return Err(ChargingError::SyntheticEvent(event_name.to_owned()));
-        }
-        Self::push_items_buffered(data, &[event_name])
+        let options = BufferedPushOptions { charge_event: Some(event_name.to_owned()), ..Default::default() };
+        Self::push_data_buffered_with(data, &options)
     }
 
-    fn push_items_buffered<T: serde::Serialize + ?Sized>(
+    /// [`push_data_buffered`](Self::push_data_buffered) with options: the event to charge for each
+    /// item, and what happens to the items the dataset's schema rejects
+    /// ([`OnInvalidItems`](crate::push_buffer::OnInvalidItems): given back, repaired or dropped).
+    pub fn push_data_buffered_with<T: serde::Serialize + ?Sized>(
         data: &T,
-        events: &[&str],
+        options: &BufferedPushOptions,
     ) -> Result<BufferedPush, ChargingError> {
+        let events: Vec<&str> = options.charge_event.as_deref().into_iter().collect();
+        if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
+            return Err(ChargingError::SyntheticEvent((*event).to_owned()));
+        }
+        let events = &events[..];
         let mut items = serialize_items(data)?;
         let charging = &state().charging;
         let is_default_dataset = state().smart.is_some();
@@ -844,7 +850,7 @@ impl Actor {
             return Ok(BufferedPush::new(charge, None));
         }
         let events = events.iter().map(|event| (*event).to_owned()).collect();
-        let stored = state().push_buffer.add(items, events, is_default_dataset);
+        let stored = state().push_buffer.add(items, events, is_default_dataset, options.on_invalid_items);
         Ok(BufferedPush::new(charge, Some(stored)))
     }
 

@@ -355,11 +355,32 @@ async fn delete_dataset(State(shared): State<Shared>, Path(id): Path<String>) ->
 async fn push_items(State(shared): State<Shared>, Path(id): Path<String>, body: Bytes) -> Response {
     let mut data = shared.data.lock();
     let Some((_, dataset)) = find_dataset(&mut data, &id) else { return not_found() };
-    match serde_json::from_slice::<Value>(&body) {
-        Ok(Value::Array(items)) => dataset.items.extend(items),
-        Ok(item @ Value::Object(_)) => dataset.items.push(item),
+    let items = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Array(items)) => items,
+        Ok(item @ Value::Object(_)) => vec![item],
         _ => return error(StatusCode::BAD_REQUEST, "invalid-input"),
+    };
+    // A dataset schema that rejects items with `"invalid": true`, as the platform rejects items that
+    // fail the schema of an Actor's dataset: none of the items is stored then.
+    let invalid: Vec<Value> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.get("invalid") == Some(&Value::Bool(true)))
+        .map(|(position, _)| {
+            json!({ "itemPosition": position, "validationErrors": [{
+                "instancePath": "/invalid", "schemaPath": "#/properties/invalid/const", "keyword": "const",
+                "params": { "allowedValue": false }, "message": "must be equal to constant",
+            }]})
+        })
+        .collect();
+    if !invalid.is_empty() {
+        let body = json!({ "error": {
+            "type": "schema-validation-error", "message": "Schema validation failed",
+            "data": { "invalidItems": invalid },
+        }});
+        return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
+    dataset.items.extend(items);
     StatusCode::CREATED.into_response()
 }
 

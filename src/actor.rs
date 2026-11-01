@@ -25,6 +25,7 @@ use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
+use crate::push_buffer::{BufferedPush, PushBuffer};
 use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 /// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
@@ -45,6 +46,9 @@ pub struct InitOptions {
     /// A storage backend used instead of the platform storages (on the platform) or the local
     /// files (elsewhere).
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// How long [`Actor::push_data_buffered`] buffers items before it stores them, counted from
+    /// the first item of a batch. 0.5 s by default.
+    pub push_buffer_window: Duration,
     /// How request queues on the platform are consumed.
     pub request_queue_access: RequestQueueAccess,
     /// Exit when the run is aborted, and reboot when it is migrated. Default `true`.
@@ -62,6 +66,7 @@ impl Default for InitOptions {
         InitOptions {
             configuration: None,
             storage: None,
+            push_buffer_window: Duration::from_millis(500),
             request_queue_access: RequestQueueAccess::default(),
             graceful_shutdown: true,
             graceful_shutdown_delay: Duration::ZERO,
@@ -148,6 +153,7 @@ struct Inner {
     exit_options: Mutex<Option<ExitOptions>>,
     status_messages: StatusMessages,
     child_runs: ChildRunTracker,
+    push_buffer: Arc<PushBuffer>,
 }
 
 /// The status message updates of the run: sent one at a time, in the order they were made, so
@@ -349,6 +355,7 @@ impl Actor {
         Services::set_global(services.clone()).map_err(|_| InitError::ServicesAlreadySet)?;
 
         let child_run_services = services.clone();
+        let push_buffer = PushBuffer::new(options.push_buffer_window, services.clone(), charging.clone());
         let inner = Inner {
             configuration: configuration.clone(),
             client,
@@ -363,6 +370,7 @@ impl Actor {
             exit_options: Mutex::default(),
             status_messages: StatusMessages::default(),
             child_runs: ChildRunTracker::new(child_run_services),
+            push_buffer,
         };
         if STATE.set(inner).is_err() {
             return Err(InitError::ServicesAlreadySet);
@@ -385,6 +393,13 @@ impl Actor {
             }
         });
         state.handlers.lock().status_forwarder = Some(forwarder);
+        // Buffered items are stored with the rest of the state: on a migration or an abort, after
+        // the running requests.
+        let push_buffer = state.push_buffer.clone();
+        events.on(EventKind::PersistState, move |_| {
+            let push_buffer = push_buffer.clone();
+            async move { push_buffer.flush().await }
+        });
         {
             let mut listeners = LISTENERS.lock();
             let pending = std::mem::take(&mut listeners.pending);
@@ -577,6 +592,8 @@ impl Actor {
             if let Some(id) = state().handlers.lock().status_forwarder.take() {
                 events.off(id);
             }
+            // Items buffered by listeners.
+            state().push_buffer.flush().await;
             let started = Instant::now();
             // The status messages still being set must not overwrite the terminal one.
             let (teardown, ()) = tokio::join!(state().storage.teardown(), Self::wait_for_status_messages());
@@ -774,6 +791,61 @@ impl Actor {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
         Self::push_items_charging(data, events).await
+    }
+
+    /// [`push_data`](Self::push_data), buffered: the items pushed within
+    /// [`InitOptions::push_buffer_window`] (0.5 s) of each other are stored with one request, and
+    /// charged with one charge call. The budget is reserved at once
+    /// ([`BufferedPush::charge_result`]); await the [`BufferedPush`] to know whether the items were
+    /// stored. Items the dataset's schema rejects come back as [`PushError::Invalid`](crate::PushError),
+    /// uncharged, and the others are stored. Buffered items are stored on every `PersistState`
+    /// event and when the Actor exits; not awaiting the push risks losing them on a crash.
+    pub fn push_data_buffered<T: serde::Serialize + ?Sized>(data: &T) -> Result<BufferedPush, ChargingError> {
+        Self::push_items_buffered(data, &[])
+    }
+
+    /// [`push_data_and_charge`](Self::push_data_and_charge), buffered as
+    /// [`push_data_buffered`](Self::push_data_buffered) is.
+    pub fn push_data_and_charge_buffered<T: serde::Serialize + ?Sized>(
+        data: &T,
+        event_name: &str,
+    ) -> Result<BufferedPush, ChargingError> {
+        if event_name.starts_with("apify-") {
+            return Err(ChargingError::SyntheticEvent(event_name.to_owned()));
+        }
+        Self::push_items_buffered(data, &[event_name])
+    }
+
+    fn push_items_buffered<T: serde::Serialize + ?Sized>(
+        data: &T,
+        events: &[&str],
+    ) -> Result<BufferedPush, ChargingError> {
+        let mut items = serialize_items(data)?;
+        let charging = &state().charging;
+        let is_default_dataset = state().smart.is_some();
+        let limit = charging.reserve_items(items.len(), events, is_default_dataset);
+        let reached = !items.is_empty() && limit < items.len()
+            || if events.is_empty() {
+                charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
+            } else {
+                events.iter().any(|event| charging.is_event_charge_limit_reached(event))
+            };
+        items.truncate(limit);
+        let charge = ChargeResult {
+            event_charge_limit_reached: charging.is_pay_per_event() && reached,
+            charged_count: if !charging.is_pay_per_event() || (events.is_empty() && !is_default_dataset) {
+                0
+            } else {
+                limit as u64
+            },
+            chargeable_within_limit: charging.chargeable_within_limit(),
+        };
+        if items.is_empty() {
+            return Ok(BufferedPush::new(charge, None));
+        }
+        let events = events.iter().map(|event| (*event).to_owned()).collect();
+        let stored = state().push_buffer.add(items, events, is_default_dataset);
+        Ok(BufferedPush::new(charge, Some(stored)))
     }
 
     /// Stores as many items as the budget allows for `events` (plus the default dataset item

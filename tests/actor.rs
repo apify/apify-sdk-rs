@@ -356,6 +356,34 @@ async fn pay_per_event_charges_stay_within_the_budget() {
 }
 
 #[tokio::test]
+async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_caller() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "100".to_owned()));
+    assert_exit(&run_child("buffered", &vars, dir.path()).await, 0);
+
+    let stored: Vec<Value> = api.dataset_items(DEFAULT_DATASET).into_iter().map(|item| item["n"].clone()).collect();
+    assert_eq!(stored, [json!(1), json!(2), json!(3), json!(5), json!(6), json!(7)]);
+    // The batch, rejected for its invalid item, then again without it; the last item at the exit.
+    assert_eq!(api.count_calls(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items")), 3);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    // One charge for the batch's stored items; the invalid one is not charged.
+    assert_eq!(charges, [json!({ "eventName": "page", "count": 5 })]);
+}
+
+#[tokio::test]
 async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -582,6 +610,40 @@ fn child() {
                     // Each charge call takes 300 ms: one after another, 21 would take over 6 s.
                     let elapsed = started.elapsed();
                     assert!(elapsed < Duration::from_secs(2), "the pushes waited for each other: {elapsed:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "buffered" => {
+                Actor::main(|| async move {
+                    let started = std::time::Instant::now();
+                    // Three pushes within the buffer's window: one request.
+                    let first = Actor::push_data_and_charge_buffered(&[json!({ "n": 1 }), json!({ "n": 2 })], "page")?;
+                    let second = Actor::push_data_and_charge_buffered(
+                        &[json!({ "n": 3 }), json!({ "n": 4, "invalid": true }), json!({ "n": 5 })],
+                        "page",
+                    )?;
+                    // Not awaited: stored all the same.
+                    drop(Actor::push_data_and_charge_buffered(&json!({ "n": 6 }), "page")?);
+                    // The budget is reserved at once, before the items are stored.
+                    assert_eq!(first.charge_result().charged_count, 2);
+                    assert_eq!(second.charge_result().charged_count, 3);
+
+                    first.await?;
+                    match second.await {
+                        Err(apify::PushError::Invalid(invalid)) => {
+                            assert_eq!(invalid.len(), 1);
+                            assert_eq!(invalid[0].index, 1, "the index in the items of this push");
+                            let item: Value = serde_json::from_str(invalid[0].item.get())?;
+                            assert_eq!(item, json!({ "n": 4, "invalid": true }));
+                            assert_eq!(invalid[0].validation_errors[0]["message"], "must be equal to constant");
+                        }
+                        other => panic!("expected the invalid item back, got {other:?}"),
+                    }
+                    let elapsed = started.elapsed();
+                    assert!(elapsed < Duration::from_secs(2), "stored after {elapsed:?}");
+                    // Left in the buffer: the exit stores it.
+                    drop(Actor::push_data_buffered(&json!({ "n": 7 }))?);
                     Ok(())
                 })
                 .await

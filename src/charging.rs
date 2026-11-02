@@ -865,4 +865,100 @@ mod tests {
         assert!(result.event_charge_limit_reached);
         assert_eq!(manager.push_data_limit(5, None, true), 0);
     }
+
+    /// An initialized manager of a run whose items cost 0.5 USD, out of a budget of 5.
+    async fn item_manager() -> Arc<ChargingManager> {
+        let manager = Arc::new(manager(5.0, &[(DEFAULT_DATASET_ITEM_EVENT, 0.5)], &[]));
+        manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();
+        manager
+    }
+
+    /// In-memory storage whose default dataset, `default-id`, charges for its items.
+    fn charged_storage(manager: &Arc<ChargingManager>) -> ChargingStorageBackend {
+        ChargingStorageBackend {
+            inner: Arc::new(crawlee::core::MemoryStorageBackend::new()),
+            charging: manager.clone(),
+            default_dataset_id: "default-id".to_owned(),
+        }
+    }
+
+    fn items(count: usize) -> Vec<Value> {
+        (0..count).map(|n| serde_json::json!({ "n": n })).collect()
+    }
+
+    #[tokio::test]
+    async fn the_default_dataset_stores_as_many_items_as_the_budget_allows() {
+        let manager = item_manager().await;
+        let storage = charged_storage(&manager);
+        let dataset = Dataset::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let stored = async || dataset.get_all::<Value>().await.unwrap().len();
+
+        dataset.push_data(&items(4)).await.unwrap();
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 4);
+        assert_eq!(manager.max_event_charge_count_within_limit(DEFAULT_DATASET_ITEM_EVENT), Some(6));
+        // Cut to the 6 the budget has left.
+        dataset.push_data(&items(10)).await.unwrap();
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 10);
+        assert_eq!(stored().await, 10);
+        // The budget spent: one more, so that the platform stops the run, then none.
+        dataset.push_data(&items(3)).await.unwrap();
+        assert_eq!(stored().await, 11);
+        dataset.push_data(&items(3)).await.unwrap();
+        assert_eq!(stored().await, 11, "dropped");
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 11);
+    }
+
+    /// A dataset that fails to store anything.
+    struct FailingDataset;
+
+    #[async_trait]
+    impl DatasetBackend for FailingDataset {
+        async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
+            unimplemented!()
+        }
+
+        async fn drop_storage(&self) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn purge(&self) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn push_data(&self, _items: Vec<DatasetItem>) -> StorageResult<()> {
+            Err(StorageError::Backend("refused".into()))
+        }
+
+        async fn get_data(&self, _options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn items_the_default_dataset_fails_to_store_are_not_charged() {
+        let manager = item_manager().await;
+        let dataset = ChargingDataset { inner: Arc::new(FailingDataset), charging: manager.clone() };
+        let items = items(3).iter().map(|item| serde_json::value::to_raw_value(item).unwrap()).collect();
+
+        assert!(dataset.push_data(items).await.is_err());
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 0);
+        assert_eq!(manager.max_event_charge_count_within_limit(DEFAULT_DATASET_ITEM_EVENT), Some(10));
+    }
+
+    #[tokio::test]
+    async fn the_default_dataset_is_charged_also_when_opened_by_its_id() {
+        let manager = item_manager().await;
+        let storage = charged_storage(&manager);
+        let charged = async |id: StorageIdentifier| {
+            let before = manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT);
+            Dataset::open(&storage, &id).await.unwrap().push_data(&items(1)).await.unwrap();
+            manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT) > before
+        };
+
+        assert!(charged(StorageIdentifier::Default).await);
+        assert!(charged(StorageIdentifier::id("default-id")).await);
+        assert!(charged(StorageIdentifier::alias(DEFAULT_STORAGE_ALIAS)).await);
+        assert!(!charged(StorageIdentifier::id("other-id")).await);
+        assert!(!charged(StorageIdentifier::name("default-id")).await, "a name is not an id");
+    }
 }

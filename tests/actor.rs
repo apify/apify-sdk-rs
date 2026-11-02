@@ -464,6 +464,22 @@ async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
 }
 
 #[tokio::test]
+async fn items_pushed_by_a_crawler_or_to_an_opened_default_dataset_are_charged() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("ppe-datasets", &vars, dir.path()).await, 0);
+
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 5);
+}
+
+#[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
     let vars = [
@@ -681,6 +697,27 @@ fn child() {
                     // Each charge call takes 300 ms: one after another, 21 would take over 6 s.
                     let elapsed = started.elapsed();
                     assert!(elapsed < Duration::from_secs(2), "the pushes waited for each other: {elapsed:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-datasets" => {
+                Actor::main(|| async move {
+                    use crawlee::StorageIdentifier;
+                    let charged = || Actor::charging_manager().charged_event_count("apify-default-dataset-item");
+                    let open = |id| Actor::open_dataset(id, apify::OpenOptions::default());
+                    open(&StorageIdentifier::Default).await?.push_data(&[json!({ "n": 1 }), json!({ "n": 2 })]).await?;
+                    assert_eq!(charged(), 2);
+                    open(&StorageIdentifier::id(DEFAULT_DATASET)).await?.push_data(&json!({ "n": 3 })).await?;
+                    assert_eq!(charged(), 3);
+                    let crawler = crawlee::BasicCrawler::builder()
+                        .request_handler(|ctx: crawlee::BasicContext| async move {
+                            ctx.push_data(&json!({ "url": ctx.request().url }))?;
+                            Ok(())
+                        })
+                        .build()?;
+                    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await?;
+                    assert_eq!(charged(), 5);
                     Ok(())
                 })
                 .await

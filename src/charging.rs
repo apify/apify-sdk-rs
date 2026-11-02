@@ -843,6 +843,24 @@ mod tests {
         assert!(matches!(manager.charge(keyed(item, 1, " ")).await, Err(ChargingError::Invalid(_))));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_idempotency_key_is_forgotten_after_three_minutes() {
+        let manager = manager(10.0, &[(DEFAULT_DATASET_ITEM_EVENT, 0.5)], &[]);
+        manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();
+        let keyed = || ChargeOptions {
+            idempotency_key: Some("k".to_owned()),
+            ..ChargeOptions::new(DEFAULT_DATASET_ITEM_EVENT, 1)
+        };
+
+        manager.charge(keyed()).await.unwrap();
+        tokio::time::advance(IDEMPOTENCY_KEY_TTL - Duration::from_secs(1)).await;
+        manager.charge(keyed()).await.unwrap();
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 1, "a repeat within the TTL");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        manager.charge(keyed()).await.unwrap();
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 2, "charged again once expired");
+    }
+
     #[tokio::test]
     async fn budget_limits_and_restored_counts() {
         let manager = manager(10.0, &[("page", 1.0), ("apify-default-dataset-item", 0.5)], &[("page", 3)]);

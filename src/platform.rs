@@ -36,7 +36,8 @@ pub struct CallOptions {
     /// Run with another token than the Actor's.
     pub token: Option<String>,
     pub timeout: Option<RunTimeout>,
-    /// Build, memory and the other run options of the API.
+    /// Build, memory and the other run options of the API. Use `max_total_charge_usd` to cap the
+    /// cost of the run: `max_items` (pay-per-result only) was removed from the options in JS v4.
     pub start: ActorStartOptions,
     /// How long `call` waits for the run to finish; `None` waits until it does.
     pub wait: Option<Duration>,
@@ -47,6 +48,15 @@ pub struct CallOptions {
     /// Actor, task or input is an error, unless the tracked run is replaced. See
     /// [`Actor::child_runs`].
     pub run_name: Option<String>,
+    /// Gracefully abort the child run when this run is gracefully aborted. Requires `run_name`.
+    ///
+    /// The latest call under the same `run_name` sets the value. Once this run is being aborted, a
+    /// call with this option fails instead of starting, resurrecting or returning a run. A hard
+    /// abort, timeout or crash of this run leaves the child run running.
+    ///
+    /// A run started with a custom `token` is aborted with that token, except for a run started
+    /// before a migration or resurrection of this run, which is aborted with the default client.
+    pub abort_with_parent: bool,
     /// Where `call` puts the log of the Actor run it started.
     pub log: RunLog,
 }
@@ -252,6 +262,9 @@ impl Actor {
         input: Option<&T>,
         options: &CallOptions,
     ) -> ApifyClientResult<(ActorRun, bool)> {
+        if options.abort_with_parent && options.run_name.is_none() {
+            return Err(ApifyClientError::InvalidArgument("`abort_with_parent` requires `run_name`.".to_owned()));
+        }
         let client = Self::client_for(options.token.as_deref());
         let start = Self::start_options(options);
         let start_new = |start: ActorStartOptions| async {
@@ -271,7 +284,9 @@ impl Actor {
             restart_on_error: start.restart_on_error,
         };
         let tracker = Self::child_run_tracker();
-        tracker.start_or_resume(&client, run_name, request, resurrect, || start_new(start)).await
+        tracker
+            .start_or_resume(&client, run_name, request, resurrect, options.abort_with_parent, || start_new(start))
+            .await
     }
 
     /// Starts an Actor or a task and waits for its run to finish.

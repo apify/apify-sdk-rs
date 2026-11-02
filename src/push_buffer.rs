@@ -16,7 +16,7 @@ use crawlee::core::storage::backend::DatasetItem;
 use crawlee::{Services, StorageIdentifier};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::charging::{ChargeResult, ChargingError, ChargingManager, DEFAULT_DATASET_ITEM_EVENT};
 use crate::schema_validation::{
@@ -99,16 +99,23 @@ struct Pending {
     added: usize,
 }
 
+/// A batch to store, and who waits for it and the batches queued before it.
+type Queued = (Batch, Option<oneshot::Sender<()>>);
+
 /// The buffer of the default dataset's pushes.
 pub(crate) struct PushBuffer {
     window: Duration,
     /// How many of the first pushes are stored at once.
     unbuffered_first: usize,
+    pending: Mutex<Pending>,
+    /// The batches to store, queued with `pending` locked: stored one at a time, in push order.
+    queue: mpsc::UnboundedSender<Queued>,
+}
+
+/// Stores the batches queued.
+struct Storer {
     services: Services,
     charging: Arc<ChargingManager>,
-    pending: Mutex<Pending>,
-    /// Held while a batch is stored: batches are stored one at a time, in order.
-    storing: tokio::sync::Mutex<()>,
 }
 
 impl PushBuffer {
@@ -118,14 +125,17 @@ impl PushBuffer {
         services: Services,
         charging: Arc<ChargingManager>,
     ) -> Arc<Self> {
-        Arc::new(PushBuffer {
-            window,
-            unbuffered_first,
-            services,
-            charging,
-            pending: Mutex::default(),
-            storing: tokio::sync::Mutex::new(()),
-        })
+        let (queue, mut queued) = mpsc::unbounded_channel::<Queued>();
+        let storer = Storer { services, charging };
+        tokio::spawn(async move {
+            while let Some((batch, stored)) = queued.recv().await {
+                storer.store(batch).await;
+                if let Some(stored) = stored {
+                    let _ = stored.send(());
+                }
+            }
+        });
+        Arc::new(PushBuffer { window, unbuffered_first, pending: Mutex::default(), queue })
     }
 
     /// Buffers the items of a push whose charges are reserved: stored `window` after the first
@@ -146,19 +156,14 @@ impl PushBuffer {
         pending.added += 1;
         let batch = &mut pending.batch;
         if !batch.items.is_empty() && batch.bytes + bytes > MAX_BATCH_BYTES {
-            let full = std::mem::take(batch);
-            let this = self.clone();
-            tokio::spawn(async move { this.store(full).await });
+            let _ = self.queue.send((std::mem::take(batch), None));
         }
         let first = batch.pushes.is_empty();
         batch.bytes += bytes;
         batch.pushes.push(Push { len: items.len(), events, is_default_dataset, on_invalid_items, charge, done });
         batch.items.extend(items);
         if unbuffered {
-            let batch = std::mem::take(batch);
-            drop(pending);
-            let this = self.clone();
-            tokio::spawn(async move { this.store(batch).await });
+            let _ = self.queue.send((std::mem::take(batch), None));
         } else if first {
             drop(pending);
             let this = self.clone();
@@ -170,14 +175,20 @@ impl PushBuffer {
         stored
     }
 
-    /// Stores the items buffered now, after the batches being stored.
+    /// Stores the items buffered now, after the batches queued before; resolves once all are
+    /// stored.
     pub(crate) async fn flush(&self) {
-        let batch = std::mem::take(&mut self.pending.lock().batch);
-        self.store(batch).await;
+        let (stored, flushed) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock();
+            let _ = self.queue.send((std::mem::take(&mut pending.batch), Some(stored)));
+        }
+        let _ = flushed.await;
     }
+}
 
+impl Storer {
     async fn store(&self, batch: Batch) {
-        let _storing = self.storing.lock().await;
         if batch.pushes.is_empty() {
             return;
         }
@@ -244,6 +255,78 @@ impl PushBuffer {
                 }
             }
             let _ = push.done.send(result);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crawlee::core::MemoryStorageBackend;
+    use crawlee::core::storage::backend::DatasetListOptions;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::configuration::Configuration;
+
+    /// A buffer storing its first 20 pushes at once, to an in-memory default dataset.
+    fn buffer() -> (Arc<PushBuffer>, Services) {
+        let configuration = Configuration::default();
+        let client = crate::new_client(&configuration, None, Default::default());
+        let charging = Arc::new(ChargingManager::new(Arc::new(configuration), client));
+        let services = Services::new(Arc::new(MemoryStorageBackend::new()));
+        (PushBuffer::new(Duration::from_secs(60), 20, services.clone(), charging), services)
+    }
+
+    fn push(buffer: &Arc<PushBuffer>, n: usize) -> oneshot::Receiver<Stored> {
+        let item = serde_json::value::to_raw_value(&json!({ "n": n })).unwrap();
+        let charge = ChargeResult {
+            event_charge_limit_reached: false,
+            charged_count: 1,
+            chargeable_within_limit: IndexMap::new(),
+        };
+        buffer.add(vec![item], Vec::new(), true, OnInvalidItems::Return, charge)
+    }
+
+    async fn stored(services: &Services) -> Vec<Value> {
+        let dataset = services.open_dataset(&StorageIdentifier::Default).await.unwrap();
+        let items: Vec<Value> = dataset.get_data(DatasetListOptions::default()).await.unwrap().items;
+        items.into_iter().map(|item| item["n"].clone()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unbuffered_pushes_are_stored_in_order_by_a_flush() {
+        // The order the storing tasks run in varies: many rounds.
+        for round in 0..50 {
+            let (buffer, services) = buffer();
+            // As at the exit: the pushes not awaited, then a flush.
+            tokio::spawn(async move {
+                for n in 0..20 {
+                    drop(push(&buffer, n));
+                }
+                buffer.flush().await;
+            })
+            .await
+            .unwrap();
+            let expected: Vec<Value> = (0..20).map(|n| json!(n)).collect();
+            assert_eq!(stored(&services).await, expected, "round {round}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_waits_for_the_unbuffered_pushes_before_it() {
+        for round in 0..50 {
+            let (buffer, _services) = buffer();
+            let pushes = tokio::spawn(async move {
+                let pushes: Vec<_> = (0..5).map(|n| push(&buffer, n)).collect();
+                buffer.flush().await;
+                pushes
+            })
+            .await
+            .unwrap();
+            for (n, mut push) in pushes.into_iter().enumerate() {
+                let result = push.try_recv().unwrap_or_else(|err| panic!("round {round}: push {n} not stored: {err}"));
+                assert!(result.is_ok(), "round {round}: push {n} failed");
+            }
         }
     }
 }

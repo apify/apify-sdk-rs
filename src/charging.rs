@@ -8,6 +8,7 @@
 //! to the platform without holding anything: concurrent charges and pushes do not wait for each
 //! other's API calls, and cannot together spend more than the budget.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use crawlee::{Dataset, StorageIdentifier};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::configuration::Configuration;
 use crate::storage::DEFAULT_STORAGE_ALIAS;
@@ -147,6 +149,8 @@ struct State {
     not_ppe_warning_printed: bool,
     /// Charges made with an idempotency key, by key, in the order they expire.
     idempotent: IndexMap<String, IdempotentCharge>,
+    /// Charges with an idempotency key being made, by key, closed once done.
+    idempotent_in_flight: HashMap<String, watch::Receiver<()>>,
 }
 
 impl State {
@@ -168,6 +172,29 @@ impl State {
             expires_at: now + IDEMPOTENCY_KEY_TTL,
         };
         self.idempotent.insert(key, charge);
+    }
+}
+
+/// A charge with an idempotency key being made: a repeat under its key waits for it. Once dropped,
+/// the key is remembered, unless the charge failed. A charge cancelled is remembered, as it stays
+/// counted.
+struct IdempotentChargeInFlight<'a> {
+    manager: &'a ChargingManager,
+    key: String,
+    event_name: String,
+    charged_count: u64,
+    failed: bool,
+    /// Dropped after the key is remembered, which wakes the repeats waiting.
+    _done: watch::Sender<()>,
+}
+
+impl Drop for IdempotentChargeInFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = self.manager.state.lock();
+        state.idempotent_in_flight.remove(&self.key);
+        if !self.failed {
+            state.remember_idempotent_charge(std::mem::take(&mut self.key), &self.event_name, self.charged_count);
+        }
     }
 }
 
@@ -328,7 +355,8 @@ impl ChargingManager {
     /// charged, so that the platform notices and stops the run.
     ///
     /// A charge repeated under the same idempotency key within three minutes is not made again: it
-    /// reports the count of the original charge, or 0 when that was of another event.
+    /// reports the count of the original charge, or 0 when that was of another event. A repeat
+    /// while the original is being made waits for it, and is made if the original failed.
     pub async fn charge(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
         if options.idempotency_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
             return Err(ChargingError::Invalid("idempotencyKey must not be blank".to_owned()));
@@ -351,47 +379,65 @@ impl ChargingManager {
             return Err(ChargingError::NotInitialized);
         }
         let ChargeOptions { event_name, count, idempotency_key } = options;
-        let charged_count = {
-            let mut state = self.state.lock();
-            if let Some(key) = &idempotency_key
-                && let Some(previous) = state.idempotent_charge(key)
-            {
-                // A repeat the platform would discard: counting it would spend the budget early.
-                let repeated_count = if previous.event_name == event_name {
-                    tracing::debug!("Skipped a repeated charge of event '{event_name}' under key '{key}'.");
-                    previous.charged_count
-                } else {
-                    tracing::warn!(
-                        "Idempotency key '{key}' was already used to charge for event '{}', so the charge of event \
-                         '{event_name}' is skipped.",
-                        previous.event_name
-                    );
-                    0
-                };
-                return Ok(ChargeResult {
-                    event_charge_limit_reached: self.is_event_charge_limit_reached_of(&state, &event_name),
-                    charged_count: repeated_count,
-                    chargeable_within_limit: self.chargeable_within_limit_of(&state),
+        let (charged_count, mut in_flight) = 'charge: loop {
+            let mut in_flight_done = 'wait: {
+                let mut state = self.state.lock();
+                if let Some(key) = &idempotency_key
+                    && let Some(in_flight_done) = state.idempotent_in_flight.get(key)
+                {
+                    break 'wait in_flight_done.clone();
+                }
+                if let Some(key) = &idempotency_key
+                    && let Some(previous) = state.idempotent_charge(key)
+                {
+                    // A repeat the platform would discard: counting it would spend the budget early.
+                    let repeated_count = if previous.event_name == event_name {
+                        tracing::debug!("Skipped a repeated charge of event '{event_name}' under key '{key}'.");
+                        previous.charged_count
+                    } else {
+                        tracing::warn!(
+                            "Idempotency key '{key}' was already used to charge for event '{}', so the charge of \
+                             event '{event_name}' is skipped.",
+                            previous.event_name
+                        );
+                        0
+                    };
+                    return Ok(ChargeResult {
+                        event_charge_limit_reached: self.is_event_charge_limit_reached_of(&state, &event_name),
+                        charged_count: repeated_count,
+                        chargeable_within_limit: self.chargeable_within_limit_of(&state),
+                    });
+                }
+                let charged_count = self.reserve(&mut state, &event_name, count);
+                let in_flight = idempotency_key.clone().map(|key| {
+                    let (done, in_flight_done) = watch::channel(());
+                    state.idempotent_in_flight.insert(key.clone(), in_flight_done);
+                    IdempotentChargeInFlight {
+                        manager: self,
+                        key,
+                        event_name: event_name.clone(),
+                        charged_count,
+                        failed: false,
+                        _done: done,
+                    }
                 });
-            }
-            let charged_count = self.reserve(&mut state, &event_name, count);
-            // Remembered right away, so that a concurrent repeat is skipped too.
-            if let Some(key) = &idempotency_key {
-                state.remember_idempotent_charge(key.clone(), &event_name, charged_count);
-            }
-            charged_count
+                break 'charge (charged_count, in_flight);
+            };
+            // A repeat waits for the charge under its key, to go by what that charge did.
+            let _ = in_flight_done.changed().await;
         };
         if charged_count > 0
             && let Err(err) = self.send_charge(&event_name, charged_count, idempotency_key.clone()).await
         {
             // Counted only once made, so that a failed charge retried under its key is counted once.
-            let mut state = self.state.lock();
-            self.add_charged(&mut state, &event_name, -(charged_count as i64));
-            if let Some(key) = &idempotency_key {
-                state.idempotent.shift_remove(key);
+            self.add_charged(&mut self.state.lock(), &event_name, -(charged_count as i64));
+            if let Some(in_flight) = &mut in_flight {
+                in_flight.failed = true;
             }
             return Err(err);
         }
+        // Remembered once made.
+        drop(in_flight);
         if charged_count < count && charged_count > 0 {
             let subject = if count == 1 { "instance" } else { "instances" };
             tracing::info!(

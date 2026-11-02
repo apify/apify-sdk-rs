@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use apify_client::clients::run::RunClient;
@@ -29,6 +30,12 @@ const NOT_FOUND_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SETTLING_STATUSES: [&str; 2] = ["ABORTING", "TIMING-OUT"];
 const RESURRECTABLE_STATUSES: [&str; 2] = ["ABORTED", "TIMED-OUT"];
 const REUSABLE_STATUSES: [&str; 5] = ["READY", "RUNNING", "SUCCEEDED", "ABORTED", "TIMED-OUT"];
+const ABORTED_STATUSES: [&str; 2] = ["ABORTING", "ABORTED"];
+
+/// How long `abort_runs_with_parent` waits for the child runs to be aborted. The platform stops a
+/// gracefully aborted run 30 seconds after the `aborting` event, which leaves `Actor::exit` time
+/// for the rest of its work.
+pub const ABORT_WITH_PARENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The status of a tracked run the platform no longer returns (removed or expired).
 const LOST: &str = "LOST";
 
@@ -53,6 +60,9 @@ pub struct TrackedChildRun {
     /// Earlier runs replaced under the same name, oldest first.
     #[serde(default)]
     pub history: Vec<ChildRunInfo>,
+    /// Whether the run is aborted when this run is gracefully aborted.
+    #[serde(default, rename = "abortWithParent")]
+    pub abort_with_parent: bool,
 }
 
 /// What a child run is started for.
@@ -131,6 +141,9 @@ pub(crate) struct ChildRunTracker {
     clients: Mutex<HashMap<String, ApifyClient>>,
     /// One start or resume at a time per name.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Set once this run is being gracefully aborted, after which no run with `abort_with_parent`
+    /// is started.
+    is_parent_aborting: AtomicBool,
 }
 
 impl ChildRunTracker {
@@ -141,6 +154,7 @@ impl ChildRunTracker {
             io: tokio::sync::Mutex::default(),
             clients: Mutex::default(),
             locks: Mutex::default(),
+            is_parent_aborting: AtomicBool::new(false),
         }
     }
 
@@ -181,21 +195,30 @@ impl ChildRunTracker {
     /// Returns the run tracked under `run_name` when it is in progress or succeeded, resurrects it
     /// with `resurrect` when it was aborted or timed out (once it finished aborting or timing out),
     /// and otherwise (failed or gone) starts a new one with `start`, keeping the replaced one in the
-    /// history. Also returns whether the run was resumed rather than started.
+    /// history. `abort_with_parent` replaces the value tracked under `run_name`. Also returns
+    /// whether the run was resumed rather than started.
     pub(crate) async fn start_or_resume<F, Fut>(
         &self,
         client: &ApifyClient,
         run_name: &str,
         request: ChildRunRequest,
         resurrect: RunResurrectOptions,
+        abort_with_parent: bool,
         start: F,
     ) -> ApifyClientResult<(ActorRun, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = ApifyClientResult<ActorRun>>,
     {
-        let lock = self.locks.lock().entry(run_name.to_owned()).or_default().clone();
+        let lock = self.lock_of(run_name);
         let _guard = lock.lock().await;
+
+        if abort_with_parent && self.is_parent_aborting.load(Ordering::Acquire) {
+            return Err(ApifyClientError::InvalidArgument(format!(
+                "Child run \"{run_name}\" with `abort_with_parent` was not started, because this run is being \
+                 aborted."
+            )));
+        }
 
         let tracked = self.get(run_name).await?;
         let mut tracked_run = match &tracked {
@@ -223,6 +246,9 @@ impl ChildRunTracker {
             } else {
                 run.clone()
             };
+            if tracked.abort_with_parent != abort_with_parent {
+                self.set_abort_with_parent(run_name, abort_with_parent).await?;
+            }
             self.update(run_name, &run).await?;
             self.clients.lock().insert(run_name.to_owned(), client.clone());
             return Ok((run, true));
@@ -230,7 +256,7 @@ impl ChildRunTracker {
 
         let replaced_status = tracked_run.as_ref().map_or(LOST, status).to_owned();
         let run = start().await?;
-        self.track(run_name, &run, &request, replaced_status).await?;
+        self.track(run_name, &run, &request, replaced_status, abort_with_parent).await?;
         self.clients.lock().insert(run_name.to_owned(), client.clone());
         Ok((run, false))
     }
@@ -243,6 +269,7 @@ impl ChildRunTracker {
         run: &ActorRun,
         request: &ChildRunRequest,
         replaced_status: String,
+        abort_with_parent: bool,
     ) -> ApifyClientResult<()> {
         let mut loaded = self.io.lock().await;
         self.ensure_loaded(&mut loaded).await?;
@@ -256,11 +283,68 @@ impl ChildRunTracker {
                 }
                 None => Vec::new(),
             };
-            let tracked = TrackedChildRun { run: info(run), checksum: request.checksum(), history };
+            let tracked = TrackedChildRun { run: info(run), checksum: request.checksum(), history, abort_with_parent };
             runs.insert(run_name.to_owned(), tracked);
             runs.clone()
         };
         self.persist(&runs).await
+    }
+
+    fn lock_of(&self, run_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks.lock().entry(run_name.to_owned()).or_default().clone()
+    }
+
+    async fn set_abort_with_parent(&self, run_name: &str, abort_with_parent: bool) -> ApifyClientResult<()> {
+        let mut loaded = self.io.lock().await;
+        self.ensure_loaded(&mut loaded).await?;
+        let runs = {
+            let mut runs = self.runs.lock();
+            let Some(current) = runs.get_mut(run_name) else { return Ok(()) };
+            current.abort_with_parent = abort_with_parent;
+            runs.clone()
+        };
+        self.persist(&runs).await
+    }
+
+    /// Gracefully aborts the current run under each name tracked with `abort_with_parent`, and
+    /// makes any later start with it fail. A start in flight is waited for, so the run it starts is
+    /// aborted too. Returns after [`ABORT_WITH_PARENT_TIMEOUT`] at the latest, leaving the aborts
+    /// still in progress to go on.
+    pub(crate) async fn abort_runs_with_parent(&self, default_client: &ApifyClient) {
+        self.is_parent_aborting.store(true, Ordering::Release);
+        if let Err(err) = self.load().await {
+            tracing::error!("Failed to load the child runs to abort with the parent: {err}");
+            return;
+        }
+        let mut names: Vec<String> = self.runs.lock().keys().cloned().collect();
+        for name in self.locks.lock().keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let aborts = futures_util::future::join_all(names.iter().map(|name| async move {
+            let lock = self.lock_of(name);
+            let _guard = lock.lock().await;
+            let Some(tracked) = self.runs.lock().get(name).filter(|tracked| tracked.abort_with_parent).cloned() else {
+                return;
+            };
+            let client = self.clients.lock().get(name).cloned().unwrap_or_else(|| default_client.clone());
+            match client.run(tracked.run.run_id.clone()).abort(Some(true)).await {
+                Ok(run) if ABORTED_STATUSES.contains(&status(&run)) => {
+                    tracing::info!(run_id = %run.id, "Aborted child run \"{name}\" with the parent");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!(run_id = %tracked.run.run_id, "Failed to abort child run \"{name}\": {err}")
+                }
+            }
+        }));
+        if tokio::time::timeout(ABORT_WITH_PARENT_TIMEOUT, aborts).await.is_err() {
+            tracing::warn!(
+                "Aborting the child runs with the parent timed out after {}s",
+                ABORT_WITH_PARENT_TIMEOUT.as_secs()
+            );
+        }
     }
 
     /// Records the latest state of the run tracked under `run_name`.

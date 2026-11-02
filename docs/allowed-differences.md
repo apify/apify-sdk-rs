@@ -86,6 +86,9 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
 - **A redirected log chunk without a newline waits for the rest of its line.** The JS
   `StreamedLog` logs such a chunk without its last character, which looks like a bug; here the
   line is logged once it is complete (or when the stream ends).
+- **`CallOptions::start` still has `max_items`.** JS v4 removed `maxItems` from the run options.
+  Here the field belongs to the API client's `ActorStartOptions`, so it stays, and the docs point
+  to `max_total_charge_usd`.
 
 ## Input
 

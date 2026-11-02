@@ -414,6 +414,10 @@ impl Actor {
             let push_buffer = push_buffer.clone();
             async move { push_buffer.flush().await }
         });
+        // Child runs started with `abort_with_parent` are aborted with this run. Exit waits for it.
+        events.on(EventKind::Aborting, |_| async {
+            Self::child_run_tracker().abort_runs_with_parent(Self::client()).await
+        });
         {
             let mut listeners = LISTENERS.lock();
             let pending = std::mem::take(&mut listeners.pending);

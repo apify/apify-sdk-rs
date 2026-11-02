@@ -188,6 +188,25 @@ async fn an_aborted_run_exits_gracefully_after_saving_its_state() {
 }
 
 #[tokio::test]
+async fn child_runs_started_with_abort_with_parent_are_aborted_gracefully_with_the_run() {
+    let api = FakeApi::start().await;
+    let events =
+        common::serve_events(Duration::from_millis(1500), vec![json!({ "name": "aborting", "data": null })]).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("abort-with-parent", &platform_env(&api, Some(events)), dir.path()).await;
+    assert_exit(&output, 0);
+    let aborts: Vec<_> = api.platform_calls().into_iter().filter(|(path, _, _)| path.ends_with("/abort")).collect();
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].0, "/v2/actor-runs/child-1/abort");
+    assert_eq!(aborts[0].1.get("gracefully").map(String::as_str), Some("1"));
+    let (stored, _) = api.record(DEFAULT_STORE, "__ACTOR_CHILD_RUNS").unwrap();
+    let stored: Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(stored["a"]["abortWithParent"], true);
+    assert_eq!(stored["b"]["abortWithParent"], false);
+}
+
+#[tokio::test]
 async fn a_migrating_run_saves_its_state_and_reboots() {
     let api = FakeApi::start().await;
     // Once the user function has registered its state.
@@ -568,6 +587,22 @@ fn child() {
             "fail" => {
                 let exit = apify::ExitOptions::message("Done");
                 Actor::main_with(apify::InitOptions::default(), exit, || async { anyhow::bail!("boom") }).await
+            }
+            "abort-with-parent" => {
+                Actor::main(|| async move {
+                    let named = |name: &str, abort_with_parent| apify::CallOptions {
+                        run_name: Some(name.to_owned()),
+                        abort_with_parent,
+                        ..apify::CallOptions::default()
+                    };
+                    Actor::start("user/a", None::<&Value>, named("a", true)).await?;
+                    Actor::start("user/b", None::<&Value>, named("b", false)).await?;
+                    let without_name = apify::CallOptions { abort_with_parent: true, ..apify::CallOptions::default() };
+                    assert!(Actor::start("user/c", None::<&Value>, without_name).await.is_err());
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(())
+                })
+                .await
             }
             "wait" | "migrate" => {
                 Actor::main(|| async move {

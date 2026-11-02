@@ -14,7 +14,7 @@ publish = false
 crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "1856d45" }
 # The client's own transport (reqwest 0.12) is compiled without TLS and not used: requests go through
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
-apify-client = { git = "https://github.com/apify/apify-client-rust", rev = "8a4d19753448bbe0c443cfba04824dfcba4be252", default-features = false }
+apify-client = { version = "=0.15.0", default-features = false }
 
 aes = "0.8"
 aes-gcm = "0.10"

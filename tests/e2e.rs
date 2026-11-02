@@ -91,7 +91,7 @@ async fn the_template_runs_on_the_platform_and_survives_a_reboot() {
 
             // A short crawl.
             let input = json!({ "startUrls": [{ "url": "https://crawlee.dev" }], "maxRequestsPerCrawl": 3 });
-            let run = actor_client.call(Some(&input), Default::default(), None).await.unwrap();
+            let run = actor_client.call(Some(&input), Default::default()).await.unwrap();
             assert_eq!(run.status.as_deref(), Some("SUCCEEDED"), "run {run:?}");
             let dataset = run.default_dataset_id.clone().unwrap();
             let items = client.dataset(dataset).list_items::<Value>(Default::default()).await.unwrap().items;

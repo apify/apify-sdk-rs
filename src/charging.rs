@@ -521,6 +521,7 @@ impl ChargingManager {
                     event_name: event_name.to_owned(),
                     count: Some(count as i64),
                     idempotency_key: idempotency_key.clone(),
+                    request_id: None,
                 };
                 self.client.run(run_id).charge(charge).await?;
             } else {

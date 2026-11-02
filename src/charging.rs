@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use apify_client::{ApifyClient, ApifyClientError, RunChargeOptions};
 use async_trait::async_trait;
@@ -25,6 +24,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::watch;
+use tokio::time::{Duration, Instant};
 
 use crate::configuration::Configuration;
 use crate::storage::DEFAULT_STORAGE_ALIAS;

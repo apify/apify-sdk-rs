@@ -506,6 +506,31 @@ async fn items_pushed_by_a_crawler_or_to_an_opened_default_dataset_are_charged()
     assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 5);
 }
 
+/// The client retries a 5xx 8 times over about two minutes, so the failures are 4xx, given up on
+/// at once.
+#[tokio::test]
+async fn a_refused_store_takes_its_charges_back_and_a_refused_charge_keeps_the_items() {
+    use axum::http::StatusCode;
+
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "10".to_owned()));
+    api.fail_next(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items"), 1, StatusCode::FORBIDDEN);
+    api.fail_next("POST /v2/actor-runs/run-1/charge", 1, StatusCode::BAD_REQUEST);
+    assert_exit(&run_child("ppe-failures", &vars, dir.path()).await, 0);
+
+    // The first push refused, the second stored.
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "n": 1 }), json!({ "n": 2 })]);
+    assert_eq!(api.count_calls("POST /v2/actor-runs/run-1/charge"), 1, "the refused store was not charged");
+}
+
 #[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
@@ -724,6 +749,20 @@ fn child() {
                     // Each charge call takes 300 ms: one after another, 21 would take over 6 s.
                     let elapsed = started.elapsed();
                     assert!(elapsed < Duration::from_secs(2), "the pushes waited for each other: {elapsed:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-failures" => {
+                Actor::main(|| async move {
+                    let charging = Actor::charging_manager();
+                    let items = [json!({ "n": 1 }), json!({ "n": 2 })];
+                    assert!(Actor::push_data_and_charge(&items, "page").await.is_err(), "the store is refused");
+                    assert_eq!(charging.charged_event_count("page"), 0);
+                    assert_eq!(charging.charged_event_count("apify-default-dataset-item"), 0);
+                    let page = apify::PushOptions { charge_events: vec!["page".to_owned()], ..Default::default() };
+                    let result = Actor::push_data_with(&items, &page).await;
+                    assert!(matches!(result, Err(apify::PushError::Charge(_))), "the charge is refused: {result:?}");
                     Ok(())
                 })
                 .await

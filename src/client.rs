@@ -270,11 +270,9 @@ pub fn new_client(configuration: &Configuration, token: Option<&str>, rate_limit
     if let Some(token) = token.or(configuration.token.as_deref()) {
         builder = builder.token(token);
     }
-    if let Some(quality) = configuration.api_brotli_quality {
-        match BrotliHttpCompressor::new(quality) {
-            Ok(compressor) => builder = builder.http_compressor(Arc::new(compressor)),
-            Err(err) => tracing::warn!("Keeping the default brotli quality of the API requests: {err}"),
-        }
+    match BrotliHttpCompressor::new(configuration.api_brotli_quality) {
+        Ok(compressor) => builder = builder.http_compressor(Arc::new(compressor)),
+        Err(err) => tracing::warn!("Keeping the API client's brotli quality for its requests: {err}"),
     }
     builder.build()
 }
@@ -382,13 +380,16 @@ mod tests {
 
     #[tokio::test]
     async fn request_bodies_are_compressed_at_the_configured_brotli_quality() {
-        let default = pushed_body_size(Configuration::default()).await;
-        let fast = pushed_body_size(Configuration { api_brotli_quality: Some(1), ..Configuration::default() }).await;
-        assert!(fast > default, "quality 1 compresses less than the default: {fast} vs {default} bytes");
-        // An invalid quality keeps the client's default.
-        let invalid =
-            pushed_body_size(Configuration { api_brotli_quality: Some(12), ..Configuration::default() }).await;
-        assert_eq!(invalid, default);
+        let fast = pushed_body_size(Configuration::default()).await;
+        let client_default =
+            pushed_body_size(Configuration { api_brotli_quality: 6, ..Configuration::default() }).await;
+        assert!(
+            fast > client_default,
+            "quality 1 by default, which compresses less than the client's 6: {fast} vs {client_default} bytes"
+        );
+        // An invalid quality keeps the client's own (6).
+        let invalid = pushed_body_size(Configuration { api_brotli_quality: 12, ..Configuration::default() }).await;
+        assert_eq!(invalid, client_default);
     }
 
     async fn serve(app: Router) -> String {

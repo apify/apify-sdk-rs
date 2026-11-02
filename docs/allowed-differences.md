@@ -2,19 +2,17 @@
 
 Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything else should match.
 
-## Configuration
+## Optimizations
 
-- **"At home" has one source.** The JS SDK reads `APIFY_IS_AT_HOME` both through `Configuration`
-  (coerced like a boolean, so `0` and `false` are false) and directly with `!!process.env[...]` (so
-  any non-empty value is true). Here it is always `Configuration::is_at_home`.
-- **Invalid numbers are ignored.** A value such as `APIFY_PROXY_PORT=abc` falls back to the default
-  with a warning. The JS SDK throws when the configuration is constructed.
+These differences exist to make runs cheaper or faster.
 
-## Storages
+### CPU and memory
 
-- **Listed keys have an empty content type.** The API does not report content types when it lists
-  the keys of a key-value store. The JS SDK leaves the field undefined; crawlee-rs requires a
-  string, so it is empty.
+- **The API clients share one HTTP client.** Every API client of the SDK (the Actor's, the
+  storages', those of `Actor::new_client`) sends its requests through the same connection pool.
+
+### Fewer API calls
+
 - **A single-consumer request queue lists its requests only until it knows all of them.** The
   platform bills one read per listed request. The JS SDK lists the queue head (at most 1,000
   requests, the ones in progress included) whenever its local head is nearly empty, twice per
@@ -30,8 +28,16 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   never lists the head, and `is_finished` makes no API call: it is true once nothing it knows of
   is left in its local head or in progress. The queue is the run's own: requests another client
   adds after that are not fetched (the JS SDK picks them up from the head).
+- **Buffered pushes (extra).** `Actor::push_data_buffered`, `push_data_and_charge_buffered` and
+  `push_data_buffered_with` store the items pushed within 0.5 s of each other
+  (`InitOptions::push_buffer_window`) with one request, and charge them with one charge call per
+  event; the JS SDK stores and charges every push on its own. The first 20 pushes of the run
+  (`InitOptions::unbuffered_first_pushes`) are stored at once, so that the first results, and all
+  of a short run's, come without the delay. The budget is reserved at once, and
+  the returned `BufferedPush` can be awaited for what was stored. Buffered items are stored on
+  every `PersistState` event and at the exit.
 
-## Actor lifecycle
+### Run time and latency
 
 - **`init` makes its API calls at the same time.** The JS SDK connects to the platform events
   websocket, then loads the tracked child runs, then reads the run for its pricing, one after
@@ -48,8 +54,23 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   later. Updates are sent one at a time in the order they were made, and an update is dropped when
   a later one was sent already (in JS, concurrent updates can land in any order); `exit` waits for
   them before the terminal status message.
-- **The API clients share one HTTP client.** Every API client of the SDK (the Actor's, the
-  storages', those of `Actor::new_client`) sends its requests through the same connection pool.
+
+## Configuration
+
+- **"At home" has one source.** The JS SDK reads `APIFY_IS_AT_HOME` both through `Configuration`
+  (coerced like a boolean, so `0` and `false` are false) and directly with `!!process.env[...]` (so
+  any non-empty value is true). Here it is always `Configuration::is_at_home`.
+- **Invalid numbers are ignored.** A value such as `APIFY_PROXY_PORT=abc` falls back to the default
+  with a warning. The JS SDK throws when the configuration is constructed.
+
+## Storages
+
+- **Listed keys have an empty content type.** The API does not report content types when it lists
+  the keys of a key-value store. The JS SDK leaves the field undefined; crawlee-rs requires a
+  string, so it is empty.
+
+## Actor lifecycle
+
 - **The final status message is awaited.** The JS SDK gives the request that sets the terminal
   status message 1 ms before exiting. Here it gets up to 1 s (the status message timeout), since
   a process exit in Rust cuts off requests in flight.
@@ -64,14 +85,6 @@ Behavior that intentionally differs from the JS SDK (`apify` on npm). Everything
   with `null`. Here the `ACTOR_*` variable is read first and the `APIFY_*` one is the fallback.
 - **`use_state` uses the Actor's services.** The JS SDK opens the store with the global
   configuration, whatever the Actor was configured with.
-- **Buffered pushes (extra).** `Actor::push_data_buffered`, `push_data_and_charge_buffered` and
-  `push_data_buffered_with` store the items pushed within 0.5 s of each other
-  (`InitOptions::push_buffer_window`) with one request, and charge them with one charge call per
-  event; the JS SDK stores and charges every push on its own. The first 20 pushes of the run
-  (`InitOptions::unbuffered_first_pushes`) are stored at once, so that the first results, and all
-  of a short run's, come without the delay. The budget is reserved at once, and
-  the returned `BufferedPush` can be awaited for what was stored. Buffered items are stored on
-  every `PersistState` event and at the exit.
 - **Pushes that handle the rejections of the dataset's schema (extra).** When a dataset's schema
   rejects items, the platform stores none of the request's items, and `pushData` fails (as
   `push_data` does). `Actor::push_data_with` and the buffered pushes handle the rejected items as

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use apify_client::http_client::{HttpBackend, HttpMethod, HttpRequest, HttpResponse};
-use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult};
+use apify_client::timeouts::NO_TIMEOUT;
+use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult, BrotliHttpCompressor};
 use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -183,7 +184,11 @@ impl HttpBackend for ReqwestBackend {
         let is_batch_add = request.method == HttpMethod::Post
             && request.url.split('?').next().is_some_and(|path| path.ends_with("/requests/batch"));
 
-        let mut builder = self.client.request(method, &request.url).timeout(request.timeout);
+        let mut builder = self.client.request(method, &request.url);
+        // A request without a timeout (a start, or a wait for a run) may run as long as it takes.
+        if request.timeout != NO_TIMEOUT {
+            builder = builder.timeout(request.timeout);
+        }
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -265,6 +270,12 @@ pub fn new_client(configuration: &Configuration, token: Option<&str>, rate_limit
     if let Some(token) = token.or(configuration.token.as_deref()) {
         builder = builder.token(token);
     }
+    if let Some(quality) = configuration.api_brotli_quality {
+        match BrotliHttpCompressor::new(quality) {
+            Ok(compressor) => builder = builder.http_compressor(Arc::new(compressor)),
+            Err(err) => tracing::warn!("Keeping the default brotli quality of the API requests: {err}"),
+        }
+    }
     builder.build()
 }
 
@@ -338,6 +349,46 @@ mod tests {
             .min_delay_between_retries(std::time::Duration::from_millis(1))
             .http_backend(Arc::new(ReqwestBackend::new(rate_limits)))
             .build()
+    }
+
+    /// The size of the body of a large dataset push of a client of `configuration`, as it reaches
+    /// the API.
+    async fn pushed_body_size(configuration: Configuration) -> usize {
+        let size = Arc::new(AtomicU64::new(0));
+        let seen = size.clone();
+        let app = Router::new().route(
+            "/v2/datasets/{id}/items",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(headers["content-encoding"], "br");
+                    seen.store(body.len() as u64, Ordering::SeqCst);
+                    (StatusCode::CREATED, String::new())
+                }
+            }),
+        );
+        let base = serve(app).await;
+        let client = new_client(
+            &Configuration { api_base_url: base, ..configuration },
+            Some("secret"),
+            RateLimitCounter::default(),
+        );
+        let items: Vec<Value> = (0..2000)
+            .map(|index| json!({ "id": index, "caption": format!("caption {index} of a post"), "likes": index * 7 }))
+            .collect();
+        client.dataset("abc").push_items(&items).await.unwrap();
+        size.load(Ordering::SeqCst) as usize
+    }
+
+    #[tokio::test]
+    async fn request_bodies_are_compressed_at_the_configured_brotli_quality() {
+        let default = pushed_body_size(Configuration::default()).await;
+        let fast = pushed_body_size(Configuration { api_brotli_quality: Some(1), ..Configuration::default() }).await;
+        assert!(fast > default, "quality 1 compresses less than the default: {fast} vs {default} bytes");
+        // An invalid quality keeps the client's default.
+        let invalid =
+            pushed_body_size(Configuration { api_brotli_quality: Some(12), ..Configuration::default() }).await;
+        assert_eq!(invalid, default);
     }
 
     async fn serve(app: Router) -> String {

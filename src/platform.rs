@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use apify_client::clients::run::RunClient;
 use apify_client::models::{ActorRun, Webhook};
-use apify_client::{ActorStartOptions, ApifyClient, ApifyClientError, ApifyClientResult, RunResurrectOptions};
+use apify_client::{
+    ActorStartOptions, ApifyClient, ApifyClientError, ApifyClientResult, RunResurrectOptions, TaskStartOptions,
+};
 use chrono::{DateTime, Utc};
 use crawlee::core::{SerdeState, StorageResult};
 use indexmap::IndexMap;
@@ -249,7 +251,7 @@ impl Actor {
     fn start_options(options: &CallOptions) -> ActorStartOptions {
         let mut start = options.start.clone();
         if let Some(timeout_secs) = Self::timeout_secs(options.timeout) {
-            start.timeout_secs = timeout_secs;
+            start.run_timeout_secs = timeout_secs;
         }
         start
     }
@@ -269,7 +271,7 @@ impl Actor {
         let start = Self::start_options(options);
         let start_new = |start: ActorStartOptions| async {
             match kind {
-                "task" => client.task(id).start(input, start).await,
+                "task" => client.task(id).start(input, task_start_options(start)).await,
                 _ => client.actor(id).start(input, start).await,
             }
         };
@@ -278,7 +280,7 @@ impl Actor {
         let resurrect = RunResurrectOptions {
             build: start.build.clone(),
             memory_mbytes: start.memory_mbytes,
-            timeout_secs: start.timeout_secs,
+            run_timeout_secs: start.run_timeout_secs,
             max_items: start.max_items,
             max_total_charge_usd: start.max_total_charge_usd,
             restart_on_error: start.restart_on_error,
@@ -299,7 +301,7 @@ impl Actor {
         let client = Self::client_for(options.token.as_deref());
         let wait = options.wait.map(|wait| wait.as_secs() as i64);
         if kind == "task" && options.run_name.is_none() {
-            return client.task(id).call(input, Self::start_options(&options), wait).await;
+            return client.task(id).call(input, task_start_options(Self::start_options(&options)), wait).await;
         }
         let (run, resumed) = Self::start_run(kind, id, input, &options).await?;
         // As the JS client's `call` does for an Actor (not a task); the earlier part of a resumed
@@ -365,7 +367,7 @@ impl Actor {
         let client = Self::client_for(options.token.as_deref());
         let mut resurrect = options.resurrect;
         if let Some(timeout_secs) = Self::timeout_secs(options.timeout) {
-            resurrect.timeout_secs = timeout_secs;
+            resurrect.run_timeout_secs = timeout_secs;
         }
         client.run(run_id).resurrect(resurrect).await
     }
@@ -441,6 +443,22 @@ impl Actor {
         Self::configuration().actor_run_id.clone().ok_or_else(|| {
             ApifyClientError::InvalidArgument("Environment variable ACTOR_RUN_ID is not set!".to_owned())
         })
+    }
+}
+
+/// The options of a task's run from those of an Actor's. A task has no `content_type` (its input
+/// is JSON) nor `force_permission_level`, so those are left out.
+fn task_start_options(start: ActorStartOptions) -> TaskStartOptions {
+    TaskStartOptions {
+        build: start.build,
+        memory_mbytes: start.memory_mbytes,
+        run_timeout_secs: start.run_timeout_secs,
+        wait_for_finish: start.wait_for_finish,
+        max_items: start.max_items,
+        max_total_charge_usd: start.max_total_charge_usd,
+        restart_on_error: start.restart_on_error,
+        webhooks: start.webhooks,
+        wait_for_resources: start.wait_for_resources,
     }
 }
 

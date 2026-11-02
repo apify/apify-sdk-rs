@@ -143,8 +143,9 @@ dependencies = [
 
 [[package]]
 name = "apify-client"
-version = "0.10.2"
-source = "git+https://github.com/apify/apify-client-rust?rev=8a4d19753448bbe0c443cfba04824dfcba4be252#8a4d19753448bbe0c443cfba04824dfcba4be252"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed123a579e76e38295756b85c02763c52f9f92047e14978a5b8c3efb2444eb91"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -159,6 +160,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -10,6 +10,10 @@ These differences exist to make runs cheaper or faster.
 
 - **The API clients share one HTTP client.** Every API client of the SDK (the Actor's, the
   storages', those of `Actor::new_client`) sends its requests through the same connection pool.
+- **The brotli quality of the API request bodies can be lowered.** `Configuration::api_brotli_quality`
+  sets the quality (0 to 11) at which every API client of the SDK compresses its request bodies of at
+  least 1 KiB, instead of the client's 6. Quality 1 is about 5x faster than 6 on dataset items, for
+  bodies about 14% larger. Not set by default.
 
 ### Fewer API calls
 

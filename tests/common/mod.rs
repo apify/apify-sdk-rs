@@ -103,6 +103,8 @@ struct Shared {
     head_lag: Arc<AtomicU32>,
     /// How long the calls starting with a prefix (`"METHOD /path"`) take.
     delays: Arc<Mutex<Vec<(String, std::time::Duration)>>>,
+    /// The calls starting with a prefix (`"METHOD /path"`) to answer with a status, and how many.
+    failures: Arc<Mutex<Vec<(String, StatusCode, u32)>>>,
 }
 
 /// A running fake API. Cheap to clone.
@@ -175,6 +177,12 @@ impl FakeApi {
     /// The calls starting with `prefix` (`"METHOD /path"`) take `delay` from now on.
     pub fn delay(&self, prefix: &str, delay: std::time::Duration) {
         self.shared.delays.lock().push((prefix.to_owned(), delay));
+    }
+
+    /// The next `count` calls starting with `prefix` (`"METHOD /path"`) are answered with `status`,
+    /// after their delay, if any.
+    pub fn fail_next(&self, prefix: &str, count: u32, status: StatusCode) {
+        self.shared.failures.lock().push((prefix.to_owned(), status, count));
     }
 
     /// The API calls made so far, as `"METHOD /path"`.
@@ -254,9 +262,19 @@ impl FakeApi {
 async fn gate(State(shared): State<Shared>, request: Request, next: Next) -> Response {
     let call = format!("{} {}", request.method(), request.uri().path());
     let delay = shared.delays.lock().iter().find(|(prefix, _)| call.starts_with(prefix.as_str())).map(|(_, d)| *d);
-    shared.data.lock().calls.push(call);
+    shared.data.lock().calls.push(call.clone());
     if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
+    }
+    let failure =
+        shared.failures.lock().iter_mut().find(|(prefix, _, left)| *left > 0 && call.starts_with(prefix.as_str())).map(
+            |(_, status, left)| {
+                *left -= 1;
+                *status
+            },
+        );
+    if let Some(status) = failure {
+        return error(status, "injected-failure");
     }
     let authorized = request
         .headers()

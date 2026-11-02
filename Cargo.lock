@@ -551,7 +551,7 @@ dependencies = [
 [[package]]
 name = "crawlee"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "crawlee-basic",
  "crawlee-core",
@@ -564,7 +564,7 @@ dependencies = [
 [[package]]
 name = "crawlee-basic"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -589,7 +589,7 @@ dependencies = [
 [[package]]
 name = "crawlee-core"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -616,7 +616,7 @@ dependencies = [
 [[package]]
 name = "crawlee-http"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -642,7 +642,7 @@ dependencies = [
 [[package]]
 name = "crawlee-http-client"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -681,7 +681,7 @@ dependencies = [
 [[package]]
 name = "crawlee-utils"
 version = "0.1.0"
-source = "git+https://github.com/apify-projects/crawlee-rs?rev=1856d45#1856d45b0fb9c17f3f0e5f1d87f04cf916274a54"
+source = "git+https://github.com/apify-projects/crawlee-rs?rev=c784409#c784409f7cddfe3f48645d226ca25752e1059df7"
 dependencies = [
  "chrono",
  "flate2",

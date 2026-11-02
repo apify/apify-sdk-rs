@@ -405,6 +405,33 @@ async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_
 }
 
 #[tokio::test]
+async fn buffered_pushes_reaching_the_budget_mid_batch_are_cut() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("buffered-budget", &vars, dir.path()).await, 0);
+
+    // 5 USD buy 3 items at 1.5: the second push gets one, the third the one over the budget.
+    let stored: Vec<Value> = api.dataset_items(DEFAULT_DATASET).into_iter().map(|item| item["n"].clone()).collect();
+    assert_eq!(stored, [json!(1), json!(2), json!(3), json!(5)]);
+    assert_eq!(api.count_calls(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items")), 1);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(charges, [json!({ "eventName": "page", "count": 4 })]);
+}
+
+#[tokio::test]
 async fn pushes_repair_drop_or_return_the_items_the_schema_rejects() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -757,6 +784,31 @@ fn child() {
                     assert!(elapsed < Duration::from_secs(2), "stored after {elapsed:?}");
                     // Left in the buffer: the exit stores it.
                     drop(Actor::push_data_buffered(&json!({ "n": 7 }))?);
+                    Ok(())
+                })
+                .await
+            }
+            "buffered-budget" => {
+                // All buffered.
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    let push = |n: u64| {
+                        Actor::push_data_and_charge_buffered(&[json!({ "n": n }), json!({ "n": n + 1 })], "page")
+                    };
+                    let pushes = [push(1)?, push(3)?, push(5)?];
+                    let reserved: Vec<(u64, bool)> = pushes
+                        .iter()
+                        .map(|push| {
+                            (push.charge_result().charged_count, push.charge_result().event_charge_limit_reached)
+                        })
+                        .collect();
+                    assert_eq!(reserved, [(2, false), (1, true), (1, true)]);
+                    for (push, count) in pushes.into_iter().zip([2, 1, 1]) {
+                        assert_eq!(push.await?.charge.charged_count, count);
+                    }
+                    let charging = Actor::charging_manager();
+                    assert_eq!(charging.charged_event_count("page"), 4);
+                    assert_eq!(charging.charged_event_count("apify-default-dataset-item"), 4);
                     Ok(())
                 })
                 .await

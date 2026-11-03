@@ -405,6 +405,33 @@ async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_
 }
 
 #[tokio::test]
+async fn buffered_pushes_reaching_the_budget_mid_batch_are_cut() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("buffered-budget", &vars, dir.path()).await, 0);
+
+    // 5 USD buy 3 items at 1.5: the second push gets one, the third the one over the budget.
+    let stored: Vec<Value> = api.dataset_items(DEFAULT_DATASET).into_iter().map(|item| item["n"].clone()).collect();
+    assert_eq!(stored, [json!(1), json!(2), json!(3), json!(5)]);
+    assert_eq!(api.count_calls(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items")), 1);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(charges, [json!({ "eventName": "page", "count": 4 })]);
+}
+
+#[tokio::test]
 async fn pushes_repair_drop_or_return_the_items_the_schema_rejects() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -461,6 +488,62 @@ async fn concurrent_pay_per_event_pushes_do_not_wait_for_each_other() {
         .map(|(_, _, body)| body["count"].as_u64().unwrap())
         .sum();
     assert_eq!(pages, 21, "each stored item is charged once");
+}
+
+#[tokio::test]
+async fn items_pushed_by_a_crawler_or_to_an_opened_default_dataset_are_charged() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("ppe-datasets", &vars, dir.path()).await, 0);
+
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 5);
+}
+
+/// The client retries a 5xx 8 times over about two minutes, so the failures are 4xx, given up on
+/// at once.
+#[tokio::test]
+async fn a_refused_store_takes_its_charges_back_and_a_refused_charge_keeps_the_items() {
+    use axum::http::StatusCode;
+
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "page": { "eventTitle": "Page", "eventPriceUsd": 1.0 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "10".to_owned()));
+    api.fail_next(&format!("POST /v2/datasets/{DEFAULT_DATASET}/items"), 1, StatusCode::FORBIDDEN);
+    api.fail_next("POST /v2/actor-runs/run-1/charge", 1, StatusCode::BAD_REQUEST);
+    assert_exit(&run_child("ppe-failures", &vars, dir.path()).await, 0);
+
+    // The first push refused, the second stored.
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "n": 1 }), json!({ "n": 2 })]);
+    assert_eq!(api.count_calls("POST /v2/actor-runs/run-1/charge"), 1, "the refused store was not charged");
+}
+
+/// A push to a deleted dataset fails with `record-not-found`, which is the storage's `NotFound`;
+/// another 404 or 4xx is not.
+#[tokio::test]
+async fn a_push_to_a_deleted_dataset_fails_as_not_found() {
+    use axum::http::StatusCode;
+
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let items = format!("POST /v2/datasets/{DEFAULT_DATASET}/items");
+    api.fail_next(&items, 1, StatusCode::NOT_FOUND);
+    api.fail_next(&items, 1, StatusCode::BAD_REQUEST);
+    assert_exit(&run_child("deleted-dataset", &platform_env(&api, None), dir.path()).await, 0);
+    assert_eq!(api.count_calls(&items), 5);
 }
 
 #[tokio::test]
@@ -685,6 +768,71 @@ fn child() {
                 })
                 .await
             }
+            "ppe-failures" => {
+                Actor::main(|| async move {
+                    let charging = Actor::charging_manager();
+                    let items = [json!({ "n": 1 }), json!({ "n": 2 })];
+                    assert!(Actor::push_data_and_charge(&items, "page").await.is_err(), "the store is refused");
+                    assert_eq!(charging.charged_event_count("page"), 0);
+                    assert_eq!(charging.charged_event_count("apify-default-dataset-item"), 0);
+                    let page = apify::PushOptions { charge_events: vec!["page".to_owned()], ..Default::default() };
+                    let result = Actor::push_data_with(&items, &page).await;
+                    assert!(matches!(result, Err(apify::PushError::Charge(_))), "the charge is refused: {result:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "deleted-dataset" => {
+                Actor::main(|| async move {
+                    use crawlee::core::StorageError;
+                    let not_found = |result: &Result<apify::PushResult, apify::PushError>| {
+                        matches!(result, Err(apify::PushError::Failed(err)) if matches!(**err, StorageError::NotFound(_)))
+                    };
+                    let item = json!({ "n": 1 });
+                    let options = apify::PushOptions::default();
+                    // A 404 of another type, then a 400.
+                    for _ in 0..2 {
+                        let result = Actor::push_data_with(&item, &options).await;
+                        assert!(result.is_err() && !not_found(&result), "{result:?}");
+                    }
+                    // Then the dataset is deleted during the run: every kind of push fails as not found.
+                    Actor::client().dataset(DEFAULT_DATASET).delete().await?;
+                    let result = Actor::push_data_with(&item, &options).await;
+                    assert!(not_found(&result), "{result:?}");
+                    let message = result.unwrap_err().to_string();
+                    assert!(message.contains("(status 404, type record-not-found)"), "the API's error: {message}");
+                    let result = Actor::push_data_buffered(&item)?.await;
+                    assert!(not_found(&result), "{result:?}");
+                    let result = Actor::push_data(&item).await;
+                    assert!(
+                        matches!(result, Err(apify::charging::ChargingError::Storage(StorageError::NotFound(_)))),
+                        "{result:?}"
+                    );
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-datasets" => {
+                Actor::main(|| async move {
+                    use crawlee::StorageIdentifier;
+                    let charged = || Actor::charging_manager().charged_event_count("apify-default-dataset-item");
+                    let open = |id| Actor::open_dataset(id, apify::OpenOptions::default());
+                    open(&StorageIdentifier::Default).await?.push_data(&[json!({ "n": 1 }), json!({ "n": 2 })]).await?;
+                    assert_eq!(charged(), 2);
+                    open(&StorageIdentifier::id(DEFAULT_DATASET)).await?.push_data(&json!({ "n": 3 })).await?;
+                    assert_eq!(charged(), 3);
+                    let crawler = crawlee::BasicCrawler::builder()
+                        .request_handler(|ctx: crawlee::BasicContext| async move {
+                            ctx.push_data(&json!({ "url": ctx.request().url }))?;
+                            Ok(())
+                        })
+                        .build()?;
+                    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await?;
+                    assert_eq!(charged(), 5);
+                    Ok(())
+                })
+                .await
+            }
             "buffered" => {
                 // All buffered.
                 let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
@@ -720,6 +868,31 @@ fn child() {
                     assert!(elapsed < Duration::from_secs(2), "stored after {elapsed:?}");
                     // Left in the buffer: the exit stores it.
                     drop(Actor::push_data_buffered(&json!({ "n": 7 }))?);
+                    Ok(())
+                })
+                .await
+            }
+            "buffered-budget" => {
+                // All buffered.
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    let push = |n: u64| {
+                        Actor::push_data_and_charge_buffered(&[json!({ "n": n }), json!({ "n": n + 1 })], "page")
+                    };
+                    let pushes = [push(1)?, push(3)?, push(5)?];
+                    let reserved: Vec<(u64, bool)> = pushes
+                        .iter()
+                        .map(|push| {
+                            (push.charge_result().charged_count, push.charge_result().event_charge_limit_reached)
+                        })
+                        .collect();
+                    assert_eq!(reserved, [(2, false), (1, true), (1, true)]);
+                    for (push, count) in pushes.into_iter().zip([2, 1, 1]) {
+                        assert_eq!(push.await?.charge.charged_count, count);
+                    }
+                    let charging = Actor::charging_manager();
+                    assert_eq!(charging.charged_event_count("page"), 4);
+                    assert_eq!(charging.charged_event_count("apify-default-dataset-item"), 4);
                     Ok(())
                 })
                 .await

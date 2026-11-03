@@ -76,3 +76,13 @@ async fn concurrent_charges_under_one_key_make_one_call() {
     assert_eq!(api.count_calls(CHARGE), 1);
     assert_eq!(manager.charged_event_count("page"), 3);
 }
+
+#[tokio::test]
+async fn the_idempotency_key_is_sent_with_the_charge() {
+    let api = FakeApi::start().await;
+    let manager = manager(&api).await;
+
+    manager.charge(keyed(1)).await.unwrap();
+
+    assert_eq!(api.charge_idempotency_keys(), [Some("key".to_owned())]);
+}

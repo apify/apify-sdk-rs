@@ -83,6 +83,8 @@ struct Data {
     runs: HashMap<String, Value>,
     /// Logs of runs, by id.
     run_logs: HashMap<String, String>,
+    /// The `idempotency-key` headers of charges, in order.
+    charge_idempotency_keys: Vec<Option<String>>,
 }
 
 impl Data {
@@ -238,6 +240,10 @@ impl FakeApi {
 
     pub fn platform_calls(&self) -> Vec<(String, HashMap<String, String>, Value)> {
         self.shared.data.lock().platform_calls.clone()
+    }
+
+    pub fn charge_idempotency_keys(&self) -> Vec<Option<String>> {
+        self.shared.data.lock().charge_idempotency_keys.clone()
     }
 
     /// Sets the log of a run, served whole whether streamed or not.
@@ -803,10 +809,13 @@ async fn run_action(
     State(shared): State<Shared>,
     uri: axum::http::Uri,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     record_platform_call(&shared, uri.path().to_owned(), query, &body);
     if uri.path().ends_with("/charge") {
+        let key = headers.get("idempotency-key").and_then(|key| key.to_str().ok()).map(str::to_owned);
+        shared.data.lock().charge_idempotency_keys.push(key);
         // As slow as a real API call, so that charges waiting for each other show.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }

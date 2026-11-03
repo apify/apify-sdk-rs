@@ -46,6 +46,8 @@ url = "2"
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+# Paused time in tests.
+tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tower-http = { version = "0.6", features = ["decompression-br", "decompression-gzip"] }
 

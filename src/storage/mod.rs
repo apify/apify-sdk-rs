@@ -36,8 +36,13 @@ const ALIAS_MAPPING_RECORD_KEY: &str = "__STORAGE_ALIASES_MAPPING";
 /// The longest client key the request queue API accepts.
 const MAX_CLIENT_KEY_LENGTH: usize = 32;
 
+/// The API's `record-not-found` (a storage deleted during the run, say) is [`StorageError::NotFound`],
+/// as the local backends report it, with the API's error as its message.
 pub(crate) fn backend_error(err: ApifyClientError) -> StorageError {
-    StorageError::Backend(Box::new(err))
+    match err.as_api_error() {
+        Some(api) if api.error_type.as_deref() == Some("record-not-found") => StorageError::NotFound(err.to_string()),
+        _ => StorageError::Backend(Box::new(err)),
+    }
 }
 
 pub(crate) fn unsupported(message: &str) -> StorageError {

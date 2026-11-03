@@ -531,6 +531,21 @@ async fn a_refused_store_takes_its_charges_back_and_a_refused_charge_keeps_the_i
     assert_eq!(api.count_calls("POST /v2/actor-runs/run-1/charge"), 1, "the refused store was not charged");
 }
 
+/// A push to a deleted dataset fails with `record-not-found`, which is the storage's `NotFound`;
+/// another 404 or 4xx is not.
+#[tokio::test]
+async fn a_push_to_a_deleted_dataset_fails_as_not_found() {
+    use axum::http::StatusCode;
+
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let items = format!("POST /v2/datasets/{DEFAULT_DATASET}/items");
+    api.fail_next(&items, 1, StatusCode::NOT_FOUND);
+    api.fail_next(&items, 1, StatusCode::BAD_REQUEST);
+    assert_exit(&run_child("deleted-dataset", &platform_env(&api, None), dir.path()).await, 0);
+    assert_eq!(api.count_calls(&items), 5);
+}
+
 #[tokio::test]
 async fn local_pay_per_event_runs_log_their_charges() {
     let dir = tempfile::tempdir().unwrap();
@@ -763,6 +778,36 @@ fn child() {
                     let page = apify::PushOptions { charge_events: vec!["page".to_owned()], ..Default::default() };
                     let result = Actor::push_data_with(&items, &page).await;
                     assert!(matches!(result, Err(apify::PushError::Charge(_))), "the charge is refused: {result:?}");
+                    Ok(())
+                })
+                .await
+            }
+            "deleted-dataset" => {
+                Actor::main(|| async move {
+                    use crawlee::core::StorageError;
+                    let not_found = |result: &Result<apify::PushResult, apify::PushError>| {
+                        matches!(result, Err(apify::PushError::Failed(err)) if matches!(**err, StorageError::NotFound(_)))
+                    };
+                    let item = json!({ "n": 1 });
+                    let options = apify::PushOptions::default();
+                    // A 404 of another type, then a 400.
+                    for _ in 0..2 {
+                        let result = Actor::push_data_with(&item, &options).await;
+                        assert!(result.is_err() && !not_found(&result), "{result:?}");
+                    }
+                    // Then the dataset is deleted during the run: every kind of push fails as not found.
+                    Actor::client().dataset(DEFAULT_DATASET).delete().await?;
+                    let result = Actor::push_data_with(&item, &options).await;
+                    assert!(not_found(&result), "{result:?}");
+                    let message = result.unwrap_err().to_string();
+                    assert!(message.contains("(status 404, type record-not-found)"), "the API's error: {message}");
+                    let result = Actor::push_data_buffered(&item)?.await;
+                    assert!(not_found(&result), "{result:?}");
+                    let result = Actor::push_data(&item).await;
+                    assert!(
+                        matches!(result, Err(apify::charging::ChargingError::Storage(StorageError::NotFound(_)))),
+                        "{result:?}"
+                    );
                     Ok(())
                 })
                 .await

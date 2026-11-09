@@ -107,6 +107,12 @@ async fn names_and_aliases_resolve_to_platform_storages() {
     let recreated = fresh.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
     assert_ne!(recreated.get_info().await.unwrap().id, scratch_id);
 
+    // Also when it was deleted after this process resolved it.
+    let recreated_id = recreated.get_info().await.unwrap().id;
+    api.delete_dataset(&recreated_id);
+    let reopened = fresh.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
+    assert_ne!(reopened.get_info().await.unwrap().id, recreated_id);
+
     // `__default__` is the default storage.
     let default = fresh.open_dataset(&StorageIdentifier::alias("__default__")).await.unwrap();
     assert_eq!(default.get_info().await.unwrap().id, DEFAULT_DATASET);
@@ -152,6 +158,15 @@ async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
     let services = Services::new(Arc::new(ApifyStorageBackend::new(declared)));
     let products = services.open_dataset(&StorageIdentifier::alias("products")).await.unwrap();
     assert_eq!(products.get_info().await.unwrap().id, DEFAULT_DATASET);
+
+    // A declared storage that was deleted is replaced, and the replacement is remembered.
+    api.delete_dataset(DEFAULT_DATASET);
+    let replaced = Services::new(Arc::new(ApifyStorageBackend::new(Arc::new(Configuration {
+        actor_storages_json: Some(format!(r#"{{"datasets": {{"products": "{DEFAULT_DATASET}"}}}}"#)),
+        ..(*configuration(&api, true)).clone()
+    }))));
+    let replacement = replaced.open_dataset(&StorageIdentifier::alias("products")).await.unwrap();
+    assert_ne!(replacement.get_info().await.unwrap().id, DEFAULT_DATASET);
 
     // Off the platform (a `force_cloud` storage), aliases are not remembered.
     let local = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, false))));

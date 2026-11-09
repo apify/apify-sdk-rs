@@ -264,8 +264,6 @@ impl ApifyStorageBackend {
             if !default_id.is_empty() {
                 return Ok(default_id.clone());
             }
-        } else if let Some(id) = self.alias_from_actor_storages(alias, kind)? {
-            return Ok(id);
         }
         self.resolve_alias_id(alias, kind).await
     }
@@ -290,9 +288,6 @@ impl ApifyStorageBackend {
         // The credentials are part of the key: the same alias opened with two tokens is two storages.
         let key = format!("{},{alias},{}", kind_name(kind), self.credentials_hash);
         let mut aliases = self.aliases.lock().await;
-        if let Some(id) = aliases.known.get(&key) {
-            return Ok(id.clone());
-        }
 
         let store = self.alias_mapping_store();
         if aliases.persisted.is_none() {
@@ -301,9 +296,16 @@ impl ApifyStorageBackend {
                 None => Map::new(),
             });
         }
-        let persisted_id = aliases.persisted.as_ref().and_then(|mapping| mapping.get(&key)).and_then(Value::as_str);
-        // A remembered storage may have been deleted since.
-        if let Some(id) = persisted_id.map(str::to_owned)
+        // A known id can point at a storage deleted since it was resolved. The persisted id wins over
+        // the declared one, as it only exists if the declared storage was gone.
+        let known_id = match aliases.known.get(&key) {
+            Some(id) => Some(id.clone()),
+            None => match aliases.persisted.as_ref().and_then(|mapping| mapping.get(&key)).and_then(Value::as_str) {
+                Some(id) => Some(id.to_owned()),
+                None => self.alias_from_actor_storages(alias, kind)?,
+            },
+        };
+        if let Some(id) = known_id
             && self.get_exists(&id, kind).await?.is_some()
         {
             aliases.known.insert(key, id.clone());

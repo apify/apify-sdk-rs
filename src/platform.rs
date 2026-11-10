@@ -59,6 +59,12 @@ pub struct CallOptions {
     /// A run started with a custom `token` is aborted with that token, except for a run started
     /// before a migration or resurrection of this run, which is aborted with the default client.
     pub abort_with_parent: bool,
+    /// Wait for memory and Actor jobs on the account, as `apify-orchestrator` does, instead of
+    /// failing when the platform refuses the start for lack of them. The starts with this option
+    /// go one at a time. A refused one is tried again every second once 10 seconds have passed,
+    /// during which none of them goes. Once this run is aborting, migrating or exiting, they fail
+    /// instead.
+    pub wait_for_capacity: bool,
     /// Where `call` puts the log of the Actor run it started.
     pub log: RunLog,
 }
@@ -269,10 +275,18 @@ impl Actor {
         }
         let client = Self::client_for(options.token.as_deref());
         let start = Self::start_options(options);
-        let start_new = |start: ActorStartOptions| async {
+        let client_ref = &client;
+        let start_once = move |start: ActorStartOptions| async move {
             match kind {
-                "task" => client.task(id).start(input, task_start_options(start)).await,
-                _ => client.actor(id).start(input, start).await,
+                "task" => client_ref.task(id).start(input, task_start_options(start)).await,
+                _ => client_ref.actor(id).start(input, start).await,
+            }
+        };
+        let start_new = |start: ActorStartOptions| async move {
+            if options.wait_for_capacity {
+                Self::child_run_tracker().capacity.start(|| start_once(start.clone())).await
+            } else {
+                start_once(start).await
             }
         };
         let Some(run_name) = &options.run_name else { return Ok((start_new(start).await?, false)) };
@@ -300,7 +314,7 @@ impl Actor {
     ) -> ApifyClientResult<ActorRun> {
         let client = Self::client_for(options.token.as_deref());
         let wait = options.wait.map(|wait| wait.as_secs() as i64);
-        if kind == "task" && options.run_name.is_none() {
+        if kind == "task" && options.run_name.is_none() && !options.wait_for_capacity {
             return client.task(id).call(input, task_start_options(Self::start_options(&options)), wait).await;
         }
         let (run, resumed) = Self::start_run(kind, id, input, &options).await?;

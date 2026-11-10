@@ -39,6 +39,15 @@ pub const ABORT_WITH_PARENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The status of a tracked run the platform no longer returns (removed or expired).
 const LOST: &str = "LOST";
 
+/// The API's refusals of a start for lack of memory or Actor jobs on the account, which
+/// [`CapacityQueue`] retries.
+const CAPACITY_ERROR_TYPES: [&str; 2] = ["actor-memory-limit-exceeded", "concurrent-runs-limit-exceeded"];
+/// How long no start is tried after one was refused for lack of capacity (`MAIN_LOOP_COOLDOWN_MS`
+/// of `apify-orchestrator`).
+const CAPACITY_COOLDOWN: Duration = Duration::from_secs(10);
+/// How often a waiting start checks whether it can go (`MAIN_LOOP_INTERVAL_MS`).
+const CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A child run as tracked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,6 +153,8 @@ pub(crate) struct ChildRunTracker {
     /// Set once this run is being gracefully aborted, after which no run with `abort_with_parent`
     /// is started.
     is_parent_aborting: AtomicBool,
+    /// The starts that wait for capacity.
+    pub(crate) capacity: CapacityQueue,
 }
 
 impl ChildRunTracker {
@@ -155,6 +166,7 @@ impl ChildRunTracker {
             clients: Mutex::default(),
             locks: Mutex::default(),
             is_parent_aborting: AtomicBool::new(false),
+            capacity: CapacityQueue::default(),
         }
     }
 
@@ -379,9 +391,145 @@ impl ChildRunTracker {
     }
 }
 
+/// The starts of [`CallOptions::wait_for_capacity`](crate::CallOptions::wait_for_capacity), as
+/// `apify-orchestrator` schedules them: one at a time. A start refused for lack of memory or Actor
+/// jobs on the account is tried again every second once [`CAPACITY_COOLDOWN`] has passed, in which
+/// no other start goes either. Once this run is shutting down (aborting, migrating or exiting), no
+/// start goes out.
+#[derive(Default)]
+pub(crate) struct CapacityQueue {
+    lock: tokio::sync::Mutex<()>,
+    cooldown_until: Mutex<Option<tokio::time::Instant>>,
+    closed: AtomicBool,
+}
+
+impl CapacityQueue {
+    /// Starts no more runs: the waiting starts fail.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Runs `start` until the account has capacity for the run it starts.
+    pub(crate) async fn start<F, Fut>(&self, mut start: F) -> ApifyClientResult<ActorRun>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ApifyClientResult<ActorRun>>,
+    {
+        loop {
+            {
+                let _exclusive = self.lock.lock().await;
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(ApifyClientError::InvalidArgument(
+                        "The run was not started, because this run is shutting down.".to_owned(),
+                    ));
+                }
+                let cooling_down = self.cooldown_until.lock().is_some_and(|until| tokio::time::Instant::now() < until);
+                if !cooling_down {
+                    match start().await {
+                        Err(err) if is_capacity_error(&err) => {
+                            *self.cooldown_until.lock() = Some(tokio::time::Instant::now() + CAPACITY_COOLDOWN);
+                            tracing::warn!(
+                                "Not enough capacity to start a run, retrying in {}s: {err}",
+                                CAPACITY_COOLDOWN.as_secs()
+                            );
+                        }
+                        result => return result,
+                    }
+                }
+            }
+            tokio::time::sleep(CAPACITY_CHECK_INTERVAL).await;
+        }
+    }
+}
+
+fn is_capacity_error(err: &ApifyClientError) -> bool {
+    err.as_api_error()
+        .and_then(|err| err.error_type.as_deref())
+        .is_some_and(|error_type| CAPACITY_ERROR_TYPES.contains(&error_type))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+
+    fn refusal(error_type: &str) -> ApifyClientError {
+        ApifyClientError::Api(Box::new(apify_client::ApiError {
+            status_code: 402,
+            error_type: Some(error_type.to_owned()),
+            message: error_type.to_owned(),
+            attempt: 1,
+            http_method: Some("POST".to_owned()),
+            path: Some("/v2/acts/user~a/runs".to_owned()),
+            data: None,
+        }))
+    }
+
+    fn run(id: &str) -> ActorRun {
+        serde_json::from_value(serde_json::json!({ "id": id, "actId": "a", "status": "READY" })).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_refused_for_capacity_is_retried_after_the_cooldown() {
+        let queue = CapacityQueue::default();
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = queue
+            .start(|| async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(refusal("actor-memory-limit-exceeded")),
+                    1 => Err(refusal("concurrent-runs-limit-exceeded")),
+                    _ => Ok(run("child-1")),
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap().id, "child-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= 2 * CAPACITY_COOLDOWN, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn starts_go_one_at_a_time_and_other_errors_are_not_retried() {
+        let queue = CapacityQueue::default();
+        let (in_flight, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let start = || async {
+            peak.fetch_max(in_flight.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(run("child"))
+        };
+        let (a, b) = tokio::join!(queue.start(start), queue.start(start));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+
+        let calls = AtomicUsize::new(0);
+        let failed = queue
+            .start(|| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(refusal("actor-not-found"))
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_start_goes_out_once_the_run_shuts_down() {
+        let queue = CapacityQueue::default();
+        let calls = AtomicUsize::new(0);
+        let waiting = queue.start(|| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(refusal("actor-memory-limit-exceeded"))
+        });
+        let close = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            queue.close();
+        };
+        let (result, ()) = tokio::join!(waiting, close);
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn the_checksum_ignores_key_order_and_an_absent_input() {

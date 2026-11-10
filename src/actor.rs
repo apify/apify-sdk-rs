@@ -799,8 +799,9 @@ impl Actor {
     }
 
     /// Pushes items to the default dataset and charges each of `events` for each item, as many
-    /// items as the budget allows for all of them. `event_charge_limit_reached` is set when the
-    /// budget allows no more of one of the events.
+    /// items as the budget allows for all of them. An event listed `n` times is charged `n` times
+    /// for each item, with one call. `event_charge_limit_reached` is set when the budget allows no
+    /// more of one of the events.
     pub async fn push_data_and_charge_events<T: serde::Serialize + ?Sized>(
         data: &T,
         events: &[&str],

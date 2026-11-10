@@ -48,7 +48,8 @@ pub enum OnInvalidItems {
 pub struct PushOptions {
     /// The events to charge for each item, as
     /// [`Actor::push_data_and_charge_events`](crate::Actor::push_data_and_charge_events) charges
-    /// them.
+    /// them. An event listed `n` times is charged `n` times for each item, as an add-on priced by
+    /// the item's parts is.
     pub charge_events: Vec<String>,
     pub on_invalid_items: OnInvalidItems,
 }

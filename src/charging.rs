@@ -488,7 +488,7 @@ impl ChargingManager {
     }
 
     /// Reserves the charges of as many of `items_count` items as the budget allows, each charged
-    /// one of every event of `events`, plus the default dataset item event if
+    /// one of every event of `events` (an event listed twice, twice), plus the default dataset item event if
     /// `is_default_dataset`. Returns how many items to store. All the charges are counted at
     /// once, so that concurrent pushes cannot together spend more than the budget.
     pub(crate) fn reserve_items(&self, items_count: usize, events: &[&str], is_default_dataset: bool) -> usize {
@@ -523,8 +523,13 @@ impl ChargingManager {
         if !self.is_pay_per_event() || items_count == 0 {
             return Ok(());
         }
+        // An event listed more than once goes in one call, as many times per item.
+        let mut counts: IndexMap<&str, u64> = IndexMap::new();
         for event in Self::item_events(events, is_default_dataset) {
-            self.send_charge(event, items_count as u64, None).await?;
+            *counts.entry(event).or_default() += items_count as u64;
+        }
+        for (event, count) in counts {
+            self.send_charge(event, count, None).await?;
         }
         Ok(())
     }

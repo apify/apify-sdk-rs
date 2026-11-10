@@ -375,6 +375,40 @@ async fn pay_per_event_charges_stay_within_the_budget() {
 }
 
 #[tokio::test]
+async fn an_event_listed_more_than_once_is_charged_as_many_times_per_item() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "post": { "eventTitle": "Post", "eventPriceUsd": 1.0 },
+        "comment": { "eventTitle": "Comment", "eventPriceUsd": 0.1 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("ppe-counts", &vars, dir.path()).await, 0);
+
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 3);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    // One call per event, for all the items of the push.
+    assert_eq!(
+        charges,
+        [
+            json!({ "eventName": "post", "count": 2 }),
+            json!({ "eventName": "comment", "count": 6 }),
+            json!({ "eventName": "post", "count": 1 }),
+            json!({ "eventName": "comment", "count": 3 }),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_caller() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -642,14 +676,54 @@ async fn a_status_message_set_after_a_crawler_one_is_the_last() {
     assert_eq!(messages.last().map(String::as_str), Some("Scraper finished"), "{messages:?}");
 }
 
+#[tokio::test]
+async fn the_log_keeps_the_debug_lines_of_the_start_until_its_level_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("log", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = ["made at the start", "an info line", "a debug line", "a warning"]
+        .into_iter()
+        .filter(|line| stdout.contains(line))
+        .collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    // The kept lines are logged when the level is set, before the debug lines after it.
+    let position = |line: &str| stdout.find(line).unwrap();
+    assert!(position("an info line") < position("made at the start"), "{stdout}");
+    assert!(position("made at the start") < position("a debug line"), "{stdout}");
+    assert!(!stdout.contains("of a crate underneath"), "{stdout}");
+    assert!(!stdout.contains("at warning level"), "{stdout}");
+
+    // A level set by the environment is kept, and nothing is kept at the start.
+    let output = run_child("log", &[("APIFY_LOG_LEVEL", "WARNING".to_owned())], dir.path()).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("an info line") && !stdout.contains("made at the start"), "{stdout}");
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
     let Ok(scenario) = std::env::var(SCENARIO) else { return };
-    tracing_subscriber::fmt().with_writer(std::io::stdout).init();
+    if scenario == "log" {
+        let options = apify::log::LogOptions { crates: vec!["my_actor".to_owned()], buffer_startup_debug: true };
+        apify::log::init(options).unwrap();
+    } else {
+        tracing_subscriber::fmt().with_writer(std::io::stdout).init();
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
         match scenario.as_str() {
+            "log" => {
+                tracing::debug!(target: "apify::client", "made at the start");
+                tracing::debug!(target: "hyper", "of a crate underneath");
+                tracing::info!(target: "my_actor", "an info line");
+                apify::log::set_level(apify::log::LogLevel::Debug);
+                tracing::debug!(target: "my_actor", "a debug line");
+                apify::log::set_level(apify::log::LogLevel::Warning);
+                tracing::info!(target: "my_actor", "an info line at warning level");
+                tracing::warn!(target: "my_actor", "a warning");
+                std::process::exit(0);
+            }
             "echo" => {
                 let exit = apify::ExitOptions::message("Echoed");
                 Actor::main_with(apify::InitOptions::default(), exit, || async move {
@@ -746,6 +820,29 @@ fn child() {
                     let result = Actor::push_data_and_charge(&items[..3], "page").await?;
                     assert_eq!(result.charged_count, 0);
                     assert!(Actor::push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-counts" => {
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    // A post with 3 comments: 1.8 USD with the dataset item.
+                    let events = ["post", "comment", "comment", "comment"];
+                    let items: Vec<Value> = (0..3).map(|n| json!({ "n": n })).collect();
+                    let result = Actor::push_data_and_charge_events(&items[..2], &events).await?;
+                    assert_eq!((result.charged_count, result.event_charge_limit_reached), (2, false));
+                    // 1.4 USD left: one more, over the budget.
+                    let options = apify::PushOptions {
+                        charge_events: events.map(str::to_owned).to_vec(),
+                        ..Default::default()
+                    };
+                    let push = Actor::push_data_buffered_with(&items, &options)?;
+                    assert_eq!(push.charge_result().charged_count, 1);
+                    assert!(push.charge_result().event_charge_limit_reached);
+                    assert_eq!(push.await?.charge.charged_count, 1);
+                    let charging = Actor::charging_manager();
+                    assert_eq!(charging.charged_event_count("comment"), 9);
                     Ok(())
                 })
                 .await

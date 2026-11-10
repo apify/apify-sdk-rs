@@ -80,6 +80,7 @@ input schema. Copy it and `apify push`.
 | **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |
 | **Charging** | Pay-per-event: budget limits, the `apify-default-dataset-item` event charged as items are stored, `push_data_and_charge`, the local charging log |
 | **CPU profile** | With the `cpu-profile` feature (Linux): a sampling profile of every thread (`PROFILE_CPU=1`, or `cpu_profile::start`), saved as a flamegraph and a pprof file to the default key-value store, with the share of each group of crates in the log |
+| **Log** | `log::init`: a `tracing` subscriber at the level of `APIFY_LOG_LEVEL` for the Actor, crawlee-rs and the SDK; `log::set_level` (`log.setLevel`); the debug lines of the start kept until the level is known |
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
 | **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 

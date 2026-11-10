@@ -418,6 +418,10 @@ impl Actor {
         events.on(EventKind::Aborting, |_| async {
             Self::child_run_tracker().abort_runs_with_parent(Self::client()).await
         });
+        // No start waiting for capacity goes out once this run is shutting down.
+        for kind in [EventKind::Aborting, EventKind::Migrating, EventKind::Exit] {
+            events.on(kind, |_| async { Self::child_run_tracker().capacity.close() });
+        }
         {
             let mut listeners = LISTENERS.lock();
             let pending = std::mem::take(&mut listeners.pending);

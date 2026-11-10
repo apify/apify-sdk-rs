@@ -375,6 +375,40 @@ async fn pay_per_event_charges_stay_within_the_budget() {
 }
 
 #[tokio::test]
+async fn an_event_listed_more_than_once_is_charged_as_many_times_per_item() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pricing = json!({ "pricingModel": "PAY_PER_EVENT", "pricingPerEvent": { "actorChargeEvents": {
+        "post": { "eventTitle": "Post", "eventPriceUsd": 1.0 },
+        "comment": { "eventTitle": "Comment", "eventPriceUsd": 0.1 },
+        "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.5 },
+    }}});
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_ACTOR_PRICING_INFO", pricing.to_string()));
+    vars.push(("APIFY_CHARGED_ACTOR_EVENT_COUNTS", "{}".to_owned()));
+    vars.push(("ACTOR_MAX_TOTAL_CHARGE_USD", "5".to_owned()));
+    assert_exit(&run_child("ppe-counts", &vars, dir.path()).await, 0);
+
+    assert_eq!(api.dataset_items(DEFAULT_DATASET).len(), 3);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    // One call per event, for all the items of the push.
+    assert_eq!(
+        charges,
+        [
+            json!({ "eventName": "post", "count": 2 }),
+            json!({ "eventName": "comment", "count": 6 }),
+            json!({ "eventName": "post", "count": 1 }),
+            json!({ "eventName": "comment", "count": 3 }),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn buffered_pushes_are_stored_together_and_invalid_items_go_back_to_their_caller() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -746,6 +780,29 @@ fn child() {
                     let result = Actor::push_data_and_charge(&items[..3], "page").await?;
                     assert_eq!(result.charged_count, 0);
                     assert!(Actor::push_data_and_charge(&items[0], "apify-default-dataset-item").await.is_err());
+                    Ok(())
+                })
+                .await
+            }
+            "ppe-counts" => {
+                let init = apify::InitOptions { unbuffered_first_pushes: 0, ..Default::default() };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    // A post with 3 comments: 1.8 USD with the dataset item.
+                    let events = ["post", "comment", "comment", "comment"];
+                    let items: Vec<Value> = (0..3).map(|n| json!({ "n": n })).collect();
+                    let result = Actor::push_data_and_charge_events(&items[..2], &events).await?;
+                    assert_eq!((result.charged_count, result.event_charge_limit_reached), (2, false));
+                    // 1.4 USD left: one more, over the budget.
+                    let options = apify::PushOptions {
+                        charge_events: events.map(str::to_owned).to_vec(),
+                        ..Default::default()
+                    };
+                    let push = Actor::push_data_buffered_with(&items, &options)?;
+                    assert_eq!(push.charge_result().charged_count, 1);
+                    assert!(push.charge_result().event_charge_limit_reached);
+                    assert_eq!(push.await?.charge.charged_count, 1);
+                    let charging = Actor::charging_manager();
+                    assert_eq!(charging.charged_event_count("comment"), 9);
                     Ok(())
                 })
                 .await

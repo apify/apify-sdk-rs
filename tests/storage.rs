@@ -103,15 +103,18 @@ async fn names_and_aliases_resolve_to_platform_storages() {
 
     // Unless the storage was deleted in the meantime.
     api.delete_dataset(&scratch_id);
-    let fresh = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, true))));
+    let fresh_backend = Arc::new(ApifyStorageBackend::new(configuration(&api, true)));
+    let fresh = Services::new(fresh_backend.clone());
     let recreated = fresh.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
     assert_ne!(recreated.get_info().await.unwrap().id, scratch_id);
 
-    // Also when it was deleted after this process resolved it.
+    // Also when it was deleted after this process resolved it. `Services` hands back the instance it
+    // already opened, as `StorageInstanceManager` does in JS, so ask the backend.
+    use crawlee::core::StorageBackend as _;
     let recreated_id = recreated.get_info().await.unwrap().id;
     api.delete_dataset(&recreated_id);
-    let reopened = fresh.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
-    assert_ne!(reopened.get_info().await.unwrap().id, recreated_id);
+    let reopened = fresh_backend.create_dataset_backend(&StorageIdentifier::alias("scratch")).await.unwrap();
+    assert_ne!(reopened.get_metadata().await.unwrap().id, recreated_id);
 
     // `__default__` is the default storage.
     let default = fresh.open_dataset(&StorageIdentifier::alias("__default__")).await.unwrap();
@@ -166,17 +169,19 @@ async fn aliases_declared_in_the_actor_schema_and_off_the_platform() {
         ..(*configuration(&api, true)).clone()
     }))));
     let replacement = replaced.open_dataset(&StorageIdentifier::alias("products")).await.unwrap();
-    assert_ne!(replacement.get_info().await.unwrap().id, DEFAULT_DATASET);
+    let replacement_id = replacement.get_info().await.unwrap().id;
+    assert_ne!(replacement_id, DEFAULT_DATASET);
 
     // Off the platform (a `force_cloud` storage), aliases are not remembered.
+    let mapping = api.record(DEFAULT_STORE, "__STORAGE_ALIASES_MAPPING");
     let local = Services::new(Arc::new(ApifyStorageBackend::new(configuration(&api, false))));
     local.open_dataset(&StorageIdentifier::alias("scratch")).await.unwrap();
-    assert!(api.record(DEFAULT_STORE, "__STORAGE_ALIASES_MAPPING").is_none());
+    assert_eq!(api.record(DEFAULT_STORE, "__STORAGE_ALIASES_MAPPING"), mapping);
 
     let backend = ApifyStorageBackend::new(configuration(&api, false));
     use crawlee::core::StorageBackend as _;
-    assert!(backend.storage_exists(DEFAULT_DATASET, StorageKind::Dataset).await.unwrap());
-    assert!(!backend.storage_exists("nope", StorageKind::Dataset).await.unwrap());
+    assert!(backend.storage_exists(&replacement_id, StorageKind::Dataset).await.unwrap());
+    assert!(!backend.storage_exists(DEFAULT_DATASET, StorageKind::Dataset).await.unwrap());
 }
 
 #[tokio::test]

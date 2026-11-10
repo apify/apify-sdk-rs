@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets --features cpu-profile
+      - run: cargo test --lib --features cpu-profile cpu_profile
       - run: cargo test
 
   msrv:

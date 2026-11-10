@@ -79,6 +79,7 @@ input schema. Copy it and `apify push`.
 | **Platform API** | `call` (the run's log redirected into this one's), `start`, `call_task`, `start_task`, `resurrect`, `abort`, `metamorph`, `add_webhook`, `set_status_message` (crawler status forwarded), `get_env`, `use_state`; named child runs (`run_name`, `child_runs`) that survive a migration or resurrection |
 | **Proxy** | Apify Proxy (groups, country, password from the account, access check) and custom proxies, for crawlers |
 | **Charging** | Pay-per-event: budget limits, the `apify-default-dataset-item` event charged as items are stored, `push_data_and_charge`, the local charging log |
+| **Log** | `log::init`: a `tracing` subscriber at the level of `APIFY_LOG_LEVEL` for the Actor, crawlee-rs and the SDK; `log::set_level` (`log.setLevel`); the debug lines of the start kept until the level is known |
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
 | **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 

@@ -676,14 +676,54 @@ async fn a_status_message_set_after_a_crawler_one_is_the_last() {
     assert_eq!(messages.last().map(String::as_str), Some("Scraper finished"), "{messages:?}");
 }
 
+#[tokio::test]
+async fn the_log_keeps_the_debug_lines_of_the_start_until_its_level_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("log", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = ["made at the start", "an info line", "a debug line", "a warning"]
+        .into_iter()
+        .filter(|line| stdout.contains(line))
+        .collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    // The kept lines are logged when the level is set, before the debug lines after it.
+    let position = |line: &str| stdout.find(line).unwrap();
+    assert!(position("an info line") < position("made at the start"), "{stdout}");
+    assert!(position("made at the start") < position("a debug line"), "{stdout}");
+    assert!(!stdout.contains("of a crate underneath"), "{stdout}");
+    assert!(!stdout.contains("at warning level"), "{stdout}");
+
+    // A level set by the environment is kept, and nothing is kept at the start.
+    let output = run_child("log", &[("APIFY_LOG_LEVEL", "WARNING".to_owned())], dir.path()).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("an info line") && !stdout.contains("made at the start"), "{stdout}");
+}
+
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
 #[test]
 fn child() {
     let Ok(scenario) = std::env::var(SCENARIO) else { return };
-    tracing_subscriber::fmt().with_writer(std::io::stdout).init();
+    if scenario == "log" {
+        let options = apify::log::LogOptions { crates: vec!["my_actor".to_owned()], buffer_startup_debug: true };
+        apify::log::init(options).unwrap();
+    } else {
+        tracing_subscriber::fmt().with_writer(std::io::stdout).init();
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
         match scenario.as_str() {
+            "log" => {
+                tracing::debug!(target: "apify::client", "made at the start");
+                tracing::debug!(target: "hyper", "of a crate underneath");
+                tracing::info!(target: "my_actor", "an info line");
+                apify::log::set_level(apify::log::LogLevel::Debug);
+                tracing::debug!(target: "my_actor", "a debug line");
+                apify::log::set_level(apify::log::LogLevel::Warning);
+                tracing::info!(target: "my_actor", "an info line at warning level");
+                tracing::warn!(target: "my_actor", "a warning");
+                std::process::exit(0);
+            }
             "echo" => {
                 let exit = apify::ExitOptions::message("Echoed");
                 Actor::main_with(apify::InitOptions::default(), exit, || async move {

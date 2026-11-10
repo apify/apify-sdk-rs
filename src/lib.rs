@@ -11,6 +11,7 @@ pub mod configuration;
 pub mod events;
 pub mod input;
 pub mod input_secrets;
+pub mod log;
 pub mod platform;
 pub mod proxy;
 pub mod push_buffer;

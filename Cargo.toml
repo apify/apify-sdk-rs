@@ -21,6 +21,7 @@ aes-gcm = "0.10"
 anyhow = "1"
 async-trait = "0.1"
 aws-lc-rs = "1"
+backtrace = { version = "0.3", optional = true }
 base64 = "0.22"
 bytes = "1"
 cbc = "0.1"
@@ -30,6 +31,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 indexmap = "2"
 lru = "0.16"
 md-5 = "0.10"
+pprof = { version = "0.15", default-features = false, features = ["flamegraph", "framehop-unwinder", "prost-codec"], optional = true }
 parking_lot = "0.12"
 rand = "0.9"
 regex = "1"
@@ -43,6 +45,10 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+[features]
+# A sampling CPU profile of the run, saved to the default key-value store (`cpu_profile`, Linux).
+cpu-profile = ["dep:pprof", "dep:backtrace"]
 
 [dev-dependencies]
 axum = "0.8"

@@ -8,6 +8,8 @@ pub mod charging;
 pub mod child_runs;
 pub mod client;
 pub mod configuration;
+#[cfg(feature = "cpu-profile")]
+pub mod cpu_profile;
 pub mod events;
 pub mod input;
 pub mod input_secrets;

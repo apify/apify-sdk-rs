@@ -10,10 +10,11 @@ These differences exist to make runs cheaper or faster.
 
 - **The API clients share one HTTP client.** Every API client of the SDK (the Actor's, the
   storages', those of `Actor::new_client`) sends its requests through the same connection pool.
-- **API request bodies are compressed at brotli quality 1.** Every API client of the SDK compresses
-  its request bodies of at least 1 KiB at quality 1, where the JS client uses 6: about 5x faster on
-  dataset items, for bodies about 14% larger. `Configuration::api_brotli_quality` sets another
-  quality (0 to 11).
+- **API request bodies are compressed with zstd at level 1.** Every API client of the SDK compresses
+  its request bodies of at least 1 KiB with zstd at level 1, where the JS client uses brotli at
+  quality 6. On dataset items, zstd 1 is about 2.5x faster than brotli 1, for bodies about 6%
+  smaller. The API serves what it stores decoded to readers that don't accept zstd.
+  `Configuration::api_zstd_level` sets another level (1 to 19).
 
 ### Fewer API calls
 

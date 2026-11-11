@@ -14,7 +14,7 @@ publish = false
 crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "2a3ed90" }
 # The client's own transport (reqwest 0.12) is compiled without TLS and not used: requests go through
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
-apify-client = { version = "=0.15.0", default-features = false }
+apify-client = { version = "=0.17.0", default-features = false, features = ["zstd"] }
 
 aes = "0.8"
 aes-gcm = "0.10"
@@ -56,7 +56,9 @@ tempfile = "3"
 # Paused time in tests.
 tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-tower-http = { version = "0.6", features = ["decompression-br", "decompression-gzip"] }
+tower-http = { version = "0.6", features = ["decompression-br", "decompression-gzip", "decompression-zstd"] }
+# Decodes the request bodies the client compresses.
+zstd = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"

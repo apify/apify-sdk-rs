@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use apify_client::http_client::{HttpBackend, HttpMethod, HttpRequest, HttpResponse};
 use apify_client::timeouts::NO_TIMEOUT;
-use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult, BrotliHttpCompressor};
+use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult, ZstdHttpCompressor};
 use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -112,6 +112,9 @@ struct UniqueKey {
 #[derive(Clone, Debug)]
 pub struct ReqwestBackend {
     client: reqwest::Client,
+    /// Sends the requests that must not follow redirects (`HttpRequest::follow_redirects`): a
+    /// reqwest client fixes its redirect policy when it is built.
+    no_redirect_client: reqwest::Client,
     rate_limits: RateLimitCounter,
     attempts: Arc<Attempts>,
 }
@@ -124,8 +127,18 @@ impl ReqwestBackend {
         ReqwestBackend::with_client(SHARED.get_or_init(reqwest::Client::new).clone(), rate_limits)
     }
 
+    /// A backend on `client`, and on a client of the same defaults that follows no redirects.
     pub fn with_client(client: reqwest::Client, rate_limits: RateLimitCounter) -> Self {
-        ReqwestBackend { client, rate_limits, attempts: Arc::default() }
+        static NO_REDIRECTS: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let no_redirect_client = NO_REDIRECTS
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("a reqwest client with the default settings builds")
+            })
+            .clone();
+        ReqwestBackend { client, no_redirect_client, rate_limits, attempts: Arc::default() }
     }
 
     /// The client retries a batch add with the requests left unprocessed, and counts each try
@@ -172,6 +185,9 @@ impl HttpBackend for ReqwestBackend {
             HttpMethod::Put => reqwest::Method::PUT,
             HttpMethod::Delete => reqwest::Method::DELETE,
             HttpMethod::Head => reqwest::Method::HEAD,
+            HttpMethod::Patch => reqwest::Method::PATCH,
+            HttpMethod::Options => reqwest::Method::OPTIONS,
+            HttpMethod::Trace => reqwest::Method::TRACE,
         };
         let call = self.attempts.call_key(&request);
         let attempt = {
@@ -184,7 +200,8 @@ impl HttpBackend for ReqwestBackend {
         let is_batch_add = request.method == HttpMethod::Post
             && request.url.split('?').next().is_some_and(|path| path.ends_with("/requests/batch"));
 
-        let mut builder = self.client.request(method, &request.url);
+        let client = if request.follow_redirects { &self.client } else { &self.no_redirect_client };
+        let mut builder = client.request(method, &request.url);
         // A request without a timeout (a start, or a wait for a run) may run as long as it takes.
         if request.timeout != NO_TIMEOUT {
             builder = builder.timeout(request.timeout);
@@ -270,9 +287,9 @@ pub fn new_client(configuration: &Configuration, token: Option<&str>, rate_limit
     if let Some(token) = token.or(configuration.token.as_deref()) {
         builder = builder.token(token);
     }
-    match BrotliHttpCompressor::new(configuration.api_brotli_quality) {
+    match ZstdHttpCompressor::new(configuration.api_zstd_level) {
         Ok(compressor) => builder = builder.http_compressor(Arc::new(compressor)),
-        Err(err) => tracing::warn!("Keeping the API client's brotli quality for its requests: {err}"),
+        Err(err) => tracing::warn!("Keeping the API client's own compression for its requests: {err}"),
     }
     builder.build()
 }
@@ -349,19 +366,21 @@ mod tests {
             .build()
     }
 
-    /// The size of the body of a large dataset push of a client of `configuration`, as it reaches
-    /// the API.
-    async fn pushed_body_size(configuration: Configuration) -> usize {
-        let size = Arc::new(AtomicU64::new(0));
-        let seen = size.clone();
+    /// The `Content-Encoding` and body of a large dataset push of a client of `configuration`, as
+    /// it reaches the API, and the items it pushed, serialized.
+    async fn pushed_body(configuration: Configuration) -> (String, Vec<u8>, Vec<u8>) {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
         let app = Router::new().route(
             "/v2/datasets/{id}/items",
-            post(move |headers: HeaderMap, body: Bytes| {
+            post({
                 let seen = seen.clone();
-                async move {
-                    assert_eq!(headers["content-encoding"], "br");
-                    seen.store(body.len() as u64, Ordering::SeqCst);
-                    (StatusCode::CREATED, String::new())
+                move |headers: HeaderMap, body: Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        let encoding = headers["content-encoding"].to_str().unwrap().to_owned();
+                        *seen.lock() = Some((encoding, body.to_vec()));
+                        (StatusCode::CREATED, String::new())
+                    }
                 }
             }),
         );
@@ -375,21 +394,43 @@ mod tests {
             .map(|index| json!({ "id": index, "caption": format!("caption {index} of a post"), "likes": index * 7 }))
             .collect();
         client.dataset("abc").push_items(&items).await.unwrap();
-        size.load(Ordering::SeqCst) as usize
+        let (encoding, body) = seen.lock().take().unwrap();
+        (encoding, body, serde_json::to_vec(&items).unwrap())
     }
 
     #[tokio::test]
-    async fn request_bodies_are_compressed_at_the_configured_brotli_quality() {
-        let fast = pushed_body_size(Configuration::default()).await;
-        let client_default =
-            pushed_body_size(Configuration { api_brotli_quality: 6, ..Configuration::default() }).await;
-        assert!(
-            fast > client_default,
-            "quality 1 by default, which compresses less than the client's 6: {fast} vs {client_default} bytes"
-        );
-        // An invalid quality keeps the client's own (6).
-        let invalid = pushed_body_size(Configuration { api_brotli_quality: 12, ..Configuration::default() }).await;
-        assert_eq!(invalid, client_default);
+    async fn request_bodies_are_compressed_with_zstd_at_the_configured_level() {
+        for (level, configuration) in
+            [(1, Configuration::default()), (19, Configuration { api_zstd_level: 19, ..Configuration::default() })]
+        {
+            let (encoding, body, json) = pushed_body(configuration).await;
+            assert_eq!(encoding, "zstd");
+            assert_eq!(zstd::decode_all(body.as_slice()).unwrap(), json, "level {level} decodes to the items");
+            assert_eq!(body, zstd::bulk::compress(&json, level).unwrap(), "compressed at level {level}");
+        }
+        // An invalid level keeps the client's own compression (brotli).
+        let (encoding, _, _) = pushed_body(Configuration { api_zstd_level: 20, ..Configuration::default() }).await;
+        assert_eq!(encoding, "br");
+    }
+
+    #[tokio::test]
+    async fn requests_that_must_not_follow_redirects_get_the_redirect() {
+        let app = Router::new()
+            .route("/from", get(|| async { (StatusCode::FOUND, [("location", "/to")], String::new()) }))
+            .route("/to", get(|| async { "followed" }));
+        let base = serve(app).await;
+        let backend = ReqwestBackend::new(RateLimitCounter::default());
+        let request = |follow_redirects| HttpRequest {
+            method: HttpMethod::Get,
+            url: format!("{base}/from"),
+            headers: HashMap::new(),
+            body: None,
+            timeout: std::time::Duration::from_secs(5),
+            follow_redirects,
+        };
+        assert_eq!(backend.send(request(false)).await.unwrap().status, 302);
+        let followed = backend.send(request(true)).await.unwrap();
+        assert_eq!((followed.status, followed.body.as_slice()), (200, b"followed".as_slice()));
     }
 
     async fn serve(app: Router) -> String {

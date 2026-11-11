@@ -23,11 +23,12 @@ pub struct Configuration {
     pub api_base_url: String,
     /// `APIFY_API_PUBLIC_BASE_URL`, default `https://api.apify.com`.
     pub api_public_base_url: String,
-    /// The brotli quality (0 to 11) at which the API clients compress the bodies of their requests
-    /// (those of at least 1 KiB). 1 by default, where the JS client uses 6: quality 1 is about 5x
-    /// faster than 6 on dataset items, for bodies about 14% larger. Set in code only, with no
-    /// variable (no JS counterpart).
-    pub api_brotli_quality: u32,
+    /// The zstd level (1 to 19) at which the API clients compress the bodies of their requests
+    /// (those of at least 1 KiB). 1 by default, where the JS client uses brotli at quality 6: on
+    /// dataset items, zstd 1 is about 2.5x faster than brotli 1, for bodies about 6% smaller. An
+    /// invalid level keeps the API client's own compression. Set in code only, with no variable
+    /// (no JS counterpart).
+    pub api_zstd_level: u32,
     /// `ACTOR_DEFAULT_DATASET_ID`, `APIFY_DEFAULT_DATASET_ID`, default `default`.
     pub default_dataset_id: String,
     /// `ACTOR_DEFAULT_KEY_VALUE_STORE_ID`, `APIFY_DEFAULT_KEY_VALUE_STORE_ID`, default `default`.
@@ -202,7 +203,7 @@ impl Configuration {
                 "apiPublicBaseUrl",
                 "https://api.apify.com",
             ),
-            api_brotli_quality: 1,
+            api_zstd_level: 1,
             default_dataset_id: sources.string_or(
                 &["ACTOR_DEFAULT_DATASET_ID", "APIFY_DEFAULT_DATASET_ID"],
                 "defaultDatasetId",

@@ -85,6 +85,10 @@ struct Data {
     run_logs: HashMap<String, String>,
     /// The `idempotency-key` headers of charges, in order.
     charge_idempotency_keys: Vec<Option<String>>,
+    /// Runs the API answers 404 for, as if removed.
+    removed_runs: std::collections::HashSet<String>,
+    /// Statuses a run's next GETs return, one per GET, the last one kept.
+    run_status_sequences: HashMap<String, std::collections::VecDeque<String>>,
 }
 
 impl Data {
@@ -254,6 +258,17 @@ impl FakeApi {
     /// Sets the status of a run started through the API.
     pub fn set_run_status(&self, id: &str, status: &str) {
         self.shared.data.lock().runs.get_mut(id).expect("a started run")["status"] = json!(status);
+    }
+
+    /// Makes the API answer 404 for a run, as if it was removed.
+    pub fn remove_run(&self, id: &str) {
+        self.shared.data.lock().removed_runs.insert(id.to_owned());
+    }
+
+    /// Makes the next GETs of a run return `statuses`, one per GET, the last one from then on.
+    pub fn set_run_statuses(&self, id: &str, statuses: &[&str]) {
+        let statuses = statuses.iter().map(|status| (*status).to_owned()).collect();
+        self.shared.data.lock().run_status_sequences.insert(id.to_owned(), statuses);
     }
 
     pub fn run_updates(&self) -> Vec<Value> {
@@ -788,7 +803,18 @@ async fn get_actor(Path(id): Path<String>) -> Response {
 }
 
 async fn get_run(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
-    let run = shared.data.lock().runs.get(&id).cloned();
+    let mut data = shared.data.lock();
+    if data.removed_runs.contains(&id) {
+        return not_found();
+    }
+    let next_status = data
+        .run_status_sequences
+        .get_mut(&id)
+        .and_then(|statuses| if statuses.len() > 1 { statuses.pop_front() } else { statuses.front().cloned() });
+    if let (Some(status), Some(run)) = (next_status, data.runs.get_mut(&id)) {
+        run["status"] = json!(status);
+    }
+    let run = data.runs.get(&id).cloned();
     envelope(StatusCode::OK, run.unwrap_or_else(|| json!({ "id": id, "status": "SUCCEEDED" })))
 }
 

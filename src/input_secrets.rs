@@ -297,6 +297,41 @@ mod tests {
         assert!(err.to_string().starts_with("The input field \"secret\" could not be decrypted."), "{err}");
     }
 
+    /// The key of the fixture in other PEM formats (see `tests/fixtures/input_secrets_key_formats.json`).
+    fn key_formats() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/input_secrets_key_formats.json")).unwrap()
+    }
+
+    #[test]
+    fn the_same_key_decrypts_the_values_in_every_supported_format() {
+        let fixture = fixture();
+        let formats = key_formats();
+        for format in ["pkcs1", "pkcs1Aes256Cbc", "pkcs1Aes128Cbc", "pkcs8"] {
+            let key = InputSecretsKey::from_base64_pem(formats[format].as_str().unwrap(), "pwd1234")
+                .unwrap_or_else(|err| panic!("{format}: {err}"));
+            let encrypted = fixture["encrypted"].as_object().unwrap().clone();
+            let decrypted = decrypt_input_secrets(encrypted, &key).unwrap();
+            assert_eq!(Value::Object(decrypted), fixture["decrypted"], "{format}");
+        }
+    }
+
+    #[test]
+    fn an_aes_encrypted_key_with_a_wrong_passphrase_fails() {
+        let formats = key_formats();
+        for format in ["pkcs1Aes256Cbc", "pkcs1Aes128Cbc"] {
+            assert!(InputSecretsKey::from_base64_pem(formats[format].as_str().unwrap(), "wrong").is_err(), "{format}");
+        }
+    }
+
+    /// An encrypted PKCS#8 key (`ENCRYPTED PRIVATE KEY`) is refused with its type, where Node's
+    /// `createPrivateKey` would decrypt it. The platform sends legacy encrypted PKCS#1 keys.
+    #[test]
+    fn an_encrypted_pkcs8_key_is_refused_with_its_type() {
+        let file = key_formats()["encryptedPkcs8"].as_str().unwrap().to_owned();
+        let err = InputSecretsKey::from_base64_pem(&file, "pwd1234").unwrap_err();
+        assert_eq!(err.to_string(), "unsupported private key type ENCRYPTED PRIVATE KEY");
+    }
+
     #[test]
     fn only_encrypted_values_are_touched() {
         assert!(parse_encrypted("ENCRYPTED_VALUE:abc=:def").is_some());

@@ -161,6 +161,52 @@ async fn named_child_runs_are_reused_resurrected_or_replaced_after_a_restart() {
     );
 }
 
+/// The tracked runs of the `child-runs` scenario, after a first run of it.
+async fn started_child_runs(api: &FakeApi, dir: &Path) -> Vec<(&'static str, String)> {
+    let vars = platform_env(api, None);
+    let output = run_child("child-runs", &vars, dir).await;
+    assert_exit(&output, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("RUNS child-1 child-2 child-3"));
+    vars
+}
+
+#[tokio::test]
+async fn a_tracked_run_the_api_no_longer_returns_is_replaced_and_kept_as_lost() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let vars = started_child_runs(&api, dir.path()).await;
+
+    api.remove_run("child-1");
+    api.clear_calls();
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-4 child-2 child-3"), "{stdout}");
+    // A run started moments ago may not be on every API replica yet: the 404 is retried first.
+    assert_eq!(api.count_calls("GET /v2/actor-runs/child-1"), 13);
+    let (stored, _) = api.record(DEFAULT_STORE, "__ACTOR_CHILD_RUNS").unwrap();
+    let stored: Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(stored["a"]["runId"], "child-4");
+    assert_eq!(stored["a"]["history"][0]["runId"], "child-1");
+    assert_eq!(stored["a"]["history"][0]["status"], "LOST");
+}
+
+#[tokio::test]
+async fn a_tracked_run_still_aborting_or_timing_out_is_waited_for_and_resurrected() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let vars = started_child_runs(&api, dir.path()).await;
+
+    api.set_run_statuses("child-1", &["ABORTING", "ABORTING", "ABORTED"]);
+    api.set_run_statuses("child-3", &["TIMING-OUT", "TIMED-OUT"]);
+    let output = run_child("child-runs", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RUNS child-1 child-2 child-3"), "{stdout}");
+    let calls: Vec<String> = api.platform_calls().into_iter().map(|(path, _, _)| path).collect();
+    assert_eq!(calls[3..], ["/v2/actor-runs/child-1/resurrect", "/v2/actor-runs/child-3/resurrect"]);
+}
+
 #[tokio::test]
 async fn the_actor_panics_before_init() {
     let dir = tempfile::tempdir().unwrap();

@@ -93,3 +93,38 @@ async fn no_access_is_an_error_on_the_platform_and_no_proxy_locally() {
     let unchecked = ProxyConfigurationOptions { check_access: Some(false), ..options() };
     assert!(ProxyConfiguration::new(&local, &client, unchecked).await.unwrap().is_some());
 }
+
+/// A proxy whose status page answers with `status` only after `delay`.
+async fn serve_slow_proxy(delay: std::time::Duration, status: axum::http::StatusCode) -> u16 {
+    let app = Router::new().fallback(get(move || async move {
+        tokio::time::sleep(delay).await;
+        (status, axum::Json(serde_json::json!({ "connected": false, "connectionError": "too late" })))
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+/// The status page not answering in time counts as access, on the platform too, as in JS
+/// (`checkAccess` warns about 407s and goes on). Real time: two attempts of 4 s each.
+#[tokio::test]
+async fn a_status_page_that_times_out_counts_as_access() {
+    let api = FakeApi::start().await;
+    let port = serve_slow_proxy(std::time::Duration::from_secs(30), axum::http::StatusCode::OK).await;
+    let configuration = configuration(&api, port, true);
+    let client = apify::new_client(&configuration, None, Default::default());
+    let options = ProxyConfigurationOptions { password: Some("pw".to_owned()), ..Default::default() };
+    assert!(ProxyConfiguration::new(&configuration, &client, options).await.unwrap().is_some());
+}
+
+/// A status page that keeps failing is not an answer either, so it counts as access too.
+#[tokio::test]
+async fn a_failing_status_page_counts_as_access() {
+    let api = FakeApi::start().await;
+    let port = serve_slow_proxy(std::time::Duration::ZERO, axum::http::StatusCode::BAD_GATEWAY).await;
+    let configuration = configuration(&api, port, true);
+    let client = apify::new_client(&configuration, None, Default::default());
+    let options = ProxyConfigurationOptions { password: Some("pw".to_owned()), ..Default::default() };
+    assert!(ProxyConfiguration::new(&configuration, &client, options).await.unwrap().is_some());
+}

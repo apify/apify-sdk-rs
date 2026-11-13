@@ -470,6 +470,77 @@ mod tests {
         serde_json::from_value(serde_json::json!({ "id": id, "actId": "a", "status": "READY" })).unwrap()
     }
 
+    fn tracker() -> ChildRunTracker {
+        ChildRunTracker::new(Services::new(Arc::new(crawlee::core::MemoryStorageBackend::new())))
+    }
+
+    fn request(id: &str) -> ChildRunRequest {
+        ChildRunRequest { kind: "actor", id: id.to_owned(), input: None }
+    }
+
+    /// A client of an API that never answers.
+    async fn client_of_a_silent_api() -> ApifyClient {
+        let app = axum::Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            ""
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ApifyClient::builder().base_url(url).token("t").build()
+    }
+
+    #[tokio::test]
+    async fn once_the_parent_is_aborting_only_runs_without_abort_with_parent_start() {
+        let tracker = tracker();
+        let client = ApifyClient::builder().base_url("http://127.0.0.1:9").token("t").build();
+        tracker.abort_runs_with_parent(&client).await;
+
+        let starts = AtomicUsize::new(0);
+        let start = || async {
+            starts.fetch_add(1, Ordering::SeqCst);
+            Ok(run("r1"))
+        };
+        let refused = tracker
+            .start_or_resume(&client, "a", request("user/a"), Default::default(), true, start)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            ApifyClientError::InvalidArgument(
+                "Child run \"a\" with `abort_with_parent` was not started, because this run is being aborted."
+                    .to_owned()
+            )
+            .to_string()
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+        let (started, resumed) =
+            tracker.start_or_resume(&client, "b", request("user/b"), Default::default(), false, start).await.unwrap();
+        assert_eq!((started.id.as_str(), resumed), ("r1", false));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Real time: the API of the run to abort never answers, and the abort gives up after
+    /// `ABORT_WITH_PARENT_TIMEOUT` so that `Actor::exit` keeps time for the rest of its work.
+    #[tokio::test]
+    async fn aborting_the_child_runs_with_the_parent_gives_up_after_its_timeout() {
+        let tracker = tracker();
+        let client = client_of_a_silent_api().await;
+        tracker
+            .start_or_resume(&client, "a", request("user/a"), Default::default(), true, || async { Ok(run("r1")) })
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        tracker.abort_runs_with_parent(&client).await;
+        let took = started.elapsed();
+        assert!(
+            took >= ABORT_WITH_PARENT_TIMEOUT && took < ABORT_WITH_PARENT_TIMEOUT + Duration::from_secs(3),
+            "{took:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_start_refused_for_capacity_is_retried_after_the_cooldown() {
         let queue = CapacityQueue::default();

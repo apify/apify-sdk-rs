@@ -26,10 +26,9 @@ use crate::child_runs::ChildRunTracker;
 use crate::client::{RateLimitCounter, new_client};
 use crate::configuration::Configuration;
 use crate::input::{ActorInputError, ActorInputErrorCode, Input, InputSchema};
+use crate::push::{PushError, PushOptions, PushResult};
 use crate::push_buffer::{BufferedPush, PushBuffer};
-use crate::schema_validation::{
-    Entry, PushError, PushOptions, PushResult, Rejected, charge_of_stored, store_validated,
-};
+use crate::schema_validation::{Entry, Rejected, charge_of_stored, store_validated};
 use crate::storage::{ApifyStorageBackend, RequestQueueAccess, SmartStorageBackend};
 
 /// Exit codes of an Actor run (`EXIT_CODES` in `@apify/consts`).
@@ -936,9 +935,13 @@ impl Actor {
         data: &T,
         events: &[&str],
     ) -> Result<ChargeResult, ChargingError> {
-        // Serialized once, straight from `data`: the items are not built as a `Value` tree first.
-        let mut items = serialize_items(data)?;
+        // Opened first, so that a failure to open it leaves no charges reserved.
         let dataset = state().services.open_dataset(&StorageIdentifier::Default).await?;
+        let options = PushOptions {
+            charge_events: events.iter().map(|event| (*event).to_owned()).collect(),
+            ..Default::default()
+        };
+        let (items, _, is_default_dataset, charge) = Self::reserve_push(data, &options)?;
         let charging = &state().charging;
         if !charging.is_pay_per_event() {
             let count = items.len() as u64;
@@ -948,39 +951,18 @@ impl Actor {
             for event in events {
                 result = Some(charging.charge(ChargeOptions::new(*event, count)).await?);
             }
-            return Ok(result.unwrap_or_else(|| ChargeResult {
-                event_charge_limit_reached: false,
-                charged_count: 0,
-                chargeable_within_limit: charging.chargeable_within_limit(),
-            }));
+            return Ok(result.unwrap_or(charge));
         }
-        // Storing an item also charges the per-item event when the dataset is the Actor's own.
-        let is_default_dataset = state().smart.is_some();
-        let limit = charging.reserve_items(items.len(), events, is_default_dataset);
-        if limit == 0 {
-            return Ok(ChargeResult {
-                event_charge_limit_reached: !items.is_empty(),
-                charged_count: 0,
-                chargeable_within_limit: charging.chargeable_within_limit(),
-            });
+        if items.is_empty() {
+            return Ok(charge);
         }
-        items.truncate(limit);
+        let stored = items.len();
         if let Err(err) = ChargingManager::with_items_reserved(dataset.push_items(items)).await {
-            charging.unreserve_items(events, is_default_dataset, limit);
+            charging.unreserve_items(events, is_default_dataset, stored);
             return Err(err.into());
         }
-        charging.send_item_charges(events, is_default_dataset, limit).await?;
-        let reached = if events.is_empty() {
-            charging.is_event_charge_limit_reached(DEFAULT_DATASET_ITEM_EVENT)
-        } else {
-            events.iter().any(|event| charging.is_event_charge_limit_reached(event))
-        };
-        Ok(ChargeResult {
-            event_charge_limit_reached: reached,
-            // Without the default dataset item event, `push_data` charges nothing.
-            charged_count: if events.is_empty() && !is_default_dataset { 0 } else { limit as u64 },
-            chargeable_within_limit: charging.chargeable_within_limit(),
-        })
+        charging.send_item_charges(events, is_default_dataset, stored).await?;
+        Ok(charge)
     }
 
     /// A value of the default key-value store.

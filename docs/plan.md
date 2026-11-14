@@ -123,10 +123,10 @@ The crawlee-rs changes 1 to 3 above are done (`EventManager::stop_periodic_persi
 
 | Milestone | State |
 |---|---|
-| M1: runs real Actors | Done. Verified locally and against the fake API; not yet run on the platform |
+| M1: runs real Actors | Done. Runs Actors on the platform (the Instagram Actors of instagram-rs) |
 | M2: platform API | Done, including shared request queues |
 | M3: monetization and input | Done: pay-per-event charging, input secrets, pseudo-URL filters |
-| M4: hardening | Golden tests against the JS SDK, live and e2e harnesses, CI and docs done. The live and e2e suites wait for an Apify token (`APIFY_TOKEN` secret in CI). Not published |
+| M4: hardening | Golden tests against the JS SDK, live and e2e harnesses, CI and docs done. The live suite runs on pushes to `master`, the e2e suite when started by hand. Not published |
 
 Changes made to crawlee-rs for the SDK: `Event::Custom`, `EventManager::stop_periodic_persist_state`,
 `Services::is_global_set`, a public `Configuration::from_sources`, `crawlee::VERSION`, and input

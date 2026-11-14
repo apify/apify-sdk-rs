@@ -261,6 +261,49 @@ mod tests {
         assert_eq!(*seen.lock(), [Event::Aborting]);
     }
 
+    /// A random delay of up to 5 s, then from 3.1 s growing by 1.618, up to 90 s.
+    #[test]
+    fn reconnection_delays_back_off_up_to_90_seconds() {
+        let mut backoff = Backoff::default();
+        assert!(backoff.next() < Duration::from_secs(5));
+        let millis: Vec<u128> = (0..12).map(|_| backoff.next().as_millis()).collect();
+        assert_eq!(millis, [3100, 5015, 8115, 13130, 21245, 34375, 55620, 89993, 90000, 90000, 90000, 90000]);
+    }
+
+    /// A connection that cannot be reopened at once is retried until the platform is back.
+    #[tokio::test]
+    async fn a_connection_is_reopened_once_the_platform_is_back() {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let close = |code: CloseCode| Some(CloseFrame { code, reason: "".into() });
+        tokio::spawn(async move {
+            // The platform goes away for 300 ms, then delivers an event and closes for good.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.close(close(CloseCode::Away)).await.unwrap();
+            drop(listener);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::text(r#"{"name":"aborting","data":null}"#)).await.unwrap();
+            socket.close(close(CloseCode::Policy)).await.unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+
+        let events = EventManager::new(Duration::from_secs(60));
+        let seen = recorder(&events);
+        let relaying = connect(&format!("ws://{addr}"), events.clone(), None).await.unwrap();
+        // The first retry comes within 5 s, the next 3.1 s later.
+        tokio::time::timeout(Duration::from_secs(15), relaying).await.expect("not reopened").unwrap();
+        events.wait_for_all_listeners_to_complete().await;
+        assert_eq!(*seen.lock(), [Event::Aborting]);
+    }
+
     #[tokio::test]
     async fn a_failed_first_connection_is_an_error() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

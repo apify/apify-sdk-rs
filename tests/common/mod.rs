@@ -89,6 +89,17 @@ struct Data {
     removed_runs: std::collections::HashSet<String>,
     /// Statuses a run's next GETs return, one per GET, the last one kept.
     run_status_sequences: HashMap<String, std::collections::VecDeque<String>>,
+    /// How the next run updates go wrong, one per update.
+    run_update_faults: std::collections::VecDeque<RunUpdateFault>,
+}
+
+/// A run update that goes wrong.
+#[derive(Clone, Copy, Debug)]
+pub enum RunUpdateFault {
+    /// Answered after 3 seconds.
+    Slow,
+    /// Refused with 400.
+    Refused,
 }
 
 impl Data {
@@ -269,6 +280,11 @@ impl FakeApi {
     pub fn set_run_statuses(&self, id: &str, statuses: &[&str]) {
         let statuses = statuses.iter().map(|status| (*status).to_owned()).collect();
         self.shared.data.lock().run_status_sequences.insert(id.to_owned(), statuses);
+    }
+
+    /// Makes the next run updates go wrong, one per update.
+    pub fn fault_run_updates(&self, faults: &[RunUpdateFault]) {
+        self.shared.data.lock().run_update_faults.extend(faults);
     }
 
     pub fn run_updates(&self) -> Vec<Value> {
@@ -733,6 +749,12 @@ async fn update_run(State(shared): State<Shared>, Path(id): Path<String>, body: 
     let Ok(update) = serde_json::from_slice::<Value>(&body) else {
         return error(StatusCode::BAD_REQUEST, "invalid-input");
     };
+    let fault = shared.data.lock().run_update_faults.pop_front();
+    match fault {
+        Some(RunUpdateFault::Refused) => return error(StatusCode::BAD_REQUEST, "invalid-input"),
+        Some(RunUpdateFault::Slow) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
+        None => {}
+    }
     let mut run = json!({ "id": id, "status": "RUNNING" });
     if let (Value::Object(run), Value::Object(update)) = (&mut run, &update) {
         run.extend(update.clone());

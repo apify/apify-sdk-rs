@@ -5,12 +5,13 @@ mod common;
 
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use apify::Actor;
 use serde_json::{Value, json};
 
-use common::{DEFAULT_DATASET, DEFAULT_QUEUE, DEFAULT_STORE, FakeApi, TOKEN};
+use common::{DEFAULT_DATASET, DEFAULT_QUEUE, DEFAULT_STORE, FakeApi, RunUpdateFault, TOKEN};
 
 const SCENARIO: &str = "APIFY_SDK_TEST_SCENARIO";
 
@@ -747,6 +748,126 @@ async fn the_log_keeps_the_debug_lines_of_the_start_until_its_level_is_set() {
 }
 
 /// The scenarios, run by [`run_child`]. Does nothing in a normal test run.
+/// A run that cannot initialize exits with 92 before the user function runs: here, the platform
+/// events cannot be connected to.
+#[tokio::test]
+async fn an_unreachable_events_websocket_fails_the_init_with_92() {
+    let api = FakeApi::start().await;
+    let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("echo", &platform_env(&api, Some(format!("ws://{refused}"))), dir.path()).await;
+    assert_exit(&output, 92);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Initializing the Actor failed"));
+    assert!(api.dataset_items(DEFAULT_DATASET).is_empty(), "the user function did not run");
+}
+
+/// Tracked child runs that cannot be read fail the init too.
+#[tokio::test]
+async fn malformed_tracked_child_runs_fail_the_init_with_92() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "__ACTOR_CHILD_RUNS", br#"["not", "a map"]"#, "application/json; charset=utf-8");
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("echo", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 92);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Initializing the Actor failed"), "{stdout}");
+    assert!(stdout.contains("are malformed"), "{stdout}");
+}
+
+/// An exit whose listeners do not end in `ExitOptions::timeout` gives up on them. (With the
+/// process exit, the deadline of the next test ends the process first.)
+#[tokio::test]
+async fn an_exit_listener_that_never_ends_holds_the_exit_up_to_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("exit-stuck-listener", &[], dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Waiting for all event listeners to complete their execution timed out after 1 seconds"),
+        "{stdout}"
+    );
+    let returned_after = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RETURNED FROM EXIT AFTER ")?.strip_suffix(" ms")?.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("exit did not return: {stdout}"));
+    assert!((1000..5000).contains(&returned_after), "{returned_after} ms");
+}
+
+/// The exit's own deadline runs on a thread of its own: a runtime too busy to run a timer, here
+/// blocked by a listener, still exits on time.
+#[tokio::test]
+async fn a_blocked_runtime_still_exits_after_the_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = run_child("exit-blocked-runtime", &[], dir.path()).await;
+    assert_exit(&output, 7);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Exiting the Actor timed out after 1 seconds"), "{stdout}");
+}
+
+/// With `exit: false`, `exit` tears the Actor down and returns, and a later `exit` ends the run.
+#[tokio::test]
+async fn an_exit_without_exiting_returns() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("exit-twice", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 4);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("RETURNED FROM EXIT"));
+    assert_eq!(terminal_messages(&api), ["Torn down"]);
+}
+
+/// Runs the `graceful` scenario, aborted 500 ms after it connected to the platform events.
+async fn aborted_run(graceful: bool, delay_millis: u64, work_millis: u64) -> String {
+    let api = FakeApi::start().await;
+    let events =
+        common::serve_events(Duration::from_millis(500), vec![json!({ "name": "aborting", "data": null })]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut vars = platform_env(&api, Some(events));
+    vars.push(("TEST_GRACEFUL", u8::from(graceful).to_string()));
+    vars.push(("TEST_DELAY_MILLIS", delay_millis.to_string()));
+    vars.push(("TEST_WORK_MILLIS", work_millis.to_string()));
+    let output = run_child("graceful", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Without `graceful_shutdown`, an abort is left to the Actor: the user function runs on.
+#[tokio::test]
+async fn without_graceful_shutdown_an_aborted_run_goes_on() {
+    let stdout = aborted_run(false, 0, 2000).await;
+    assert!(stdout.contains("USER FUNCTION FINISHED"), "{stdout}");
+}
+
+/// `graceful_shutdown_delay` puts the exit off after the abort.
+#[tokio::test]
+async fn a_graceful_shutdown_exits_after_its_delay() {
+    let stdout = aborted_run(true, 1500, 60_000).await;
+    assert!(!stdout.contains("USER FUNCTION FINISHED"), "{stdout}");
+    let since_abort = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("EXIT AFTER ABORTING Some(")?.strip_suffix(')')?.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no exit after the abort: {stdout}"));
+    assert!((1500..5000).contains(&since_abort), "{since_abort} ms");
+}
+
+/// Setting a status message is best effort: an update that is slow (beyond 1 s) or refused is
+/// logged, and the run goes on.
+#[tokio::test]
+async fn a_slow_or_refused_status_message_is_logged_and_skipped() {
+    let api = FakeApi::start().await;
+    api.fault_run_updates(&[RunUpdateFault::Slow, RunUpdateFault::Refused]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_child("status-faults", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Setting status message timed out after 1s"), "{stdout}");
+    assert!(stdout.contains("Setting the status message failed"), "{stdout}");
+    let messages: Vec<_> = api.run_updates().iter().map(|update| update["statusMessage"].clone()).collect();
+    assert!(!messages.contains(&json!("Refused")), "{messages:?}");
+    assert!(messages.ends_with(&[json!("Fine"), json!("Done")]), "{messages:?}");
+}
+
 #[test]
 fn child() {
     let Ok(scenario) = std::env::var(SCENARIO) else { return };
@@ -756,7 +877,12 @@ fn child() {
     } else {
         tracing_subscriber::fmt().with_writer(std::io::stdout).init();
     }
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // A single thread, which the scenario can block.
+    let runtime = if scenario == "exit-blocked-runtime" {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    } else {
+        tokio::runtime::Runtime::new().unwrap()
+    };
     runtime.block_on(async move {
         match scenario.as_str() {
             "log" => {
@@ -1217,6 +1343,75 @@ fn child() {
                 Actor::off(removed);
                 Actor::init(apify::InitOptions::default()).await.unwrap();
                 Actor::exit(apify::ExitOptions::message("Bye")).await;
+            }
+            "exit-stuck-listener" | "exit-blocked-runtime" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let blocking = scenario == "exit-blocked-runtime";
+                Actor::on(crawlee::core::EventKind::Exit, move |_| async move {
+                    if blocking {
+                        std::thread::sleep(Duration::from_secs(60));
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                });
+                // Without the process exit, the teardown's own deadline returns from `exit`.
+                let options = apify::ExitOptions {
+                    exit_code: 7,
+                    timeout: Duration::from_secs(1),
+                    exit: blocking,
+                    ..apify::ExitOptions::default()
+                };
+                let started = Instant::now();
+                Actor::exit(options).await;
+                println!("RETURNED FROM EXIT AFTER {} ms", started.elapsed().as_millis());
+                std::process::exit(0);
+            }
+            "exit-twice" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let torn_down = apify::ExitOptions { exit: false, ..apify::ExitOptions::message("Torn down") };
+                Actor::exit(torn_down).await;
+                println!("RETURNED FROM EXIT");
+                Actor::exit(apify::ExitOptions { exit_code: 4, ..apify::ExitOptions::default() }).await;
+                unreachable!("exited");
+            }
+            "graceful" => {
+                let var = |name: &str| std::env::var(name).unwrap().parse::<u64>().unwrap();
+                let (graceful, delay, work) =
+                    (var("TEST_GRACEFUL") == 1, var("TEST_DELAY_MILLIS"), var("TEST_WORK_MILLIS"));
+                let aborted_at = Arc::new(parking_lot::Mutex::new(None));
+                Actor::on(crawlee::core::EventKind::Aborting, {
+                    let aborted_at = aborted_at.clone();
+                    move |_| {
+                        aborted_at.lock().get_or_insert_with(Instant::now);
+                        async {}
+                    }
+                });
+                Actor::on(crawlee::core::EventKind::Exit, move |_| {
+                    let since_abort = aborted_at.lock().map(|at| at.elapsed().as_millis());
+                    println!("EXIT AFTER ABORTING {since_abort:?}");
+                    async {}
+                });
+                let init = apify::InitOptions {
+                    graceful_shutdown: graceful,
+                    graceful_shutdown_delay: Duration::from_millis(delay),
+                    ..apify::InitOptions::default()
+                };
+                Actor::main_with(init, apify::ExitOptions::default(), || async move {
+                    tokio::time::sleep(Duration::from_millis(work)).await;
+                    println!("USER FUNCTION FINISHED");
+                    Ok(())
+                })
+                .await
+            }
+            "status-faults" => {
+                Actor::init(apify::InitOptions::default()).await.unwrap();
+                let options = apify::StatusMessageOptions::default;
+                let started = Instant::now();
+                assert!(Actor::set_status_message("Slow", options()).await.is_none());
+                assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+                assert!(Actor::set_status_message("Refused", options()).await.is_none());
+                assert!(Actor::set_status_message("Fine", options()).await.is_some());
+                Actor::exit(apify::ExitOptions::message("Done")).await;
             }
             "before-init" => {
                 Actor::is_at_home();

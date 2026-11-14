@@ -19,9 +19,8 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::charging::{ChargeResult, ChargingError, ChargingManager, DEFAULT_DATASET_ITEM_EVENT};
-use crate::schema_validation::{
-    Entry, OnInvalidItems, PushError, PushResult, Rejected, charge_of_stored, store_validated,
-};
+use crate::push::{OnInvalidItems, PushError, PushResult};
+use crate::schema_validation::{Entry, Rejected, charge_of_stored, store_validated};
 
 /// The most bytes of items in one request, below the platform's payload limit.
 const MAX_BATCH_BYTES: usize = 9_000_000;

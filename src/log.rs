@@ -6,7 +6,7 @@
 //! through `log` in JS. The crates underneath (the HTTP stack) log at `info` at most. `RUST_LOG`,
 //! when set, replaces all of that until [`set_level`].
 //!
-//! An Actor that reads its log level from its input knows it only after [`Actor::init`]
+//! An Actor that reads its log level from its input knows it only after [`Actor::init`](crate::Actor::init)
 //! (crate::Actor::init), whose debug lines (its API calls, for one) would be lost.
 //! [`LogOptions::buffer_startup_debug`] keeps them until the level is set: [`set_level`] at debug
 //! logs them, with the time they were made, and any other level, or

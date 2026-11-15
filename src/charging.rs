@@ -27,48 +27,13 @@ use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
 
 use crate::configuration::Configuration;
+use crate::js::number::js_to_fixed;
 use crate::storage::DEFAULT_STORAGE_ALIAS;
 
 /// The synthetic event of an item stored in the default dataset.
 pub const DEFAULT_DATASET_ITEM_EVENT: &str = "apify-default-dataset-item";
 const LOCAL_CHARGING_LOG_DATASET_NAME: &str = "charging_log";
 const PAY_PER_EVENT: &str = "PAY_PER_EVENT";
-
-/// `Number(x.toFixed(digits))` of JavaScript: rounds the exact value of `x`, halves away from zero.
-pub(crate) fn js_to_fixed(x: f64, digits: usize) -> f64 {
-    if !x.is_finite() || x.abs() >= 1e21 {
-        return x;
-    }
-    // The exact decimal expansion of an f64 has at most 1074 fractional digits.
-    let exact = format!("{:.1074}", x.abs());
-    let (int_part, frac) = exact.split_once('.').expect("a fractional part");
-    let mut digits_str: Vec<u8> = int_part.bytes().chain(frac.bytes().take(digits)).collect();
-    if frac.as_bytes()[digits] >= b'5' {
-        // Increment the decimal number in `digits_str`.
-        let mut i = digits_str.len();
-        loop {
-            if i == 0 {
-                digits_str.insert(0, b'1');
-                break;
-            }
-            i -= 1;
-            if digits_str[i] == b'9' {
-                digits_str[i] = b'0';
-            } else {
-                digits_str[i] += 1;
-                break;
-            }
-        }
-    }
-    let split = digits_str.len() - digits;
-    let text = format!(
-        "{}{}.{}",
-        if x < 0.0 { "-" } else { "" },
-        std::str::from_utf8(&digits_str[..split]).expect("digits"),
-        std::str::from_utf8(&digits_str[split..]).expect("digits")
-    );
-    text.parse().expect("a number")
-}
 
 /// A charge to make.
 #[derive(Clone, Debug)]
@@ -783,27 +748,6 @@ impl StorageBackend for ChargingStorageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn to_fixed_rounds_like_javascript() {
-        // Values checked with node: Number(x.toFixed(n)).
-        assert_eq!(js_to_fixed(0.25, 1), 0.3, "a tie rounds up, not to even");
-        assert_eq!(js_to_fixed(1.005, 2), 1.0, "1.005 is below 1.005 in binary");
-        assert_eq!(js_to_fixed(4.99999999999, 4), 5.0);
-        assert_eq!(js_to_fixed(-2.5, 0), -3.0);
-        assert_eq!(js_to_fixed(0.1 + 0.2, 6), 0.3);
-        assert_eq!(js_to_fixed(9.9999995, 6), 9.999999);
-        assert_eq!(js_to_fixed(f64::INFINITY, 4), f64::INFINITY);
-    }
-
-    #[test]
-    fn to_fixed_golden() {
-        let cases: Vec<Value> = serde_json::from_str(include_str!("../conformance/golden/to_fixed.json")).unwrap();
-        for case in cases {
-            let (x, digits) = (case["x"].as_f64().unwrap(), case["digits"].as_u64().unwrap() as usize);
-            assert_eq!(js_to_fixed(x, digits), case["expected"].as_f64().unwrap(), "{x}.toFixed({digits})");
-        }
-    }
 
     fn manager(max: f64, prices: &[(&str, f64)], charged: &[(&str, u64)]) -> ChargingManager {
         let events: serde_json::Map<String, Value> = prices

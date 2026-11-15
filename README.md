@@ -84,6 +84,14 @@ input schema. Copy it and `apify push`.
 | **URL filters** | Globs and pseudo-URLs with request options, as Actor inputs send them |
 | **Autoscaling** | Platform system info drives the CPU and memory signals. Rate-limited API calls are counted by attempt as in the JS client (`ApifyStorageBackend::rate_limits`) but, as in the JS SDK, not reported to the storage load signal |
 
+## JS semantics for ports of JS Actors
+
+`apify::js` holds what a Rust port of a JS Actor needs to produce the same items as the JS Actor:
+`undefined` as opposed to `null`, truthiness, `??` and `||`, `String(value)`, the key order of
+objects, numbers as JS reads and writes them (`Number`, `parseFloat`, `toFixed`, `Math.round`),
+`encodeURIComponent`, and typed reading of JSON with those semantics (`js_object!`, borrowing
+strings from the response body). It is shared by the ports, so that they do not each copy it.
+
 ## Testing
 
 | Layer | What runs | Needs |

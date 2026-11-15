@@ -13,6 +13,7 @@ pub mod cpu_profile;
 pub mod events;
 pub mod input;
 pub mod input_secrets;
+pub mod js;
 pub mod log;
 pub mod platform;
 pub mod proxy;

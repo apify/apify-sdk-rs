@@ -477,7 +477,7 @@ impl Actor {
         }
         child_runs?;
         charging?;
-        if state.charging.is_pay_per_event() && state.smart.is_none() {
+        if state.charging.is_pay_per_event() && !state.charging.is_multi_tenant() && state.smart.is_none() {
             tracing::warn!(
                 "Items pushed to the default dataset will not be charged for, because this run does not use Apify \
                  storage - the platform only counts items it stores itself."
@@ -780,9 +780,18 @@ impl Actor {
         &state().charging
     }
 
-    /// Charges for `count` events of `event_name` (see [`ChargingManager::charge`]).
+    /// Charges for `count` events of `event_name` (see [`ChargingManager::charge`]). In a
+    /// multi-tenant Server Actor run, set [`ChargeOptions::request_id`] to the
+    /// `X-Actor-Request-ID` header of the incoming request.
     pub async fn charge(options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
         state().charging.charge(options).await
+    }
+
+    /// The current Actor run from the Apify API. It is fetched once and kept for the lifetime of
+    /// the Actor, so use `Actor::client().run(id).get()` for fresh data such as the run status.
+    /// `None` when not running on the Apify platform.
+    pub async fn get_current_run() -> Result<Option<ActorRun>, apify_client::ApifyClientError> {
+        state().charging.current_run().await
     }
 
     /// Pushes one item (an object) or several (an array) to the default dataset. Under
@@ -794,6 +803,8 @@ impl Actor {
 
     /// Pushes items to the default dataset and charges `event_name` for each, as many as the
     /// budget allows (`Actor.pushData(items, eventName)` in JS).
+    /// Not supported in multi-tenant Server Actor runs, which charge per request with
+    /// [`charge`](Self::charge).
     pub async fn push_data_and_charge<T: serde::Serialize + ?Sized>(
         data: &T,
         event_name: &str,
@@ -804,7 +815,8 @@ impl Actor {
     /// Pushes items to the default dataset and charges each of `events` for each item, as many
     /// items as the budget allows for all of them. An event listed `n` times is charged `n` times
     /// for each item, with one call. `event_charge_limit_reached` is set when the budget allows no
-    /// more of one of the events.
+    /// more of one of the events. Not supported in multi-tenant Server Actor runs, which charge per
+    /// request with [`charge`](Self::charge).
     pub async fn push_data_and_charge_events<T: serde::Serialize + ?Sized>(
         data: &T,
         events: &[&str],
@@ -830,6 +842,8 @@ impl Actor {
 
     /// [`push_data_and_charge`](Self::push_data_and_charge), buffered as
     /// [`push_data_buffered`](Self::push_data_buffered) is.
+    /// Not supported in multi-tenant Server Actor runs, which charge per request with
+    /// [`charge`](Self::charge).
     pub fn push_data_and_charge_buffered<T: serde::Serialize + ?Sized>(
         data: &T,
         event_name: &str,
@@ -905,8 +919,12 @@ impl Actor {
         if let Some(event) = events.iter().find(|event| event.starts_with("apify-")) {
             return Err(ChargingError::SyntheticEvent((*event).to_owned()));
         }
-        let mut items = serialize_items(data)?;
         let charging = &state().charging;
+        // A multi-tenant run charges per request, with `Actor::charge` and the request's ID.
+        if !events.is_empty() && charging.is_multi_tenant() {
+            return Err(ChargingError::PushInMultiTenantRun);
+        }
+        let mut items = serialize_items(data)?;
         let is_default_dataset = state().smart.is_some();
         let limit = charging.reserve_items(items.len(), &events, is_default_dataset);
         let reached = !items.is_empty() && limit < items.len()
@@ -918,7 +936,10 @@ impl Actor {
         items.truncate(limit);
         let charge = ChargeResult {
             event_charge_limit_reached: charging.is_pay_per_event() && reached,
-            charged_count: if !charging.is_pay_per_event() || (events.is_empty() && !is_default_dataset) {
+            charged_count: if !charging.is_pay_per_event()
+                || charging.is_multi_tenant()
+                || (events.is_empty() && !is_default_dataset)
+            {
                 0
             } else {
                 limit as u64
@@ -983,7 +1004,8 @@ impl Actor {
     /// The input of the run, as it was stored. Locally, the input may instead be an `INPUT` or
     /// `INPUT.json` file in the working directory; a storage backend that does not read the default
     /// key-value store's directory (in-memory) also gets the file `apify run` writes there. Input
-    /// found in more than one place is an error.
+    /// found in more than one place is an error. Google Sheets sharing links in `requestsFromUrl`
+    /// entries are replaced with the links of their CSV exports.
     pub async fn get_input_raw() -> Result<Input, ActorInputError> {
         let configuration = &state().configuration;
         let key = &configuration.input_key;
@@ -1038,7 +1060,18 @@ impl Actor {
             ));
         };
         let input = Self::decrypt_secrets(input)?;
-        Ok(Self::with_schema_defaults(input))
+        Ok(Self::fix_google_sheets_urls(Self::with_schema_defaults(input)))
+    }
+
+    /// Google Sheets sharing links in `requestsFromUrl` entries (from the "Link remote text file"
+    /// option) are replaced with the links of their CSV exports.
+    fn fix_google_sheets_urls(input: Input) -> Input {
+        match input {
+            Input::Json(Value::Object(object)) if !object.is_empty() => {
+                Input::Json(Value::Object(crate::google_sheets::fix_google_sheets_urls(object)))
+            }
+            input => input,
+        }
     }
 
     /// Decrypts the secret fields, when the platform passed the key.

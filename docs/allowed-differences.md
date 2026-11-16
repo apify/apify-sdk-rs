@@ -59,6 +59,10 @@ These differences exist to make runs cheaper or faster.
   later. Updates are sent one at a time in the order they were made, and an update is dropped when
   a later one was sent already (in JS, concurrent updates can land in any order); `exit` waits for
   them before the terminal status message.
+- **A Server Actor run fetches its Actor while it reads the run.** In standby, the JS SDK starts
+  fetching both in `init`, and its charging manager waits for the run before it asks for the
+  Actor. Here charging fetches them at once. Both are kept: `Actor::get_current_run` returns the
+  run that charging read, as `Actor.getCurrentRun()` does.
 
 ## Configuration
 
@@ -98,6 +102,9 @@ These differences exist to make runs cheaper or faster.
   `pushDataWithSchemaRepair` of `@apify/actor-utils` (logged; the items that cannot be repaired
   are given back), or dropped (logged). The other items are stored and charged; rejected items
   are not charged.
+- **A charge count cannot be negative.** `ChargeOptions::count` is a `u64`. A count of 0 is
+  ignored as JS ignores a non-positive one: nothing is sent or counted, and its idempotency key
+  is not kept.
 - **Shared request queues can prolong locks.** `extend_request_processing_time` prolongs the
   platform lock of a request in progress; the JS SDK never prolongs locks.
 

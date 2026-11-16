@@ -85,6 +85,8 @@ struct Data {
     run_logs: HashMap<String, String>,
     /// The `idempotency-key` headers of charges, in order.
     charge_idempotency_keys: Vec<Option<String>>,
+    /// Actors the API returns, by id, in place of a bare one.
+    actors: HashMap<String, Value>,
     /// Runs the API answers 404 for, as if removed.
     removed_runs: std::collections::HashSet<String>,
     /// Statuses a run's next GETs return, one per GET, the last one kept.
@@ -264,6 +266,18 @@ impl FakeApi {
     /// Sets the log of a run, served whole whether streamed or not.
     pub fn set_run_log(&self, id: &str, log: &str) {
         self.shared.data.lock().run_logs.insert(id.to_owned(), log.to_owned());
+    }
+
+    /// Adds a run (or replaces one) as the API returns it, by its `id`.
+    pub fn put_run(&self, run: Value) {
+        let id = run["id"].as_str().expect("a run id").to_owned();
+        self.shared.data.lock().runs.insert(id, run);
+    }
+
+    /// Sets the Actor the API returns for its `id`.
+    pub fn put_actor(&self, actor: Value) {
+        let id = actor["id"].as_str().expect("an Actor id").to_owned();
+        self.shared.data.lock().actors.insert(id, actor);
     }
 
     /// Sets the status of a run started through the API.
@@ -819,7 +833,10 @@ async fn get_run_log(State(shared): State<Shared>, Path(id): Path<String>) -> Re
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], log).into_response()
 }
 
-async fn get_actor(Path(id): Path<String>) -> Response {
+async fn get_actor(State(shared): State<Shared>, Path(id): Path<String>) -> Response {
+    if let Some(actor) = shared.data.lock().actors.get(&id) {
+        return envelope(StatusCode::OK, actor.clone());
+    }
     let name = id.rsplit('~').next().unwrap_or_default().to_owned();
     envelope(StatusCode::OK, json!({ "id": id, "name": name }))
 }

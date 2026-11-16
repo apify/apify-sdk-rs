@@ -3,15 +3,14 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::lru::LazyLru;
 use apify_client::http_client::{HttpBackend, HttpMethod, HttpRequest, HttpResponse};
 use apify_client::timeouts::NO_TIMEOUT;
 use apify_client::{ApifyClient, ApifyClientError, ApifyClientResult, ZstdHttpCompressor};
 use async_trait::async_trait;
-use lru::LruCache;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
@@ -58,18 +57,17 @@ impl RateLimitCounter {
 struct Attempts {
     hasher: RandomState,
     /// Calls whose last attempt is to be retried: attempts made so far.
-    retried: Mutex<LruCache<u64, usize>>,
+    retried: Mutex<LazyLru<u64, usize>>,
     /// Batch adds that left requests unprocessed, by the unique keys left: tries made so far.
-    unprocessed: Mutex<LruCache<u64, usize>>,
+    unprocessed: Mutex<LazyLru<u64, usize>>,
 }
 
 impl Default for Attempts {
     fn default() -> Self {
-        let capacity = NonZeroUsize::new(MAX_TRACKED_CALLS).expect("non-zero");
         Attempts {
             hasher: RandomState::new(),
-            retried: Mutex::new(LruCache::new(capacity)),
-            unprocessed: Mutex::new(LruCache::new(capacity)),
+            retried: Mutex::new(LazyLru::new(MAX_TRACKED_CALLS)),
+            unprocessed: Mutex::new(LazyLru::new(MAX_TRACKED_CALLS)),
         }
     }
 }

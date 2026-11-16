@@ -7,10 +7,16 @@
 //! A charge is counted against the budget at once, in one short critical section, and then sent
 //! to the platform without holding anything: concurrent charges and pushes do not wait for each
 //! other's API calls, and cannot together spend more than the budget.
+//!
+//! A multi-tenant Server Actor run (a standby deployment shared by its callers) charges each
+//! caller per request: [`ChargeOptions::request_id`] names the request, and the platform prices,
+//! limits and deduplicates the charges. Nothing is counted locally there, and pushed items are
+//! not charged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use apify_client::models::{Actor as ActorResource, ActorRun};
 use apify_client::{ApifyClient, ApifyClientError, RunChargeOptions};
 use async_trait::async_trait;
 use crawlee::core::StorageResult;
@@ -42,12 +48,20 @@ pub struct ChargeOptions {
     pub count: u64,
     /// Keeps a retried operation from being charged twice: a charge repeated under the same key
     /// within three minutes is not made again (see [`ChargingManager::charge`]).
+    ///
+    /// The key is scoped to the whole run, not to `request_id`. In a multi-tenant Server Actor
+    /// run, a key reused across requests charges only the first caller, so it must be globally
+    /// unique (for example, derived from `request_id`).
     pub idempotency_key: Option<String>,
+    /// ID of the Server Actor request being charged, from the `X-Actor-Request-ID` header of the
+    /// incoming request. Required in multi-tenant Server Actor runs, where it maps the charge to
+    /// the caller's account instead of the account that started the run. Sent along elsewhere.
+    pub request_id: Option<String>,
 }
 
 impl ChargeOptions {
     pub fn new(event_name: impl Into<String>, count: u64) -> Self {
-        ChargeOptions { event_name: event_name.into(), count, idempotency_key: None }
+        ChargeOptions { event_name: event_name.into(), count, idempotency_key: None, request_id: None }
     }
 }
 
@@ -76,6 +90,18 @@ pub enum ChargingError {
     NotInitialized,
     #[error("Cannot charge for synthetic event '{0}' manually")]
     SyntheticEvent(String),
+    #[error("Cannot charge for synthetic event '{0}' in a multi-tenant Server Actor run")]
+    SyntheticEventMultiTenant(String),
+    #[error(
+        "Charging for '{0}' in a multi-tenant Server Actor run requires `request_id` - pass the value of the incoming \
+         request's X-Actor-Request-ID header to Actor::charge()."
+    )]
+    MissingRequestId(String),
+    #[error(
+        "Charging for pushed items is not supported in a multi-tenant Server Actor run - use Actor::charge() with the \
+         `request_id` of the incoming request instead."
+    )]
+    PushInMultiTenantRun,
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]
@@ -106,6 +132,9 @@ const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(3 * 60);
 #[derive(Default)]
 struct State {
     initialized: bool,
+    /// A multi-tenant Server Actor run: no pricing snapshot on the run, and the platform prices,
+    /// limits and deduplicates per caller.
+    multi_tenant: bool,
     pricing_model: Option<String>,
     max_total_charge_usd: f64,
     prices: IndexMap<String, EventPrice>,
@@ -163,6 +192,29 @@ impl Drop for IdempotentChargeInFlight<'_> {
     }
 }
 
+/// The standby deployment of a multi-tenant Server Actor run starts with this.
+const MULTI_TENANT_DEPLOYMENT_PREFIX: &str = "MULTI_TENANT";
+
+/// The pricing in effect now: the latest entry of the Actor's pricing history with
+/// `startedAt <= now`, as the history includes scheduled changes. An entry without a valid
+/// `startedAt` is never in effect, as `new Date(...) <= now` is false in JS.
+///
+/// Resolved once at init on purpose. A change kicking in mid-run only affects local event titles
+/// and "unknown event" warnings; the platform prices each charge from its own current pricing.
+fn effective_pricing_info(pricing_infos: &[Value], now: chrono::DateTime<chrono::Utc>) -> Option<&Value> {
+    let started_at = |info: &Value| {
+        let started_at = info.get("startedAt")?.as_str()?;
+        chrono::DateTime::parse_from_rfc3339(started_at).ok().map(|at| at.with_timezone(&chrono::Utc))
+    };
+    // `max_by_key` keeps the last of equal entries, as JS's stable sort and `.at(-1)` do.
+    pricing_infos
+        .iter()
+        .filter_map(|info| Some((started_at(info)?, info)))
+        .filter(|(started_at, _)| *started_at <= now)
+        .max_by_key(|(started_at, _)| *started_at)
+        .map(|(_, info)| info)
+}
+
 /// `f64` counts (possibly infinite) as optional integers.
 fn limit(count: f64) -> Option<u64> {
     count.is_finite().then(|| count.max(0.0) as u64)
@@ -180,6 +232,9 @@ pub struct ChargingManager {
     client: ApifyClient,
     state: Mutex<State>,
     log_dataset: tokio::sync::OnceCell<Dataset>,
+    /// The run and the Actor from the API, fetched once. A failed fetch is tried again next time.
+    current_run: tokio::sync::OnceCell<Option<ActorRun>>,
+    current_actor: tokio::sync::OnceCell<Option<ActorResource>>,
 }
 
 impl std::fmt::Debug for ChargingManager {
@@ -196,7 +251,28 @@ impl ChargingManager {
             client,
             state: Mutex::new(State { max_total_charge_usd, ..State::default() }),
             log_dataset: tokio::sync::OnceCell::new(),
+            current_run: tokio::sync::OnceCell::new(),
+            current_actor: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The current Actor run from the API, fetched once (see [`Actor::get_current_run`](crate::Actor::get_current_run)).
+    /// `None` when not running on the Apify platform.
+    pub async fn current_run(&self) -> Result<Option<ActorRun>, ApifyClientError> {
+        let Some(run_id) = self.configuration.actor_run_id.clone() else { return Ok(None) };
+        self.current_run.get_or_try_init(|| async { self.client.run(run_id).get().await }).await.cloned()
+    }
+
+    /// The current Actor from the API, fetched once. `None` without an Actor ID.
+    async fn current_actor(&self) -> Result<Option<ActorResource>, ApifyClientError> {
+        let Some(actor_id) = self.configuration.actor_id.clone() else { return Ok(None) };
+        self.current_actor.get_or_try_init(|| async { self.client.actor(actor_id).get().await }).await.cloned()
+    }
+
+    /// True in a multi-tenant Server Actor run, which charges per request with
+    /// [`ChargeOptions::request_id`] only.
+    pub fn is_multi_tenant(&self) -> bool {
+        self.state.lock().multi_tenant
     }
 
     /// Loads the pricing and what was charged so far (by an earlier incarnation of the run), from
@@ -218,9 +294,10 @@ impl ChargingManager {
             ));
         }
 
-        let (pricing_info, charged_counts, max_total_charge_usd) = self.fetch_pricing_info().await?;
+        let (pricing_info, charged_counts, max_total_charge_usd, multi_tenant) = self.fetch_pricing_info().await?;
         let is_ppe = {
             let mut state = self.state.lock();
+            state.multi_tenant = multi_tenant;
             let run_model = pricing_info.get("pricingModel").and_then(Value::as_str).map(str::to_owned);
             state.pricing_model =
                 if configuration.test_pay_per_event { Some(PAY_PER_EVENT.to_owned()) } else { run_model.clone() };
@@ -253,8 +330,9 @@ impl ChargingManager {
         Ok(())
     }
 
-    /// Pricing info (JSON), charged counts, and the budget.
-    async fn fetch_pricing_info(&self) -> Result<(Value, IndexMap<String, u64>, f64), ChargingError> {
+    /// Pricing info (JSON), charged counts, the budget, and whether the run is a multi-tenant
+    /// Server Actor run.
+    async fn fetch_pricing_info(&self) -> Result<(Value, IndexMap<String, u64>, f64, bool), ChargingError> {
         let configuration = &self.configuration;
         let counts = |value: Option<&Value>| -> IndexMap<String, u64> {
             value
@@ -266,18 +344,34 @@ impl ChargingManager {
         {
             let pricing: Value = serde_json::from_str(pricing)?;
             let charged: Value = serde_json::from_str(charged)?;
-            return Ok((pricing, counts(Some(&charged)), configuration.max_total_charge_usd));
+            return Ok((pricing, counts(Some(&charged)), configuration.max_total_charge_usd, false));
         }
         if configuration.is_at_home {
-            let run_id = configuration.actor_run_id.clone().ok_or_else(|| {
-                ChargingError::Invalid("Actor run ID not found even though the Actor is running on Apify".to_owned())
-            })?;
-            let run = self
-                .client
-                .run(run_id)
-                .get()
-                .await?
-                .ok_or_else(|| ChargingError::Invalid("Actor run not found".to_owned()))?;
+            if configuration.actor_run_id.is_none() {
+                return Err(ChargingError::Invalid(
+                    "Actor run ID not found even though the Actor is running on Apify".to_owned(),
+                ));
+            }
+            // A Server Actor run lives long enough to make fetching the Actor worth it up front:
+            // a multi-tenant one needs it, and it is fetched at the same time as the run.
+            let is_standby = configuration.meta_origin.as_deref() == Some("STANDBY");
+            let (run, actor) = tokio::join!(self.current_run(), async {
+                if is_standby { Some(self.current_actor().await) } else { None }
+            });
+            let run = run?.ok_or_else(|| ChargingError::Invalid("Actor run not found".to_owned()))?;
+            let deployment = run.extra.get("standby").and_then(|standby| standby.get("deployment"));
+            if deployment.and_then(Value::as_str).is_some_and(|d| d.starts_with(MULTI_TENANT_DEPLOYMENT_PREFIX)) {
+                let actor = match actor {
+                    Some(actor) => actor,
+                    None => self.current_actor().await,
+                };
+                let actor = actor?.ok_or_else(|| ChargingError::Invalid("Actor not found".to_owned()))?;
+                let pricing_infos = actor.extra.get("pricingInfos").and_then(Value::as_array);
+                let pricing =
+                    effective_pricing_info(pricing_infos.map_or(&[], Vec::as_slice), chrono::Utc::now()).cloned();
+                // The run's counts mix all callers, and the platform prices and limits per caller.
+                return Ok((pricing.unwrap_or(Value::Null), IndexMap::new(), f64::INFINITY, true));
+            }
             let max = run
                 .extra
                 .get("options")
@@ -286,9 +380,9 @@ impl ChargingManager {
                 .filter(|&max| max != 0.0)
                 .unwrap_or(f64::INFINITY);
             let pricing = run.extra.get("pricingInfo").cloned().unwrap_or(Value::Null);
-            return Ok((pricing, counts(run.extra.get("chargedEventCounts")), max));
+            return Ok((pricing, counts(run.extra.get("chargedEventCounts")), max, false));
         }
-        Ok((Value::Null, IndexMap::new(), configuration.max_total_charge_usd))
+        Ok((Value::Null, IndexMap::new(), configuration.max_total_charge_usd, false))
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -340,10 +434,22 @@ impl ChargingManager {
                 chargeable_within_limit: self.chargeable_within_limit_of(&state),
             });
         }
+        if self.is_multi_tenant() {
+            return self.charge_server_request(options).await;
+        }
+        // As the Python SDK: no charge of nothing reaches the platform or the charging state, and
+        // its idempotency key is not remembered.
+        if options.count == 0 {
+            return Ok(ChargeResult {
+                event_charge_limit_reached: false,
+                charged_count: 0,
+                chargeable_within_limit: self.chargeable_within_limit(),
+            });
+        }
         if !self.is_initialized() {
             return Err(ChargingError::NotInitialized);
         }
-        let ChargeOptions { event_name, count, idempotency_key } = options;
+        let ChargeOptions { event_name, count, idempotency_key, request_id } = options;
         let (charged_count, mut in_flight) = 'charge: loop {
             let mut in_flight_done = 'wait: {
                 let mut state = self.state.lock();
@@ -392,7 +498,7 @@ impl ChargingManager {
             let _ = in_flight_done.changed().await;
         };
         if charged_count > 0
-            && let Err(err) = self.send_charge(&event_name, charged_count, idempotency_key.clone()).await
+            && let Err(err) = self.send_charge(&event_name, charged_count, idempotency_key.clone(), request_id).await
         {
             // Counted only once made, so that a failed charge retried under its key is counted once.
             self.add_charged(&mut self.state.lock(), &event_name, -(charged_count as i64));
@@ -419,6 +525,42 @@ impl ChargingManager {
             },
             charged_count,
             chargeable_within_limit: self.chargeable_within_limit_of(&state),
+        })
+    }
+
+    /// A charge in a multi-tenant Server Actor run. The platform prices, limits and deduplicates
+    /// each caller's charges itself, so nothing is counted or enforced locally, and every call is
+    /// sent: the platform discards a repeat under an idempotency key used earlier in the run, even
+    /// by another caller.
+    async fn charge_server_request(&self, options: ChargeOptions) -> Result<ChargeResult, ChargingError> {
+        let ChargeOptions { event_name, count, idempotency_key, request_id } = options;
+        if event_name.starts_with("apify-") {
+            return Err(ChargingError::SyntheticEventMultiTenant(event_name));
+        }
+        let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
+            return Err(ChargingError::MissingRequestId(event_name));
+        };
+        let known = self.state.lock().prices.contains_key(&event_name);
+        let mut charged_count = 0;
+        if count == 0 {
+            // Nothing to charge.
+        } else if !known {
+            tracing::warn!("Attempting to charge for an unknown event '{event_name}'");
+        } else {
+            let run_id = self.configuration.actor_run_id.clone().unwrap_or_default();
+            let charge = RunChargeOptions {
+                event_name,
+                count: Some(count as i64),
+                idempotency_key,
+                request_id: Some(request_id),
+            };
+            self.client.run(run_id).charge(charge).await?;
+            charged_count = count;
+        }
+        Ok(ChargeResult {
+            event_charge_limit_reached: false,
+            charged_count,
+            chargeable_within_limit: self.chargeable_within_limit(),
         })
     }
 
@@ -459,7 +601,7 @@ impl ChargingManager {
     pub(crate) fn reserve_items(&self, items_count: usize, events: &[&str], is_default_dataset: bool) -> usize {
         let mut state = self.state.lock();
         let limit = self.push_data_limit_of(&state, items_count, events, is_default_dataset);
-        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
+        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) && !state.multi_tenant {
             for event in Self::item_events(events, is_default_dataset) {
                 self.add_charged(&mut state, event, limit as i64);
             }
@@ -471,7 +613,7 @@ impl ChargingManager {
     /// not stored.
     pub(crate) fn unreserve_items(&self, events: &[&str], is_default_dataset: bool, items_count: usize) {
         let mut state = self.state.lock();
-        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) {
+        if state.pricing_model.as_deref() == Some(PAY_PER_EVENT) && !state.multi_tenant {
             for event in Self::item_events(events, is_default_dataset) {
                 self.add_charged(&mut state, event, -(items_count as i64));
             }
@@ -485,7 +627,7 @@ impl ChargingManager {
         is_default_dataset: bool,
         items_count: usize,
     ) -> Result<(), ChargingError> {
-        if !self.is_pay_per_event() || items_count == 0 {
+        if !self.is_pay_per_event() || self.is_multi_tenant() || items_count == 0 {
             return Ok(());
         }
         // An event listed more than once goes in one call, as many times per item.
@@ -494,7 +636,7 @@ impl ChargingManager {
             *counts.entry(event).or_default() += items_count as u64;
         }
         for (event, count) in counts {
-            self.send_charge(event, count, None).await?;
+            self.send_charge(event, count, None, None).await?;
         }
         Ok(())
     }
@@ -516,6 +658,7 @@ impl ChargingManager {
         event_name: &str,
         count: u64,
         idempotency_key: Option<String>,
+        request_id: Option<String>,
     ) -> Result<(), ChargingError> {
         let (known, title, price) = {
             let state = self.state.lock();
@@ -537,7 +680,7 @@ impl ChargingManager {
                     event_name: event_name.to_owned(),
                     count: Some(count as i64),
                     idempotency_key: idempotency_key.clone(),
-                    request_id: None,
+                    request_id: request_id.clone(),
                 };
                 self.client.run(run_id).charge(charge).await?;
             } else {
@@ -553,6 +696,9 @@ impl ChargingManager {
             });
             if let Some(key) = idempotency_key {
                 entry["idempotencyKey"] = Value::String(key);
+            }
+            if let Some(request_id) = request_id {
+                entry["requestId"] = Value::String(request_id);
             }
             entry["timestamp"] = Value::String(crawlee::core::now_iso());
             dataset.push_data(&entry).await?;
@@ -662,9 +808,11 @@ impl DatasetBackend for ChargingDataset {
         let charging = &self.charging;
         // Datasets also work before the Actor is initialized, with nothing to charge. Items the
         // Actor reserved the charges of are stored as they are.
+        // Multi-tenant runs charge per request only, so dataset writes charge nothing there.
         if items.is_empty()
             || !charging.is_initialized()
             || !charging.is_pay_per_event()
+            || charging.is_multi_tenant()
             || ITEMS_RESERVED.try_with(|_| ()).is_ok()
         {
             return self.inner.push_data(items).await;
@@ -770,6 +918,45 @@ mod tests {
         };
         let client = crate::new_client(&configuration, None, Default::default());
         ChargingManager::new(Arc::new(configuration), client)
+    }
+
+    #[tokio::test]
+    async fn a_charge_of_nothing_changes_nothing_and_keeps_no_key() {
+        let manager = manager(10.0, &[(DEFAULT_DATASET_ITEM_EVENT, 1.0)], &[]);
+        // A synthetic event, which is counted without an API call.
+        manager.init(&crawlee::core::MemoryStorageBackend::new()).await.unwrap();
+        assert_eq!(manager.charge(ChargeOptions::new(DEFAULT_DATASET_ITEM_EVENT, 2)).await.unwrap().charged_count, 2);
+        let keyed = |count: u64| ChargeOptions {
+            idempotency_key: Some("k".to_owned()),
+            ..ChargeOptions::new(DEFAULT_DATASET_ITEM_EVENT, count)
+        };
+        let nothing = manager.charge(keyed(0)).await.unwrap();
+        assert_eq!(nothing.charged_count, 0);
+        assert!(!nothing.event_charge_limit_reached);
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 2);
+        // The key of a charge of nothing is not remembered: a charge under it is made.
+        assert_eq!(manager.charge(keyed(1)).await.unwrap().charged_count, 1);
+        assert_eq!(manager.charged_event_count(DEFAULT_DATASET_ITEM_EVENT), 3);
+    }
+
+    #[test]
+    fn the_effective_pricing_is_the_latest_one_started() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let info = |n: u64, started_at: &str| serde_json::json!({ "n": n, "startedAt": started_at });
+        let history = [
+            info(1, "2021-01-01T00:00:00.000Z"),
+            info(2, "2999-01-01T00:00:00.000Z"),
+            info(3, "2020-01-01T00:00:00.000Z"),
+            info(4, "2026-06-01T00:00:00.000Z"),
+            info(5, "not a date"),
+        ];
+        assert_eq!(effective_pricing_info(&history, now).unwrap()["n"], 4, "started exactly now");
+        assert_eq!(effective_pricing_info(&history[..3], now).unwrap()["n"], 1, "not the last, nor a future one");
+        // Of entries started at the same time, the last one, as JS's stable sort keeps it.
+        let ties = [info(1, "2020-01-01T00:00:00Z"), info(2, "2020-01-01T00:00:00.000Z")];
+        assert_eq!(effective_pricing_info(&ties, now).unwrap()["n"], 2);
+        assert!(effective_pricing_info(&history[1..2], now).is_none());
+        assert!(effective_pricing_info(&[], now).is_none());
     }
 
     #[tokio::test]

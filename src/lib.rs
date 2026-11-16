@@ -11,6 +11,7 @@ pub mod configuration;
 #[cfg(feature = "cpu-profile")]
 pub mod cpu_profile;
 pub mod events;
+pub mod google_sheets;
 pub mod input;
 pub mod input_secrets;
 pub mod js;

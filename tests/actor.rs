@@ -77,6 +77,65 @@ async fn input_and_output_on_the_platform() {
     assert!(!dir.path().join("storage").exists(), "nothing is stored locally");
 }
 
+/// Google Sheets sharing links in `requestsFromUrl` entries come as the links of their CSV exports.
+#[tokio::test]
+async fn the_input_has_google_sheets_csv_export_links() {
+    let api = FakeApi::start().await;
+    let input = json!({
+        "startUrls": [{ "requestsFromUrl": "https://docs.google.com/spreadsheets/d/abc-123/edit?usp=sharing" }],
+    });
+    api.put_record(DEFAULT_STORE, "INPUT", input.to_string().as_bytes(), "application/json; charset=utf-8");
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("echo", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    let expected = json!({
+        "startUrls": [{ "requestsFromUrl": "https://docs.google.com/spreadsheets/d/abc-123/gviz/tq?tqx=out:csv" }],
+    });
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "echo": expected })]);
+}
+
+/// A multi-tenant Server Actor run charges per request: items pushed with an event are refused,
+/// and the other items are not charged.
+#[tokio::test]
+async fn a_multi_tenant_run_charges_per_request_only() {
+    let api = FakeApi::start().await;
+    api.put_run(json!({
+        "id": "run-1",
+        "standby": { "deployment": "MULTI_TENANT_PAYING_USERS" },
+        "options": {},
+        "chargedEventCounts": {},
+    }));
+    let pricing = json!({
+        "pricingModel": "PAY_PER_EVENT",
+        "startedAt": "2020-01-01T00:00:00.000Z",
+        "pricingPerEvent": { "actorChargeEvents": {
+            "test-event": { "eventTitle": "Test", "eventPriceUsd": 1 },
+            "apify-default-dataset-item": { "eventTitle": "Item", "eventPriceUsd": 0.001 },
+        }},
+    });
+    api.put_actor(json!({ "id": "actor-1", "pricingInfos": [pricing] }));
+    let mut vars = platform_env(&api, None);
+    vars.push(("APIFY_META_ORIGIN", "STANDBY".to_owned()));
+    vars.push(("ACTOR_ID", "actor-1".to_owned()));
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("multi-tenant", &vars, dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("CURRENT RUN run-1"), "{stdout}");
+    assert!(stdout.contains("PUSH AND CHARGE Charging for pushed items is not supported"), "{stdout}");
+    assert_eq!(api.dataset_items(DEFAULT_DATASET), [json!({ "id": 3 })]);
+    let charges: Vec<Value> = api
+        .platform_calls()
+        .into_iter()
+        .filter(|(path, _, _)| path.ends_with("/charge"))
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(charges, [json!({ "eventName": "test-event", "count": 1, "requestId": "some-request-id" })]);
+    assert_eq!(api.count_calls("GET /v2/actor-runs/run-1"), 1, "the run is fetched once");
+}
+
 #[tokio::test]
 async fn a_failing_user_function_exits_with_91() {
     let api = FakeApi::start().await;
@@ -901,6 +960,27 @@ fn child() {
                 Actor::main_with(apify::InitOptions::default(), exit, || async move {
                     let input: Value = Actor::get_input().await?;
                     Actor::push_data(&json!({ "echo": input })).await?;
+                    Ok(())
+                })
+                .await
+            }
+            "multi-tenant" => {
+                Actor::main(|| async move {
+                    let run = Actor::get_current_run().await?.expect("a run on the platform");
+                    println!("CURRENT RUN {}", run.id);
+                    // Rejected before anything is stored or charged.
+                    let err = Actor::push_data_and_charge(&json!({ "id": 1 }), "test-event").await.unwrap_err();
+                    println!("PUSH AND CHARGE {err}");
+                    let options = apify::PushOptions { charge_events: vec!["test-event".to_owned()], ..Default::default() };
+                    assert!(Actor::push_data_buffered_with(&json!({ "id": 2 }), &options).is_err());
+                    // Stored, and charged nothing: the platform charges per request.
+                    let pushed = Actor::push_data(&json!({ "id": 3 })).await?;
+                    assert_eq!(pushed.charged_count, 0);
+                    let charge = apify::charging::ChargeOptions {
+                        request_id: Some("some-request-id".to_owned()),
+                        ..apify::charging::ChargeOptions::new("test-event", 1)
+                    };
+                    assert_eq!(Actor::charge(charge).await?.charged_count, 1);
                     Ok(())
                 })
                 .await

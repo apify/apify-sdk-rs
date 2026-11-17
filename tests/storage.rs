@@ -559,7 +559,8 @@ fn platform_request(api: &FakeApi, url: &str) -> Option<Value> {
     api.queue_request(DEFAULT_QUEUE, &crawlee::core::request::unique_key_to_request_id(url))
 }
 
-const SPILLED: &str = apify::storage::REQUEST_QUEUE_SPILLED_KEY;
+/// The listing of one request that tells whether the default queue holds requests already.
+const QUEUE_CHECK: &str = "GET /v2/request-queues/default-queue/requests";
 
 #[tokio::test]
 async fn a_short_run_keeps_its_default_queue_in_memory() {
@@ -573,8 +574,7 @@ async fn a_short_run_keeps_its_default_queue_in_memory() {
     assert!(queue.is_finished().await.unwrap());
     assert_eq!(queue.get_info().await.unwrap().id, DEFAULT_QUEUE);
     assert_eq!(queue.handled_count().await.unwrap(), 2);
-    assert_eq!(queue_calls(&api), Vec::<String>::new());
-    assert!(api.record(DEFAULT_STORE, SPILLED).is_none());
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK], "only the check that the queue is empty");
 
     // Other queues are on the platform from the start.
     let named = services.open_request_queue(&StorageIdentifier::name("other")).await.unwrap();
@@ -594,7 +594,7 @@ async fn a_run_past_the_switch_commits_its_queue_with_the_handled_requests_as_ha
     queue.mark_request_as_handled(&mut first).await.unwrap();
     let mut running = queue.fetch_next_request().await.unwrap().unwrap();
     assert_eq!(backend.unhandled_requests_in_memory(), 2);
-    assert!(queue_calls(&api).is_empty());
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK]);
 
     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
     // The next call moves the queue to the platform.
@@ -604,9 +604,6 @@ async fn a_run_past_the_switch_commits_its_queue_with_the_handled_requests_as_ha
     for url in [urls[1], urls[2], "https://a.test/4"] {
         assert!(platform_request(&api, url).unwrap()["handledAt"].is_null(), "{url}");
     }
-    let (marker, _) = api.record(DEFAULT_STORE, SPILLED).expect("the marker");
-    let marker: Value = serde_json::from_slice(&marker).unwrap();
-    assert_eq!(marker["requestQueueId"], DEFAULT_QUEUE);
 
     // The request in progress at the switch is not handed out again, and finishes on the platform.
     let mut rest = Vec::new();
@@ -632,7 +629,7 @@ async fn a_run_past_the_switch_commits_its_queue_with_the_handled_requests_as_ha
 }
 
 #[tokio::test]
-async fn a_resumed_run_finds_the_committed_queue_through_the_marker() {
+async fn a_resumed_run_whose_queue_holds_requests_uses_the_platform_queue() {
     let api = FakeApi::start().await;
     let backend = spilling_backend(&api, std::time::Duration::from_secs(30));
     let queue = Services::new(backend.clone()).open_request_queue(&StorageIdentifier::Default).await.unwrap();
@@ -641,9 +638,8 @@ async fn a_resumed_run_finds_the_committed_queue_through_the_marker() {
     queue.mark_request_as_handled(&mut first).await.unwrap();
     // As on a migration.
     backend.spill_request_queue().await.unwrap();
-    assert!(api.record(DEFAULT_STORE, SPILLED).is_some());
 
-    // The process after the migration opens the platform queue right away.
+    // The process after the migration finds the requests and opens the platform queue right away.
     let resumed = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)));
     let queue = resumed.open_request_queue(&StorageIdentifier::Default).await.unwrap();
     api.clear_calls();
@@ -651,6 +647,35 @@ async fn a_resumed_run_finds_the_committed_queue_through_the_marker() {
     assert!(again.was_already_handled);
     assert_eq!(queue.fetch_next_request().await.unwrap().unwrap().url, "https://a.test/2");
     assert!(!queue_calls(&api).is_empty(), "on the platform");
+}
+
+#[tokio::test]
+async fn a_queue_holding_only_handled_requests_or_that_cannot_be_checked_is_on_the_platform() {
+    use crawlee::core::StorageBackend as _;
+
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_request("https://a.test/done", false).await.unwrap();
+    let mut done = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut done).await.unwrap();
+    assert!(queue.is_finished().await.unwrap());
+    let resumed = spilling_backend(&api, std::time::Duration::from_secs(30));
+    resumed.create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+    assert_eq!(resumed.unhandled_requests_in_memory(), 0);
+    let queue = Services::new(resumed).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.clear_calls();
+    queue.add_request("https://a.test/new", false).await.unwrap();
+    assert!(!queue_calls(&api).is_empty(), "on the platform");
+
+    // An empty queue whose check fails: the platform queue, the safe side.
+    let api = FakeApi::start().await;
+    api.fail_next(QUEUE_CHECK, 1, axum::http::StatusCode::FORBIDDEN);
+    let queue = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)))
+        .open_request_queue(&StorageIdentifier::Default)
+        .await
+        .unwrap();
+    queue.add_request("https://a.test/new", false).await.unwrap();
+    assert!(queue_calls(&api).iter().any(|call| call.ends_with("/requests/batch")), "{:?}", queue_calls(&api));
 }
 
 #[tokio::test]

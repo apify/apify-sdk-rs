@@ -35,10 +35,6 @@ pub use self::request_queue::RequestQueueAccess;
 pub const DEFAULT_STORAGE_ALIAS: &str = "__default__";
 /// The record of the default key-value store holding a run's alias → storage id mapping.
 const ALIAS_MAPPING_RECORD_KEY: &str = "__STORAGE_ALIASES_MAPPING";
-/// The record of the default key-value store that says the run's default request queue moved from
-/// memory to the platform: a run that resumes (after a migration or a resurrection) opens the
-/// platform queue directly.
-pub const REQUEST_QUEUE_SPILLED_KEY: &str = "CRAWLEE_REQUEST_QUEUE_SPILLED";
 /// The longest client key the request queue API accepts.
 const MAX_CLIENT_KEY_LENGTH: usize = 32;
 
@@ -146,6 +142,10 @@ pub struct ApifyStorageBackend {
     spill_default_request_queue_after: Option<Duration>,
     /// The default request queue, while it is (or was) in memory.
     spilling_queue: Mutex<Option<Arc<SpillingRequestQueueBackend>>>,
+    /// Whether the default request queue holds a request already (see
+    /// [`check_default_request_queue`](Self::check_default_request_queue)); `true` when that could
+    /// not be read.
+    default_queue_has_requests: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 #[derive(Default)]
@@ -193,6 +193,7 @@ impl ApifyStorageBackend {
             prefetched_datasets: Arc::default(),
             spill_default_request_queue_after: None,
             spilling_queue: Mutex::new(None),
+            default_queue_has_requests: Arc::default(),
         }
     }
 
@@ -227,22 +228,59 @@ impl ApifyStorageBackend {
     /// ([`RequestQueueAccess::Single`]): named and aliased queues, and shared ones, which other
     /// clients read, are on the platform from the start. At the switch, the handled requests are
     /// added to the platform queue as handled, so a resumed run still deduplicates them, the
-    /// pending ones in their order, and those in progress finish there. Then the
-    /// [`REQUEST_QUEUE_SPILLED_KEY`] record is written to the default key-value store; a run that
-    /// finds it (after a migration or a resurrection) opens the platform queue directly.
+    /// pending ones in their order, and those in progress finish there.
     /// [`spill_request_queue`](Self::spill_request_queue) moves the queue at once.
+    ///
+    /// A run whose default queue holds a request already (handled or not), as after a migration
+    /// or a resurrection of a run that moved it, opens the platform queue directly. That is read
+    /// with a listing of one request (consistent, unlike the queue's counters) before the queue is
+    /// opened; [`check_default_request_queue`](Self::check_default_request_queue) starts it
+    /// ahead.
     pub fn spill_default_request_queue_after(mut self, after: Option<Duration>) -> Self {
         self.spill_default_request_queue_after = after;
         self
     }
 
-    /// The key of the record that says the default queue moved to the platform, when the default
-    /// queue starts in memory: [`Actor::init`](crate::Actor::init) reads it ahead.
-    pub(crate) fn spill_marker_key(&self) -> Option<&'static str> {
-        (self.spill_default_request_queue_after.is_some()
+    /// Whether the default request queue starts in memory, once it is checked to be empty.
+    fn spills_default_request_queue(&self) -> bool {
+        self.spill_default_request_queue_after.is_some()
             && self.configuration.is_at_home
-            && self.request_queue_access == RequestQueueAccess::Single)
-            .then_some(REQUEST_QUEUE_SPILLED_KEY)
+            && self.request_queue_access == RequestQueueAccess::Single
+            && !self.configuration.default_request_queue_id.is_empty()
+    }
+
+    /// Starts reading, in the background, whether the default request queue holds a request
+    /// already, which decides whether it starts in memory (see
+    /// [`spill_default_request_queue_after`](Self::spill_default_request_queue_after)), so that
+    /// opening it does not wait for the API. Does nothing when the queue cannot start in memory.
+    pub fn check_default_request_queue(&self) {
+        if !self.spills_default_request_queue() {
+            return;
+        }
+        let (cell, check) = (self.default_queue_has_requests.clone(), self.default_queue_check());
+        tokio::spawn(async move {
+            cell.get_or_init(|| check).await;
+        });
+    }
+
+    /// Lists one request of the default queue. A failure counts as a request: the platform queue
+    /// is the safe side.
+    fn default_queue_check(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
+        let client = self.client.request_queue(self.configuration.default_request_queue_id.clone());
+        async move {
+            let options =
+                apify_client::clients::request_queue::ListRequestsOptions { limit: Some(1), ..Default::default() };
+            match client.list_requests(options).await {
+                Ok(page) => !page.items.is_empty(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to read whether the default request queue holds requests, opening it on the \
+                         platform: {err}"
+                    );
+                    true
+                }
+            }
+        }
     }
 
     /// Moves the default request queue from memory to the platform now, if it is in memory: before
@@ -283,42 +321,18 @@ impl ApifyStorageBackend {
         }
     }
 
-    /// The default queue `id` in memory, moving to the platform after `after`, unless the run
-    /// moved it already (the marker record), or whether it did cannot be read.
+    /// The default queue `id` in memory, moving to the platform after `after`, unless it holds a
+    /// request already (a resumed run), or whether it does cannot be read.
     async fn spilling_request_queue(&self, id: &str, after: Duration) -> Option<Arc<SpillingRequestQueueBackend>> {
-        let store_id = self.configuration.default_key_value_store_id.clone();
-        if store_id.is_empty() {
+        // Waits for the check started ahead, if any.
+        if *self.default_queue_has_requests.get_or_init(|| self.default_queue_check()).await {
+            tracing::debug!("The default request queue holds requests already, opening it on the platform");
             return None;
         }
-        let store = self.client.key_value_store(store_id.clone());
-        let read = || key_value_store::get_record(&store, REQUEST_QUEUE_SPILLED_KEY);
-        let key = (store_id.clone(), REQUEST_QUEUE_SPILLED_KEY.to_owned());
-        match self.prefetched_stores.records.take_or(&key, read).await {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                tracing::debug!("The default request queue was moved to the platform before, opening it there");
-                return None;
-            }
-            Err(err) => {
-                // The platform queue then, which holds whatever was committed.
-                tracing::warn!("Failed to read whether the default request queue was moved to the platform: {err}");
-                return None;
-            }
-        }
-
         let target = self.platform_request_queue(id);
         let options = SpillingOptions { spill_after: Some(after), max_requests: None };
-        let (marker_store, prefetched, queue_id) = (store, self.prefetched_stores.clone(), id.to_owned());
-        let queue = SpillingRequestQueueBackend::new(move || std::future::ready(Ok(target.clone())), options)
-            .with_id(id)
-            .on_spilled(move || {
-                let (store, prefetched, key) = (marker_store.clone(), prefetched.clone(), key.clone());
-                let marker = serde_json::json!({ "requestQueueId": queue_id, "spilledAt": crawlee::core::now_iso() });
-                async move {
-                    prefetched.records.forget(&key);
-                    store.set_record_json(REQUEST_QUEUE_SPILLED_KEY, &marker).await.map_err(backend_error)
-                }
-            });
+        let queue =
+            SpillingRequestQueueBackend::new(move || std::future::ready(Ok(target.clone())), options).with_id(id);
         Some(Arc::new(queue))
     }
 
@@ -518,7 +532,7 @@ impl StorageBackend for ApifyStorageBackend {
             return Ok(opened.clone());
         }
         let spilling = match self.spill_default_request_queue_after {
-            Some(after) if self.spill_marker_key().is_some() && id == self.configuration.default_request_queue_id => {
+            Some(after) if self.spills_default_request_queue() && id == self.configuration.default_request_queue_id => {
                 self.spilling_request_queue(&id, after).await
             }
             _ => None,

@@ -335,7 +335,8 @@ fn queue_calls(api: &FakeApi) -> Vec<String> {
     api.calls().into_iter().filter(|call| call.contains("/v2/request-queues")).collect()
 }
 
-const SPILLED: &str = apify::storage::REQUEST_QUEUE_SPILLED_KEY;
+/// The listing of one request that tells whether the default queue holds requests already.
+const QUEUE_CHECK: &str = "GET /v2/request-queues/default-queue/requests";
 
 /// The handled flags of the requests of the default queue on the platform, by URL.
 fn platform_queue(api: &FakeApi, urls: &[&str]) -> Vec<Option<bool>> {
@@ -350,12 +351,11 @@ fn platform_queue(api: &FakeApi, urls: &[&str]) -> Vec<Option<bool>> {
 const QUEUE_URLS: [&str; 3] = ["https://a.test/1", "https://a.test/2", "https://a.test/3"];
 
 #[tokio::test]
-async fn a_short_run_makes_no_request_queue_calls() {
+async fn a_short_run_makes_only_the_check_that_its_queue_is_empty() {
     let api = FakeApi::start().await;
     let dir = tempfile::tempdir().unwrap();
     assert_exit(&run_child("queue-short", &platform_env(&api, None), dir.path()).await, 0);
-    assert_eq!(queue_calls(&api), Vec::<String>::new());
-    assert!(api.record(DEFAULT_STORE, SPILLED).is_none());
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK], "only the check that the queue is empty");
 }
 
 #[tokio::test]
@@ -364,7 +364,6 @@ async fn a_run_ending_with_requests_in_memory_commits_them() {
     let dir = tempfile::tempdir().unwrap();
     assert_exit(&run_child("queue-pending", &platform_env(&api, None), dir.path()).await, 0);
     assert_eq!(platform_queue(&api, &QUEUE_URLS), [Some(true), Some(false), Some(false)]);
-    assert!(api.record(DEFAULT_STORE, SPILLED).is_some());
 }
 
 #[tokio::test]
@@ -379,16 +378,13 @@ async fn a_migrating_run_commits_its_queue_before_it_reboots() {
     assert_eq!(platform_queue(&api, &QUEUE_URLS), [Some(true), Some(false), Some(false)]);
     let calls = api.calls();
     let reboot = calls.iter().position(|call| call == "POST /v2/actor-runs/run-1/reboot").expect("rebooted");
-    let marker = format!("PUT /v2/key-value-stores/{DEFAULT_STORE}/records/{SPILLED}");
-    let marked = calls.iter().position(|call| *call == marker).expect("the marker written");
     let committed = calls.iter().rposition(|call| call.ends_with("/requests/batch")).unwrap();
-    assert!(committed < marked && marked < reboot, "{calls:?}");
+    assert!(committed < reboot, "{calls:?}");
 }
 
 #[tokio::test]
-async fn a_resumed_run_uses_the_platform_queue_its_marker_points_to() {
+async fn a_resumed_run_whose_queue_holds_requests_uses_the_platform_queue() {
     let api = FakeApi::start().await;
-    api.put_record(DEFAULT_STORE, SPILLED, br#"{"requestQueueId":"default-queue"}"#, "application/json");
     api.add_request(DEFAULT_QUEUE, "https://a.test/left");
     let dir = tempfile::tempdir().unwrap();
 
@@ -396,11 +392,7 @@ async fn a_resumed_run_uses_the_platform_queue_its_marker_points_to() {
     assert_exit(&output, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FETCHED https://a.test/left"), "the request committed before:\n{stdout}");
-    assert_eq!(
-        api.count_calls(&format!("GET /v2/key-value-stores/{DEFAULT_STORE}/records/{SPILLED}")),
-        1,
-        "read ahead"
-    );
+    assert!(stdout.contains("FETCHED https://a.test/new"), "{stdout}");
     assert!(!queue_calls(&api).is_empty());
 }
 
@@ -812,6 +804,9 @@ async fn init_makes_its_calls_at_once_and_reads_records_ahead() {
     api.delay("GET /v2/actor-runs/run-1", slow);
     api.delay("GET /v2/key-value-stores", slow);
     api.delay("GET /v2/datasets", slow);
+    // Whether the default request queue is empty, read beside the records: opening the queue
+    // within the time below means the check did not wait for them, nor they for it.
+    api.delay(QUEUE_CHECK, slow);
     let events = common::serve_events(Duration::ZERO, Vec::new()).await;
     let dir = tempfile::tempdir().unwrap();
 
@@ -823,6 +818,7 @@ async fn init_makes_its_calls_at_once_and_reads_records_ahead() {
     assert!(elapsed < 1000, "init and the reads took {elapsed} ms:\n{stdout}");
     assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/INPUT"), 1);
     assert_eq!(api.count_calls("GET /v2/datasets/default-dataset"), 1);
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK], "checked once, and the queue kept in memory:\n{stdout}");
     // Read once ahead, and again after it was written.
     assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/STATE"), 2, "{:?}", api.calls());
 }
@@ -1456,6 +1452,7 @@ fn child() {
                 let state: Value = Actor::get_value("STATE").await.unwrap().unwrap();
                 assert_eq!(state["count"], 1);
                 Actor::services().open_dataset(&crawlee::StorageIdentifier::Default).await.unwrap();
+                Actor::services().open_request_queue(&crawlee::StorageIdentifier::Default).await.unwrap();
                 println!("ELAPSED {}", started.elapsed().as_millis());
                 Actor::set_value("STATE", &json!({ "count": 2 })).await.unwrap();
                 let state: Value = Actor::get_value("STATE").await.unwrap().unwrap();

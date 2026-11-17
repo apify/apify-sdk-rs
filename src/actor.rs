@@ -67,10 +67,11 @@ pub struct InitOptions {
     /// child runs are always read ahead). A record written before it is read is read again.
     pub prefetch_records: Vec<String>,
     /// On the platform, the run's default request queue is kept in memory for this long, and then
-    /// moved to the platform with what it holds, so that a short run makes no request queue API
-    /// calls (and its queue stays empty in the Apify console). It moves at once when the run
-    /// migrates or is aborted, and on exit if requests are left in it. `None`: on the platform
-    /// from the start. 30 s by default. See
+    /// moved to the platform with what it holds, so that a short run makes one request queue API
+    /// call (a listing of one request, made during `init`, which finds whether the queue holds
+    /// requests already, as in a resumed run), and its queue stays empty in the Apify console. It
+    /// moves at once when the run migrates or is aborted, and on exit if requests are left in it.
+    /// `None`: on the platform from the start. 30 s by default. See
     /// [`ApifyStorageBackend::spill_default_request_queue_after`].
     pub spill_request_queue_after: Option<Duration>,
 }
@@ -339,15 +340,13 @@ impl Actor {
                     .spill_default_request_queue_after(options.spill_request_queue_after);
                 // What every run reads first, read while the run connects to the platform: the
                 // default storages' metadata (which opening them reads), the input, the child runs,
-                // and whether the default request queue was moved to the platform already.
+                // and whether the default request queue holds requests already (a resumed run).
                 if configuration.is_at_home && !configuration.default_key_value_store_id.is_empty() {
                     let keys = [configuration.input_key.as_str(), crate::child_runs::CHILD_RUNS_KVS_KEY];
-                    let keys = keys
-                        .into_iter()
-                        .chain(cloud.spill_marker_key())
-                        .chain(options.prefetch_records.iter().map(String::as_str));
+                    let keys = keys.into_iter().chain(options.prefetch_records.iter().map(String::as_str));
                     cloud.prefetch_key_value_store(&configuration.default_key_value_store_id, keys);
                 }
+                cloud.check_default_request_queue();
                 if configuration.is_at_home && !configuration.default_dataset_id.is_empty() {
                     cloud.prefetch_dataset(&configuration.default_dataset_id);
                 }

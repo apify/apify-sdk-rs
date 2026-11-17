@@ -39,11 +39,9 @@ pub(crate) struct PrefetchedStores {
 /// not be listed, or the store holds too many to list.
 type Listing = Arc<tokio::sync::OnceCell<Option<HashSet<String>>>>;
 
-/// The size of a page of the listing: the most the API returns at once.
+/// The keys the listing reads, in one page: the most the API returns at once. A store holding more
+/// has its records read one by one (in parallel), rather than listed page after page.
 const LISTING_PAGE_SIZE: i64 = 1000;
-/// How many pages the listing reads at most. The records of a store holding more keys are read
-/// one by one.
-const MAX_LISTING_PAGES: usize = 10;
 
 impl PrefetchedStores {
     /// Starts reading the metadata of the store of `client` (whose id is `store_id`) and its
@@ -51,7 +49,7 @@ impl PrefetchedStores {
     /// once a listing of the store's keys finds them there. Those it does not find are read as
     /// missing without asking the API: in a fresh run, most records read ahead are (state an
     /// earlier container of the run would have saved). When the store cannot be listed, or holds
-    /// more keys than [`MAX_LISTING_PAGES`] pages, each record is read.
+    /// more keys than one page of the listing ([`LISTING_PAGE_SIZE`]), each record is read.
     pub(crate) fn prefetch<'a>(
         &self,
         client: &KeyValueStoreClient,
@@ -79,37 +77,27 @@ impl PrefetchedStores {
     }
 }
 
-/// All the keys of the store of `client`, or `None` when it holds more than [`MAX_LISTING_PAGES`]
-/// pages of them or the listing fails.
+/// All the keys of the store of `client`, or `None` when it holds more than one page of them
+/// ([`LISTING_PAGE_SIZE`]) or the listing fails.
 ///
 /// The listing is complete: on the Apify platform, a record is stored before its write is
 /// answered, and listed from then on (unlike a request queue's head, which lags behind), so the
 /// records an earlier container of the run wrote are listed.
 async fn list_all_keys(client: &KeyValueStoreClient) -> Option<HashSet<String>> {
-    let mut keys = HashSet::new();
-    let mut exclusive_start_key = None;
-    for _ in 0..MAX_LISTING_PAGES {
-        let options = ListKeysOptions {
-            limit: Some(LISTING_PAGE_SIZE),
-            exclusive_start_key: exclusive_start_key.take(),
-            ..ListKeysOptions::default()
-        };
-        let page = match client.list_keys(options).await {
-            Ok(page) => page,
-            Err(err) => {
-                tracing::debug!("Listing the keys of the key-value store failed, reading each record instead: {err}");
-                return None;
-            }
-        };
-        keys.extend(page.items.into_iter().map(|item| item.key));
-        if !page.is_truncated {
-            return Some(keys);
+    let options = ListKeysOptions { limit: Some(LISTING_PAGE_SIZE), ..ListKeysOptions::default() };
+    match client.list_keys(options).await {
+        Ok(page) if page.is_truncated => {
+            tracing::debug!(
+                "The key-value store holds more than {LISTING_PAGE_SIZE} keys, reading each record instead"
+            );
+            None
         }
-        // A truncated page without where to go on is read as a store too big to list.
-        exclusive_start_key = Some(page.next_exclusive_start_key?);
+        Ok(page) => Some(page.items.into_iter().map(|item| item.key).collect()),
+        Err(err) => {
+            tracing::debug!("Listing the keys of the key-value store failed, reading each record instead: {err}");
+            None
+        }
     }
-    tracing::debug!("The key-value store holds more than {} keys, reading each record instead", keys.len());
-    None
 }
 
 async fn get_metadata(client: &KeyValueStoreClient) -> StorageResult<KeyValueStoreInfo> {

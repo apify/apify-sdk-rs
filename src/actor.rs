@@ -67,7 +67,7 @@ pub struct InitOptions {
     /// child runs are always read ahead). The store's keys are listed once, and only the records
     /// it holds are read, once listed: in a fresh run, where most of these records (state saved
     /// by an earlier container of the run) do not exist yet, the first read of each is `None`
-    /// without an API call. When the store cannot be listed, or holds over 10,000 keys, each
+    /// without an API call. When the store cannot be listed, or holds over 1,000 keys (one page of the listing), each
     /// record is read. A record written or deleted before it is read is read again.
     pub prefetch_records: Vec<String>,
     /// On the platform, the run's default request queue is kept in memory for this long, and then

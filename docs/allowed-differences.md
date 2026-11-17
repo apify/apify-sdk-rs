@@ -68,7 +68,7 @@ These differences exist to make runs cheaper or faster.
   `InitOptions::prefetch_records` in the background, and the first read of each takes what was
   read. The records other than the input are read after one listing of the store's keys, and
   only when listed: the first read of one that is not is `None` without an API call (each is
-  read when the store cannot be listed or holds over 10,000 keys). What is written through the
+  read when the store cannot be listed or holds over 1,000 keys, one page of the listing). What is written through the
   SDK before it is read (a record, items of the dataset) is read again; what another client
   changes in the meantime is not. The JS SDK reads each when asked.
 - **Status messages can be set in the background.** `Actor::set_status_message_in_background` is

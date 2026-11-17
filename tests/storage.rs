@@ -173,8 +173,8 @@ async fn a_failing_listing_falls_back_to_reading_each_record() {
 #[tokio::test]
 async fn a_store_with_more_keys_than_the_listing_covers_falls_back_to_reading_each_record() {
     let api = FakeApi::start().await;
-    // Ten pages of a thousand keys, and more.
-    for n in 0..10_000 {
+    // More than the one page of a thousand keys the listing reads.
+    for n in 0..1_000 {
         api.put_record(DEFAULT_STORE, &format!("item-{n:05}"), b"x", "text/plain");
     }
     api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
@@ -186,7 +186,7 @@ async fn a_store_with_more_keys_than_the_listing_covers_falls_back_to_reading_ea
         let read = format!("GET /v2/key-value-stores/default-store/records/{key}");
         assert_eq!(api.count_calls(&read), 1, "{key}");
     }
-    assert_eq!(api.count_calls(LISTING), 10);
+    assert_eq!(api.count_calls(LISTING), 1, "one page, not the next ones");
 }
 
 #[tokio::test]

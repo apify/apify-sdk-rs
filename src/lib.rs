@@ -16,6 +16,8 @@ pub mod input;
 pub mod input_secrets;
 pub mod js;
 pub mod log;
+#[doc(hidden)]
+pub mod lru;
 pub mod platform;
 pub mod proxy;
 pub mod push;

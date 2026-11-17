@@ -2,10 +2,10 @@
 //! platform (`listAndLockHead`), a port of `ApifyRequestQueueSharedBackend` of the JS SDK.
 
 use std::collections::{HashSet, VecDeque};
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::lru::LazyLru;
 use apify_client::clients::request_queue::RequestQueueClient;
 use async_trait::async_trait;
 use crawlee::Request;
@@ -14,7 +14,6 @@ use crawlee::core::request::unique_key_to_request_id;
 use crawlee::core::storage::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
 };
-use lru::LruCache;
 use parking_lot::Mutex;
 
 use super::request_queue::{
@@ -39,7 +38,7 @@ struct Head {
 
 struct State {
     /// Whether requests this client knows about were handled, by id.
-    known: LruCache<String, bool>,
+    known: LazyLru<String, bool>,
     in_progress: HashSet<String>,
     estimated_total: u64,
     estimated_handled: u64,
@@ -60,7 +59,7 @@ impl ApifySharedRequestQueue {
             drop_hook,
             head: tokio::sync::Mutex::default(),
             state: Mutex::new(State {
-                known: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
+                known: LazyLru::new(MAX_CACHED_REQUESTS),
                 in_progress: HashSet::new(),
                 estimated_total: 0,
                 estimated_handled: 0,

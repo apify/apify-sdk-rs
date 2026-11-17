@@ -5,9 +5,9 @@
 //! of consumers, requests locked on the platform).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::lru::LazyLru;
 use apify_client::clients::request_queue::{BatchAddRequestsOptions, ListRequestsOptions, RequestQueueClient};
 use apify_client::models::RequestQueueRequest;
 use async_trait::async_trait;
@@ -19,7 +19,6 @@ use crawlee::core::storage::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
     UnprocessedRequest,
 };
-use lru::LruCache;
 use parking_lot::Mutex;
 
 use super::{DropHook, backend_error, date, extra_date, extra_u64, unsupported};
@@ -187,7 +186,7 @@ struct State {
     /// Local estimate of the queue head: request ids in the order they should be fetched.
     head: VecDeque<String>,
     /// Unhandled requests added by (or fetched through) this client, by id.
-    cached: LruCache<String, Request>,
+    cached: LazyLru<String, Request>,
     /// Ids of requests known to be handled.
     handled: HashSet<String>,
     /// Ids of requests being processed by this client.
@@ -247,7 +246,7 @@ impl ApifySingleRequestQueue {
             drop_hook,
             state: Arc::new(Mutex::new(State {
                 head: VecDeque::new(),
-                cached: LruCache::new(NonZeroUsize::new(MAX_CACHED_REQUESTS).expect("non-zero")),
+                cached: LazyLru::new(MAX_CACHED_REQUESTS),
                 handled: HashSet::new(),
                 in_progress: HashSet::new(),
                 head_complete: false,

@@ -38,9 +38,9 @@ These differences exist to make runs cheaper or faster.
   the first 30 s (`InitOptions::spill_request_queue_after`; `None` turns it off), then moved to
   the platform queue with what it holds: the handled requests added as handled (so a resumed run
   still deduplicates them), the pending ones in their order, those in progress last (they finish
-  there). The queue moves at once on `migrating` and `aborting`, and on exit when a failing run
-  left requests in it (a run that succeeds left them on purpose, by stopping or aborting its
-  crawl, and they are not written). A short run makes one request queue API call, so unlike in JS its queue stays empty
+  there). The queue moves at once on `migrating` and `aborting`. Requests left in memory when a
+  run ends are not written: a run that succeeds left them on purpose (by stopping or aborting
+  its crawl), and one that fails ends there. A short run makes one request queue API call, so unlike in JS its queue stays empty
   in the Apify console: during `Actor::init`, beside the reads of the input and the other records,
   it lists one request of the default queue (the listing is consistent, unlike the queue's
   counters, which can lag for seconds after the writes of a previous container). If the queue

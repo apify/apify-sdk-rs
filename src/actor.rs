@@ -64,7 +64,11 @@ pub struct InitOptions {
     pub graceful_shutdown_delay: Duration,
     /// Records of the default key-value store to read in the background during `init`, on the
     /// platform, so that their first reads do not wait for the API (the input and the tracked
-    /// child runs are always read ahead). A record written before it is read is read again.
+    /// child runs are always read ahead). The store's keys are listed once, and only the records
+    /// it holds are read, once listed: in a fresh run, where most of these records (state saved
+    /// by an earlier container of the run) do not exist yet, the first read of each is `None`
+    /// without an API call. When the store cannot be listed, or holds over 10,000 keys, each
+    /// record is read. A record written or deleted before it is read is read again.
     pub prefetch_records: Vec<String>,
     /// On the platform, the run's default request queue is kept in memory for this long, and then
     /// moved to the platform with what it holds, so that a short run makes one request queue API
@@ -339,8 +343,9 @@ impl Actor {
                     .request_queue_access(options.request_queue_access)
                     .spill_default_request_queue_after(options.spill_request_queue_after);
                 // What every run reads first, read while the run connects to the platform: the
-                // default storages' metadata (which opening them reads), the input, the child runs,
-                // and whether the default request queue holds requests already (a resumed run).
+                // default storages' metadata (which opening them reads), the input, the child runs
+                // and the records asked for (those the store's listing finds), and whether the
+                // default request queue holds requests already (a resumed run).
                 if configuration.is_at_home && !configuration.default_key_value_store_id.is_empty() {
                     let keys = [configuration.input_key.as_str(), crate::child_runs::CHILD_RUNS_KVS_KEY];
                     let keys = keys.into_iter().chain(options.prefetch_records.iter().map(String::as_str));

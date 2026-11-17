@@ -74,6 +74,121 @@ async fn key_value_store_records_keep_their_bytes_and_content_type() {
     assert_eq!(url, format!("{}/v2/key-value-stores/{DEFAULT_STORE}/records/OUTPUT", api.url));
 }
 
+/// Records an Actor may have saved in an earlier container of its run, read ahead.
+const STATE_KEYS: [&str; 10] =
+    ["STATE-0", "STATE-1", "STATE-2", "STATE-3", "STATE-4", "STATE-5", "STATE-6", "STATE-7", "STATE-8", "STATE-9"];
+
+/// The default store, with the input and [`STATE_KEYS`] read ahead as `Actor::init` reads them.
+async fn prefetched_store(api: &FakeApi) -> crawlee::KeyValueStore {
+    let backend = ApifyStorageBackend::new(configuration(api, true));
+    backend.prefetch_key_value_store(DEFAULT_STORE, std::iter::once("INPUT").chain(STATE_KEYS));
+    Services::new(Arc::new(backend)).open_key_value_store(&StorageIdentifier::Default).await.unwrap()
+}
+
+/// The key-value store calls made so far, sorted.
+fn store_calls(api: &FakeApi) -> Vec<String> {
+    let mut calls: Vec<String> =
+        api.calls().into_iter().filter(|call| call.contains("/v2/key-value-stores/")).collect();
+    calls.sort();
+    calls
+}
+
+const LISTING: &str = "GET /v2/key-value-stores/default-store/keys";
+
+#[tokio::test]
+async fn a_fresh_run_lists_the_store_once_instead_of_reading_each_missing_record() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "INPUT", br#"{"a":1}"#, "application/json");
+    let store = prefetched_store(&api).await;
+
+    assert_eq!(store.get_value::<Value>("INPUT").await.unwrap(), Some(json!({ "a": 1 })));
+    for key in STATE_KEYS {
+        assert_eq!(store.get_value::<Value>(key).await.unwrap(), None, "{key}");
+    }
+    let expected =
+        ["GET /v2/key-value-stores/default-store", LISTING, "GET /v2/key-value-stores/default-store/records/INPUT"];
+    assert_eq!(store_calls(&api), expected);
+}
+
+#[tokio::test]
+async fn the_listed_records_are_read_at_once_after_the_listing_and_the_others_answered_locally() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    api.put_record(DEFAULT_STORE, "STATE-7", b"7", "text/plain");
+    let slow = std::time::Duration::from_millis(300);
+    api.delay(LISTING, slow);
+    api.delay("GET /v2/key-value-stores/default-store/records/STATE", slow);
+    let started = std::time::Instant::now();
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = ["STATE-3", "STATE-7"].contains(&key).then(|| key[6..].to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+    }
+    // The listing, then both reads at the same time: 600 ms, where one after another takes 900.
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_millis(850), "{elapsed:?}");
+    let calls = api.calls();
+    let listed_at = calls.iter().position(|call| call == LISTING).unwrap();
+    let reads: Vec<usize> =
+        calls.iter().enumerate().filter(|(_, call)| call.contains("/records/STATE")).map(|(at, _)| at).collect();
+    assert_eq!(reads.len(), 2, "{calls:?}");
+    assert!(reads.iter().all(|&at| at > listed_at), "{calls:?}");
+    // The input, not in the store, was read too, and nothing else.
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/"), 3, "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_record_written_or_deleted_after_the_listing_is_read_from_the_api() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-1", b"1", "text/plain");
+    let store = prefetched_store(&api).await;
+    // Answered from the listing.
+    assert_eq!(store.get_text("STATE-2").await.unwrap(), None);
+
+    store.set_text("STATE-0", "0").await.unwrap();
+    assert_eq!(store.get_text("STATE-0").await.unwrap().as_deref(), Some("0"));
+    store.delete_value("STATE-1").await.unwrap();
+    assert_eq!(store.get_text("STATE-1").await.unwrap(), None);
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/STATE-0"), 1);
+    assert_eq!(api.count_calls(LISTING), 1);
+}
+
+#[tokio::test]
+async fn a_failing_listing_falls_back_to_reading_each_record() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    api.fail_next(LISTING, 1, axum::http::StatusCode::FORBIDDEN);
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = (key == "STATE-3").then(|| "3".to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+        let read = format!("GET /v2/key-value-stores/default-store/records/{key}");
+        assert_eq!(api.count_calls(&read), 1, "{key}");
+    }
+    assert_eq!(api.count_calls(LISTING), 1);
+}
+
+#[tokio::test]
+async fn a_store_with_more_keys_than_the_listing_covers_falls_back_to_reading_each_record() {
+    let api = FakeApi::start().await;
+    // Ten pages of a thousand keys, and more.
+    for n in 0..10_000 {
+        api.put_record(DEFAULT_STORE, &format!("item-{n:05}"), b"x", "text/plain");
+    }
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = (key == "STATE-3").then(|| "3".to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+        let read = format!("GET /v2/key-value-stores/default-store/records/{key}");
+        assert_eq!(api.count_calls(&read), 1, "{key}");
+    }
+    assert_eq!(api.count_calls(LISTING), 10);
+}
+
 #[tokio::test]
 async fn names_and_aliases_resolve_to_platform_storages() {
     let api = FakeApi::start().await;

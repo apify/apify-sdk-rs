@@ -199,10 +199,15 @@ impl ApifyStorageBackend {
 
     /// Starts reading the metadata of the key-value store `store_id` and its records `keys` in the
     /// background, so that the first reads of each take what was read instead of waiting for the
-    /// API (opening a storage reads its metadata). A record written or deleted before it is read
-    /// is read again, and so is the metadata of a store written to.
+    /// API (opening a storage reads its metadata). The store's keys are listed once, and only the
+    /// records listed are read (the input record of the default store is read at once, beside the
+    /// listing): the first read of one that is not listed is `None`, without an API call. When the
+    /// keys cannot be listed, or are too many (over 10,000), each record is read. A record written
+    /// or deleted before it is read is read again, and so is the metadata of a store written to.
     pub fn prefetch_key_value_store<'a>(&self, store_id: &str, keys: impl IntoIterator<Item = &'a str>) {
-        self.prefetched_stores.prefetch(&self.client.key_value_store(store_id), store_id, keys);
+        let input_key = (store_id == self.configuration.default_key_value_store_id)
+            .then_some(self.configuration.input_key.as_str());
+        self.prefetched_stores.prefetch(&self.client.key_value_store(store_id), store_id, keys, input_key);
     }
 
     /// Starts reading the metadata of the dataset `dataset_id` in the background, like

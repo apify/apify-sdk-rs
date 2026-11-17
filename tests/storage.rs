@@ -74,6 +74,121 @@ async fn key_value_store_records_keep_their_bytes_and_content_type() {
     assert_eq!(url, format!("{}/v2/key-value-stores/{DEFAULT_STORE}/records/OUTPUT", api.url));
 }
 
+/// Records an Actor may have saved in an earlier container of its run, read ahead.
+const STATE_KEYS: [&str; 10] =
+    ["STATE-0", "STATE-1", "STATE-2", "STATE-3", "STATE-4", "STATE-5", "STATE-6", "STATE-7", "STATE-8", "STATE-9"];
+
+/// The default store, with the input and [`STATE_KEYS`] read ahead as `Actor::init` reads them.
+async fn prefetched_store(api: &FakeApi) -> crawlee::KeyValueStore {
+    let backend = ApifyStorageBackend::new(configuration(api, true));
+    backend.prefetch_key_value_store(DEFAULT_STORE, std::iter::once("INPUT").chain(STATE_KEYS));
+    Services::new(Arc::new(backend)).open_key_value_store(&StorageIdentifier::Default).await.unwrap()
+}
+
+/// The key-value store calls made so far, sorted.
+fn store_calls(api: &FakeApi) -> Vec<String> {
+    let mut calls: Vec<String> =
+        api.calls().into_iter().filter(|call| call.contains("/v2/key-value-stores/")).collect();
+    calls.sort();
+    calls
+}
+
+const LISTING: &str = "GET /v2/key-value-stores/default-store/keys";
+
+#[tokio::test]
+async fn a_fresh_run_lists_the_store_once_instead_of_reading_each_missing_record() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "INPUT", br#"{"a":1}"#, "application/json");
+    let store = prefetched_store(&api).await;
+
+    assert_eq!(store.get_value::<Value>("INPUT").await.unwrap(), Some(json!({ "a": 1 })));
+    for key in STATE_KEYS {
+        assert_eq!(store.get_value::<Value>(key).await.unwrap(), None, "{key}");
+    }
+    let expected =
+        ["GET /v2/key-value-stores/default-store", LISTING, "GET /v2/key-value-stores/default-store/records/INPUT"];
+    assert_eq!(store_calls(&api), expected);
+}
+
+#[tokio::test]
+async fn the_listed_records_are_read_at_once_after_the_listing_and_the_others_answered_locally() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    api.put_record(DEFAULT_STORE, "STATE-7", b"7", "text/plain");
+    let slow = std::time::Duration::from_millis(300);
+    api.delay(LISTING, slow);
+    api.delay("GET /v2/key-value-stores/default-store/records/STATE", slow);
+    let started = std::time::Instant::now();
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = ["STATE-3", "STATE-7"].contains(&key).then(|| key[6..].to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+    }
+    // The listing, then both reads at the same time: 600 ms, where one after another takes 900.
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_millis(850), "{elapsed:?}");
+    let calls = api.calls();
+    let listed_at = calls.iter().position(|call| call == LISTING).unwrap();
+    let reads: Vec<usize> =
+        calls.iter().enumerate().filter(|(_, call)| call.contains("/records/STATE")).map(|(at, _)| at).collect();
+    assert_eq!(reads.len(), 2, "{calls:?}");
+    assert!(reads.iter().all(|&at| at > listed_at), "{calls:?}");
+    // The input, not in the store, was read too, and nothing else.
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/"), 3, "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_record_written_or_deleted_after_the_listing_is_read_from_the_api() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-1", b"1", "text/plain");
+    let store = prefetched_store(&api).await;
+    // Answered from the listing.
+    assert_eq!(store.get_text("STATE-2").await.unwrap(), None);
+
+    store.set_text("STATE-0", "0").await.unwrap();
+    assert_eq!(store.get_text("STATE-0").await.unwrap().as_deref(), Some("0"));
+    store.delete_value("STATE-1").await.unwrap();
+    assert_eq!(store.get_text("STATE-1").await.unwrap(), None);
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/STATE-0"), 1);
+    assert_eq!(api.count_calls(LISTING), 1);
+}
+
+#[tokio::test]
+async fn a_failing_listing_falls_back_to_reading_each_record() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    api.fail_next(LISTING, 1, axum::http::StatusCode::FORBIDDEN);
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = (key == "STATE-3").then(|| "3".to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+        let read = format!("GET /v2/key-value-stores/default-store/records/{key}");
+        assert_eq!(api.count_calls(&read), 1, "{key}");
+    }
+    assert_eq!(api.count_calls(LISTING), 1);
+}
+
+#[tokio::test]
+async fn a_store_with_more_keys_than_the_listing_covers_falls_back_to_reading_each_record() {
+    let api = FakeApi::start().await;
+    // More than the one page of a thousand keys the listing reads.
+    for n in 0..1_000 {
+        api.put_record(DEFAULT_STORE, &format!("item-{n:05}"), b"x", "text/plain");
+    }
+    api.put_record(DEFAULT_STORE, "STATE-3", b"3", "text/plain");
+    let store = prefetched_store(&api).await;
+
+    for key in STATE_KEYS {
+        let expected = (key == "STATE-3").then(|| "3".to_owned());
+        assert_eq!(store.get_text(key).await.unwrap(), expected, "{key}");
+        let read = format!("GET /v2/key-value-stores/default-store/records/{key}");
+        assert_eq!(api.count_calls(&read), 1, "{key}");
+    }
+    assert_eq!(api.count_calls(LISTING), 1, "one page, not the next ones");
+}
+
 #[tokio::test]
 async fn names_and_aliases_resolve_to_platform_storages() {
     let api = FakeApi::start().await;
@@ -543,4 +658,164 @@ async fn a_shared_queue_leaves_forefront_ordering_to_the_platform() {
     // The locked head is drained before the forefront request is looked at: the SDK does not re-read the head.
     let next = queue.fetch_next_request().await.unwrap().unwrap();
     assert_eq!(next.url, "https://a.test/1");
+}
+
+// ─── The default queue in memory first ──────────────────────────────────────
+
+fn spilling_backend(api: &FakeApi, after: std::time::Duration) -> Arc<ApifyStorageBackend> {
+    Arc::new(ApifyStorageBackend::new(configuration(api, true)).spill_default_request_queue_after(Some(after)))
+}
+
+fn queue_calls(api: &FakeApi) -> Vec<String> {
+    api.calls().into_iter().filter(|call| call.contains("/v2/request-queues")).collect()
+}
+
+fn platform_request(api: &FakeApi, url: &str) -> Option<Value> {
+    api.queue_request(DEFAULT_QUEUE, &crawlee::core::request::unique_key_to_request_id(url))
+}
+
+/// The listing of one request that tells whether the default queue holds requests already.
+const QUEUE_CHECK: &str = "GET /v2/request-queues/default-queue/requests";
+
+#[tokio::test]
+async fn a_short_run_keeps_its_default_queue_in_memory() {
+    let api = FakeApi::start().await;
+    let services = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)));
+    let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+    while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+    }
+    assert!(queue.is_finished().await.unwrap());
+    assert_eq!(queue.get_info().await.unwrap().id, DEFAULT_QUEUE);
+    assert_eq!(queue.handled_count().await.unwrap(), 2);
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK], "only the check that the queue is empty");
+
+    // Other queues are on the platform from the start.
+    let named = services.open_request_queue(&StorageIdentifier::name("other")).await.unwrap();
+    named.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+    assert!(queue_calls(&api).iter().any(|call| call.ends_with("/requests/batch")), "{:?}", queue_calls(&api));
+}
+
+#[tokio::test]
+async fn a_run_past_the_switch_commits_its_queue_with_the_handled_requests_as_handled() {
+    let api = FakeApi::start().await;
+    let backend = spilling_backend(&api, std::time::Duration::from_millis(300));
+    let services = Services::new(backend.clone());
+    let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let urls = ["https://a.test/1", "https://a.test/2", "https://a.test/3"];
+    queue.add_requests(urls.iter().map(|&url| url.into()).collect(), false).await.unwrap();
+    let mut first = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut first).await.unwrap();
+    let mut running = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(backend.unhandled_requests_in_memory(), 2);
+    assert_eq!(queue_calls(&api), [QUEUE_CHECK]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    // The next call moves the queue to the platform.
+    queue.add_requests(vec!["https://a.test/4".into()], false).await.unwrap();
+    assert_eq!(backend.unhandled_requests_in_memory(), 0);
+    assert!(!platform_request(&api, urls[0]).unwrap()["handledAt"].is_null(), "committed as handled");
+    for url in [urls[1], urls[2], "https://a.test/4"] {
+        assert!(platform_request(&api, url).unwrap()["handledAt"].is_null(), "{url}");
+    }
+
+    // The request in progress at the switch is not handed out again, and finishes on the platform.
+    let mut rest = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        rest.push(request);
+    }
+    let rest_urls: Vec<&str> = rest.iter().map(|request| request.url.as_str()).collect();
+    assert_eq!(rest_urls, ["https://a.test/3", "https://a.test/4"]);
+    assert!(!queue.is_finished().await.unwrap());
+    queue.mark_request_as_handled(&mut running).await.unwrap().unwrap();
+    for mut request in rest {
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+    }
+    assert!(queue.is_finished().await.unwrap());
+    assert!(!platform_request(&api, urls[1]).unwrap()["handledAt"].is_null());
+    let info = queue.get_info().await.unwrap();
+    assert_eq!((info.id.as_str(), info.total_request_count, info.handled_request_count), (DEFAULT_QUEUE, 4, 4));
+
+    // A client that never saw the requests learns from the platform that they were handled.
+    let fresh = crawlee::RequestQueue::from_backend(queue.backend().clone());
+    let again = fresh.add_request("https://a.test/1", false).await.unwrap();
+    assert!(again.was_already_present && again.was_already_handled);
+}
+
+#[tokio::test]
+async fn a_resumed_run_whose_queue_holds_requests_uses_the_platform_queue() {
+    let api = FakeApi::start().await;
+    let backend = spilling_backend(&api, std::time::Duration::from_secs(30));
+    let queue = Services::new(backend.clone()).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+    let mut first = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut first).await.unwrap();
+    // As on a migration.
+    backend.spill_request_queue().await.unwrap();
+
+    // The process after the migration finds the requests and opens the platform queue right away.
+    let resumed = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)));
+    let queue = resumed.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.clear_calls();
+    let again = queue.add_request("https://a.test/1", false).await.unwrap();
+    assert!(again.was_already_handled);
+    assert_eq!(queue.fetch_next_request().await.unwrap().unwrap().url, "https://a.test/2");
+    assert!(!queue_calls(&api).is_empty(), "on the platform");
+}
+
+#[tokio::test]
+async fn a_queue_holding_only_handled_requests_or_that_cannot_be_checked_is_on_the_platform() {
+    use crawlee::core::StorageBackend as _;
+
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_request("https://a.test/done", false).await.unwrap();
+    let mut done = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut done).await.unwrap();
+    assert!(queue.is_finished().await.unwrap());
+    let resumed = spilling_backend(&api, std::time::Duration::from_secs(30));
+    resumed.create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+    assert_eq!(resumed.unhandled_requests_in_memory(), 0);
+    let queue = Services::new(resumed).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.clear_calls();
+    queue.add_request("https://a.test/new", false).await.unwrap();
+    assert!(!queue_calls(&api).is_empty(), "on the platform");
+
+    // An empty queue whose check fails: the platform queue, the safe side.
+    let api = FakeApi::start().await;
+    api.fail_next(QUEUE_CHECK, 1, axum::http::StatusCode::FORBIDDEN);
+    let queue = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)))
+        .open_request_queue(&StorageIdentifier::Default)
+        .await
+        .unwrap();
+    queue.add_request("https://a.test/new", false).await.unwrap();
+    assert!(queue_calls(&api).iter().any(|call| call.ends_with("/requests/batch")), "{:?}", queue_calls(&api));
+}
+
+#[tokio::test]
+async fn a_shared_default_queue_is_on_the_platform_from_the_start() {
+    let api = FakeApi::start().await;
+    let backend = ApifyStorageBackend::new(configuration(&api, true))
+        .request_queue_access(apify::RequestQueueAccess::Shared)
+        .spill_default_request_queue_after(Some(std::time::Duration::from_secs(30)));
+    let queue = Services::new(Arc::new(backend)).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+    assert!(!queue_calls(&api).is_empty());
+}
+
+#[tokio::test]
+async fn requests_added_as_handled_are_not_fetched_and_count_as_handled() {
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let mut handled = crawlee::Request::new("https://a.test/done");
+    handled.handled_at = Some("2026-01-01T00:00:00.000Z".to_owned());
+    queue.backend().add_batch_of_requests(vec![handled, "https://a.test/todo".into()], false).await.unwrap();
+    assert!(!platform_request(&api, "https://a.test/done").unwrap()["handledAt"].is_null());
+    let fetched = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(fetched.url, "https://a.test/todo");
+    assert!(queue.fetch_next_request().await.unwrap().is_none());
+    assert_eq!(queue.handled_count().await.unwrap(), 1);
+    let again = queue.backend().add_batch_of_requests(vec!["https://a.test/done".into()], false).await.unwrap();
+    assert!(again.processed_requests[0].was_already_handled);
 }

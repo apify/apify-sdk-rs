@@ -33,6 +33,21 @@ These differences exist to make runs cheaper or faster.
   never lists the head, and `is_finished` makes no API call: it is true once nothing it knows of
   is left in its local head or in progress. The queue is the run's own: requests another client
   adds after that are not fetched (the JS SDK picks them up from the head).
+- **The default request queue starts in memory.** On the platform, the run's default request
+  queue (consumed by this run only, the default `RequestQueueAccess::Single`) is kept in memory for
+  the first 30 s (`InitOptions::spill_request_queue_after`; `None` turns it off), then moved to
+  the platform queue with what it holds: the handled requests added as handled (so a resumed run
+  still deduplicates them), the pending ones in their order, those in progress last (they finish
+  there). The queue moves at once on `migrating` and `aborting`. Requests left in memory when a
+  run ends are not written: a run that succeeds left them on purpose (by stopping or aborting
+  its crawl), and one that fails ends there. A short run makes one request queue API call, so unlike in JS its queue stays empty
+  in the Apify console: during `Actor::init`, beside the reads of the input and the other records,
+  it lists one request of the default queue (the listing is consistent, unlike the queue's
+  counters, which can lag for seconds after the writes of a previous container). If the queue
+  holds any request, handled or not, as after a migration or a resurrection of a run that moved
+  it, it is used on the platform from the start; if the listing fails, too. Nothing else tells a
+  restarted run apart. A short run that is resurrected starts its queue over, as nothing of it
+  was stored. Named, aliased and shared queues are on the platform from the start.
 - **Buffered pushes (extra).** `Actor::push_data_buffered`, `push_data_and_charge_buffered` and
   `push_data_buffered_with` store the items pushed within 0.5 s of each other
   (`InitOptions::push_buffer_window`) with one request, and charge them with one charge call per
@@ -51,9 +66,11 @@ These differences exist to make runs cheaper or faster.
   `init` starts reading the metadata of the default dataset and key-value store (which opening
   them reads), the input record, the tracked child runs and the records of
   `InitOptions::prefetch_records` in the background, and the first read of each takes what was
-  read. What is written through the SDK before it is read (a record, items of the dataset) is
-  read again; what another client changes in the meantime is not. The JS SDK reads each when
-  asked.
+  read. The records other than the input are read after one listing of the store's keys, and
+  only when listed: the first read of one that is not is `None` without an API call (each is
+  read when the store cannot be listed or holds over 1,000 keys, one page of the listing). What is written through the
+  SDK before it is read (a record, items of the dataset) is read again; what another client
+  changes in the meantime is not. The JS SDK reads each when asked.
 - **Status messages can be set in the background.** `Actor::set_status_message_in_background` is
   `Actor.setStatusMessage(...)` without `await`: the message is logged at once and the run updated
   later. Updates are sent one at a time in the order they were made, and an update is dropped when

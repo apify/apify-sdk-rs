@@ -151,9 +151,18 @@ impl RequestQueueBackend for ApifySharedRequestQueue {
         if !new_requests.is_empty() {
             result = send_batch(&self.client, &new_requests, forefront).await?;
             {
+                let added_as_handled: HashSet<&str> = new_requests
+                    .iter()
+                    .filter(|request| request.handled_at.is_some())
+                    .map(|request| request.unique_key.as_str())
+                    .collect();
                 let mut state = self.state.lock();
                 for processed in &result.processed_requests {
-                    state.known.put(processed.request_id.clone(), processed.was_already_handled);
+                    let as_handled = added_as_handled.contains(processed.unique_key.as_str());
+                    if as_handled && !processed.was_already_present {
+                        state.estimated_handled += 1;
+                    }
+                    state.known.put(processed.request_id.clone(), processed.was_already_handled || as_handled);
                 }
             }
         }

@@ -359,11 +359,18 @@ async fn a_short_run_makes_only_the_check_that_its_queue_is_empty() {
 }
 
 #[tokio::test]
-async fn a_run_ending_with_requests_in_memory_commits_them() {
-    let api = FakeApi::start().await;
-    let dir = tempfile::tempdir().unwrap();
-    assert_exit(&run_child("queue-pending", &platform_env(&api, None), dir.path()).await, 0);
-    assert_eq!(platform_queue(&api, &QUEUE_URLS), [Some(true), Some(false), Some(false)]);
+async fn a_run_ending_with_requests_left_in_memory_does_not_commit_them() {
+    // A run that succeeds left them on purpose (it stopped or aborted its crawl), and one that fails
+    // ends there: writing them would cost a write each, for nothing. A run that goes on elsewhere
+    // (migrating, aborting) moves them on that event.
+    for (scenario, succeeds) in [("queue-pending", true), ("queue-pending-fail", false)] {
+        let api = FakeApi::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = run_child(scenario, &platform_env(&api, None), dir.path()).await;
+        assert_eq!(output.status.code() == Some(0), succeeds, "{scenario}: {output:?}");
+        assert_eq!(platform_queue(&api, &QUEUE_URLS), [None, None, None], "{scenario}");
+        assert_eq!(queue_calls(&api), [QUEUE_CHECK], "{scenario}");
+    }
 }
 
 #[tokio::test]
@@ -1092,7 +1099,7 @@ fn child() {
                 })
                 .await
             }
-            "queue-short" | "queue-pending" | "queue-migrate" => {
+            "queue-short" | "queue-pending" | "queue-pending-fail" | "queue-migrate" => {
                 Actor::main(|| async move {
                     use crawlee::RequestManager as _;
                     let queue =
@@ -1108,6 +1115,9 @@ fn child() {
                     }
                     if scenario == "queue-migrate" {
                         tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    if scenario == "queue-pending-fail" {
+                        anyhow::bail!("the run fails");
                     }
                     Ok(())
                 })

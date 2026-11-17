@@ -655,13 +655,6 @@ impl Actor {
             }
             // Items buffered by listeners.
             state().push_buffer.flush().await;
-            // Requests left in the default queue in memory, for a resurrected run.
-            if let Some(platform_storage) = &state().platform_storage
-                && platform_storage.unhandled_requests_in_memory() > 0
-                && let Err(err) = platform_storage.spill_request_queue().await
-            {
-                tracing::error!("Failed to move the request queue from memory to the platform: {err}");
-            }
             let started = Instant::now();
             // The status messages still being set must not overwrite the terminal one.
             let (teardown, ()) = tokio::join!(state().storage.teardown(), Self::wait_for_status_messages());

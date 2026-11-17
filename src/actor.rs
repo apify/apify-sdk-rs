@@ -66,6 +66,14 @@ pub struct InitOptions {
     /// platform, so that their first reads do not wait for the API (the input and the tracked
     /// child runs are always read ahead). A record written before it is read is read again.
     pub prefetch_records: Vec<String>,
+    /// On the platform, the run's default request queue is kept in memory for this long, and then
+    /// moved to the platform with what it holds, so that a short run makes one request queue API
+    /// call (a listing of one request, made during `init`, which finds whether the queue holds
+    /// requests already, as in a resumed run), and its queue stays empty in the Apify console. It
+    /// moves at once when the run migrates or is aborted, and on exit if requests are left in it.
+    /// `None`: on the platform from the start. 30 s by default. See
+    /// [`ApifyStorageBackend::spill_default_request_queue_after`].
+    pub spill_request_queue_after: Option<Duration>,
 }
 
 impl Default for InitOptions {
@@ -79,6 +87,7 @@ impl Default for InitOptions {
             graceful_shutdown: true,
             graceful_shutdown_delay: Duration::ZERO,
             prefetch_records: Vec::new(),
+            spill_request_queue_after: Some(crawlee::core::storage::spilling::DEFAULT_SPILL_AFTER),
         }
     }
 }
@@ -151,6 +160,8 @@ struct Inner {
     client: ApifyClient,
     storage: Arc<dyn StorageBackend>,
     smart: Option<Arc<SmartStorageBackend>>,
+    /// The platform storages, when the Actor uses them (not with a storage of its own).
+    platform_storage: Option<Arc<ApifyStorageBackend>>,
     charging: Arc<ChargingManager>,
     services: Services,
     exiting: AtomicBool,
@@ -321,22 +332,26 @@ impl Actor {
 
         let client = new_client(&configuration, None, RateLimitCounter::default());
         let charging = Arc::new(ChargingManager::new(configuration.clone(), client.clone()));
-        let (storage, smart): (Arc<dyn StorageBackend>, _) = match options.storage {
-            Some(storage) => (storage, None),
+        let (storage, smart, platform_storage): (Arc<dyn StorageBackend>, _, _) = match options.storage {
+            Some(storage) => (storage, None, None),
             None => {
-                let cloud =
-                    ApifyStorageBackend::new(configuration.clone()).request_queue_access(options.request_queue_access);
+                let cloud = ApifyStorageBackend::new(configuration.clone())
+                    .request_queue_access(options.request_queue_access)
+                    .spill_default_request_queue_after(options.spill_request_queue_after);
                 // What every run reads first, read while the run connects to the platform: the
-                // default storages' metadata (which opening them reads), the input and the child runs.
+                // default storages' metadata (which opening them reads), the input, the child runs,
+                // and whether the default request queue holds requests already (a resumed run).
                 if configuration.is_at_home && !configuration.default_key_value_store_id.is_empty() {
                     let keys = [configuration.input_key.as_str(), crate::child_runs::CHILD_RUNS_KVS_KEY];
                     let keys = keys.into_iter().chain(options.prefetch_records.iter().map(String::as_str));
                     cloud.prefetch_key_value_store(&configuration.default_key_value_store_id, keys);
                 }
+                cloud.check_default_request_queue();
                 if configuration.is_at_home && !configuration.default_dataset_id.is_empty() {
                     cloud.prefetch_dataset(&configuration.default_dataset_id);
                 }
-                let cloud: Arc<dyn StorageBackend> = Arc::new(cloud);
+                let platform_storage = Arc::new(cloud);
+                let cloud: Arc<dyn StorageBackend> = platform_storage.clone();
                 let local = SmartStorageBackend::local_backend(&configuration);
                 // The default datasets charge for their items under pay-per-event pricing.
                 let charged = |inner| -> Arc<dyn StorageBackend> {
@@ -348,7 +363,7 @@ impl Actor {
                 };
                 let (cloud, local) = (charged(cloud), charged(local));
                 let smart = Arc::new(SmartStorageBackend::new(configuration.clone(), cloud, local));
-                (smart.clone(), Some(smart))
+                (smart.clone(), Some(smart), Some(platform_storage))
             }
         };
 
@@ -374,6 +389,7 @@ impl Actor {
             client,
             storage,
             smart,
+            platform_storage,
             charging,
             services,
             exiting: AtomicBool::new(false),
@@ -413,6 +429,30 @@ impl Actor {
             let push_buffer = push_buffer.clone();
             async move { push_buffer.flush().await }
         });
+        // The default request queue moves from memory to the platform before the run moves to another
+        // server or ends, and once its time in memory is over, should nobody call it.
+        if let Some(platform_storage) = &state.platform_storage {
+            for kind in [EventKind::Migrating, EventKind::Aborting] {
+                let platform_storage = platform_storage.clone();
+                events.on(kind, move |_| {
+                    let platform_storage = platform_storage.clone();
+                    async move {
+                        if let Err(err) = platform_storage.spill_request_queue().await {
+                            tracing::error!("Failed to move the request queue from memory to the platform: {err}");
+                        }
+                    }
+                });
+            }
+            let platform_storage = platform_storage.clone();
+            events.on(EventKind::PersistState, move |_| {
+                let platform_storage = platform_storage.clone();
+                async move {
+                    if let Err(err) = platform_storage.spill_request_queue_if_due().await {
+                        tracing::warn!("Failed to move the request queue from memory to the platform: {err}");
+                    }
+                }
+            });
+        }
         // Child runs started with `abort_with_parent` are aborted with this run. Exit waits for it.
         events.on(EventKind::Aborting, |_| async {
             Self::child_run_tracker().abort_runs_with_parent(Self::client()).await
@@ -615,6 +655,13 @@ impl Actor {
             }
             // Items buffered by listeners.
             state().push_buffer.flush().await;
+            // Requests left in the default queue in memory, for a resurrected run.
+            if let Some(platform_storage) = &state().platform_storage
+                && platform_storage.unhandled_requests_in_memory() > 0
+                && let Err(err) = platform_storage.spill_request_queue().await
+            {
+                tracing::error!("Failed to move the request queue from memory to the platform: {err}");
+            }
             let started = Instant::now();
             // The status messages still being set must not overwrite the terminal one.
             let (teardown, ()) = tokio::join!(state().storage.teardown(), Self::wait_for_status_messages());

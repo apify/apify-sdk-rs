@@ -331,6 +331,79 @@ async fn a_migrating_run_saves_its_state_and_reboots() {
     assert!(saved < reboot, "the state is saved before the reboot: {calls:?}");
 }
 
+fn queue_calls(api: &FakeApi) -> Vec<String> {
+    api.calls().into_iter().filter(|call| call.contains("/v2/request-queues")).collect()
+}
+
+const SPILLED: &str = apify::storage::REQUEST_QUEUE_SPILLED_KEY;
+
+/// The handled flags of the requests of the default queue on the platform, by URL.
+fn platform_queue(api: &FakeApi, urls: &[&str]) -> Vec<Option<bool>> {
+    urls.iter()
+        .map(|url| {
+            let id = crawlee::core::request::unique_key_to_request_id(url);
+            api.queue_request(DEFAULT_QUEUE, &id).map(|request| !request["handledAt"].is_null())
+        })
+        .collect()
+}
+
+const QUEUE_URLS: [&str; 3] = ["https://a.test/1", "https://a.test/2", "https://a.test/3"];
+
+#[tokio::test]
+async fn a_short_run_makes_no_request_queue_calls() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("queue-short", &platform_env(&api, None), dir.path()).await, 0);
+    assert_eq!(queue_calls(&api), Vec::<String>::new());
+    assert!(api.record(DEFAULT_STORE, SPILLED).is_none());
+}
+
+#[tokio::test]
+async fn a_run_ending_with_requests_in_memory_commits_them() {
+    let api = FakeApi::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    assert_exit(&run_child("queue-pending", &platform_env(&api, None), dir.path()).await, 0);
+    assert_eq!(platform_queue(&api, &QUEUE_URLS), [Some(true), Some(false), Some(false)]);
+    assert!(api.record(DEFAULT_STORE, SPILLED).is_some());
+}
+
+#[tokio::test]
+async fn a_migrating_run_commits_its_queue_before_it_reboots() {
+    let api = FakeApi::start().await;
+    let events =
+        common::serve_events(Duration::from_millis(500), vec![json!({ "name": "migrating", "data": null })]).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("queue-migrate", &platform_env(&api, Some(events)), dir.path()).await;
+    assert_exit(&output, 0);
+    assert_eq!(platform_queue(&api, &QUEUE_URLS), [Some(true), Some(false), Some(false)]);
+    let calls = api.calls();
+    let reboot = calls.iter().position(|call| call == "POST /v2/actor-runs/run-1/reboot").expect("rebooted");
+    let marker = format!("PUT /v2/key-value-stores/{DEFAULT_STORE}/records/{SPILLED}");
+    let marked = calls.iter().position(|call| *call == marker).expect("the marker written");
+    let committed = calls.iter().rposition(|call| call.ends_with("/requests/batch")).unwrap();
+    assert!(committed < marked && marked < reboot, "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_resumed_run_uses_the_platform_queue_its_marker_points_to() {
+    let api = FakeApi::start().await;
+    api.put_record(DEFAULT_STORE, SPILLED, br#"{"requestQueueId":"default-queue"}"#, "application/json");
+    api.add_request(DEFAULT_QUEUE, "https://a.test/left");
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("queue-resumed", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FETCHED https://a.test/left"), "the request committed before:\n{stdout}");
+    assert_eq!(
+        api.count_calls(&format!("GET /v2/key-value-stores/{DEFAULT_STORE}/records/{SPILLED}")),
+        1,
+        "read ahead"
+    );
+    assert!(!queue_calls(&api).is_empty());
+}
+
 #[tokio::test]
 async fn a_local_run_reads_its_input_from_the_working_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -1019,6 +1092,41 @@ fn child() {
                     state.lock()["count"] = json!(1);
                     let wait = if scenario == "wait" { 60 } else { 2 };
                     tokio::time::sleep(Duration::from_secs(wait)).await;
+                    Ok(())
+                })
+                .await
+            }
+            "queue-short" | "queue-pending" | "queue-migrate" => {
+                Actor::main(|| async move {
+                    use crawlee::RequestManager as _;
+                    let queue =
+                        Actor::open_request_queue(&crawlee::StorageIdentifier::Default, Default::default()).await?;
+                    let urls: [&str; 3] = ["https://a.test/1", "https://a.test/2", "https://a.test/3"];
+                    queue.add_requests(urls.iter().map(|&url| url.into()).collect(), false).await?;
+                    let handle_all = scenario == "queue-short";
+                    while let Some(mut request) = queue.fetch_next_request().await? {
+                        queue.mark_request_as_handled(&mut request).await?;
+                        if !handle_all {
+                            break;
+                        }
+                    }
+                    if scenario == "queue-migrate" {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Ok(())
+                })
+                .await
+            }
+            "queue-resumed" => {
+                Actor::main(|| async move {
+                    use crawlee::RequestManager as _;
+                    let queue =
+                        Actor::open_request_queue(&crawlee::StorageIdentifier::Default, Default::default()).await?;
+                    queue.add_requests(vec!["https://a.test/new".into()], false).await?;
+                    while let Some(mut request) = queue.fetch_next_request().await? {
+                        println!("FETCHED {}", request.url);
+                        queue.mark_request_as_handled(&mut request).await?;
+                    }
                     Ok(())
                 })
                 .await

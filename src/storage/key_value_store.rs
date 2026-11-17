@@ -68,7 +68,7 @@ async fn get_metadata(client: &KeyValueStoreClient) -> StorageResult<KeyValueSto
     })
 }
 
-async fn get_record(client: &KeyValueStoreClient, key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
+pub(super) async fn get_record(client: &KeyValueStoreClient, key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
     let record = client.get_record(key).await.map_err(backend_error)?;
     Ok(record.map(|record| KeyValueStoreRecord {
         key: record.key,

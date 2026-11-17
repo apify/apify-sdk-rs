@@ -544,3 +544,138 @@ async fn a_shared_queue_leaves_forefront_ordering_to_the_platform() {
     let next = queue.fetch_next_request().await.unwrap().unwrap();
     assert_eq!(next.url, "https://a.test/1");
 }
+
+// ─── The default queue in memory first ──────────────────────────────────────
+
+fn spilling_backend(api: &FakeApi, after: std::time::Duration) -> Arc<ApifyStorageBackend> {
+    Arc::new(ApifyStorageBackend::new(configuration(api, true)).spill_default_request_queue_after(Some(after)))
+}
+
+fn queue_calls(api: &FakeApi) -> Vec<String> {
+    api.calls().into_iter().filter(|call| call.contains("/v2/request-queues")).collect()
+}
+
+fn platform_request(api: &FakeApi, url: &str) -> Option<Value> {
+    api.queue_request(DEFAULT_QUEUE, &crawlee::core::request::unique_key_to_request_id(url))
+}
+
+const SPILLED: &str = apify::storage::REQUEST_QUEUE_SPILLED_KEY;
+
+#[tokio::test]
+async fn a_short_run_keeps_its_default_queue_in_memory() {
+    let api = FakeApi::start().await;
+    let services = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)));
+    let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+    while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+    }
+    assert!(queue.is_finished().await.unwrap());
+    assert_eq!(queue.get_info().await.unwrap().id, DEFAULT_QUEUE);
+    assert_eq!(queue.handled_count().await.unwrap(), 2);
+    assert_eq!(queue_calls(&api), Vec::<String>::new());
+    assert!(api.record(DEFAULT_STORE, SPILLED).is_none());
+
+    // Other queues are on the platform from the start.
+    let named = services.open_request_queue(&StorageIdentifier::name("other")).await.unwrap();
+    named.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+    assert!(queue_calls(&api).iter().any(|call| call.ends_with("/requests/batch")), "{:?}", queue_calls(&api));
+}
+
+#[tokio::test]
+async fn a_run_past_the_switch_commits_its_queue_with_the_handled_requests_as_handled() {
+    let api = FakeApi::start().await;
+    let backend = spilling_backend(&api, std::time::Duration::from_millis(300));
+    let services = Services::new(backend.clone());
+    let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let urls = ["https://a.test/1", "https://a.test/2", "https://a.test/3"];
+    queue.add_requests(urls.iter().map(|&url| url.into()).collect(), false).await.unwrap();
+    let mut first = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut first).await.unwrap();
+    let mut running = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(backend.unhandled_requests_in_memory(), 2);
+    assert!(queue_calls(&api).is_empty());
+
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    // The next call moves the queue to the platform.
+    queue.add_requests(vec!["https://a.test/4".into()], false).await.unwrap();
+    assert_eq!(backend.unhandled_requests_in_memory(), 0);
+    assert!(!platform_request(&api, urls[0]).unwrap()["handledAt"].is_null(), "committed as handled");
+    for url in [urls[1], urls[2], "https://a.test/4"] {
+        assert!(platform_request(&api, url).unwrap()["handledAt"].is_null(), "{url}");
+    }
+    let (marker, _) = api.record(DEFAULT_STORE, SPILLED).expect("the marker");
+    let marker: Value = serde_json::from_slice(&marker).unwrap();
+    assert_eq!(marker["requestQueueId"], DEFAULT_QUEUE);
+
+    // The request in progress at the switch is not handed out again, and finishes on the platform.
+    let mut rest = Vec::new();
+    while let Some(request) = queue.fetch_next_request().await.unwrap() {
+        rest.push(request);
+    }
+    let rest_urls: Vec<&str> = rest.iter().map(|request| request.url.as_str()).collect();
+    assert_eq!(rest_urls, ["https://a.test/3", "https://a.test/4"]);
+    assert!(!queue.is_finished().await.unwrap());
+    queue.mark_request_as_handled(&mut running).await.unwrap().unwrap();
+    for mut request in rest {
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+    }
+    assert!(queue.is_finished().await.unwrap());
+    assert!(!platform_request(&api, urls[1]).unwrap()["handledAt"].is_null());
+    let info = queue.get_info().await.unwrap();
+    assert_eq!((info.id.as_str(), info.total_request_count, info.handled_request_count), (DEFAULT_QUEUE, 4, 4));
+
+    // A client that never saw the requests learns from the platform that they were handled.
+    let fresh = crawlee::RequestQueue::from_backend(queue.backend().clone());
+    let again = fresh.add_request("https://a.test/1", false).await.unwrap();
+    assert!(again.was_already_present && again.was_already_handled);
+}
+
+#[tokio::test]
+async fn a_resumed_run_finds_the_committed_queue_through_the_marker() {
+    let api = FakeApi::start().await;
+    let backend = spilling_backend(&api, std::time::Duration::from_secs(30));
+    let queue = Services::new(backend.clone()).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+    let mut first = queue.fetch_next_request().await.unwrap().unwrap();
+    queue.mark_request_as_handled(&mut first).await.unwrap();
+    // As on a migration.
+    backend.spill_request_queue().await.unwrap();
+    assert!(api.record(DEFAULT_STORE, SPILLED).is_some());
+
+    // The process after the migration opens the platform queue right away.
+    let resumed = Services::new(spilling_backend(&api, std::time::Duration::from_secs(30)));
+    let queue = resumed.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    api.clear_calls();
+    let again = queue.add_request("https://a.test/1", false).await.unwrap();
+    assert!(again.was_already_handled);
+    assert_eq!(queue.fetch_next_request().await.unwrap().unwrap().url, "https://a.test/2");
+    assert!(!queue_calls(&api).is_empty(), "on the platform");
+}
+
+#[tokio::test]
+async fn a_shared_default_queue_is_on_the_platform_from_the_start() {
+    let api = FakeApi::start().await;
+    let backend = ApifyStorageBackend::new(configuration(&api, true))
+        .request_queue_access(apify::RequestQueueAccess::Shared)
+        .spill_default_request_queue_after(Some(std::time::Duration::from_secs(30)));
+    let queue = Services::new(Arc::new(backend)).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    queue.add_requests(vec!["https://a.test/1".into()], false).await.unwrap();
+    assert!(!queue_calls(&api).is_empty());
+}
+
+#[tokio::test]
+async fn requests_added_as_handled_are_not_fetched_and_count_as_handled() {
+    let api = FakeApi::start().await;
+    let queue = services(&api).open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let mut handled = crawlee::Request::new("https://a.test/done");
+    handled.handled_at = Some("2026-01-01T00:00:00.000Z".to_owned());
+    queue.backend().add_batch_of_requests(vec![handled, "https://a.test/todo".into()], false).await.unwrap();
+    assert!(!platform_request(&api, "https://a.test/done").unwrap()["handledAt"].is_null());
+    let fetched = queue.fetch_next_request().await.unwrap().unwrap();
+    assert_eq!(fetched.url, "https://a.test/todo");
+    assert!(queue.fetch_next_request().await.unwrap().is_none());
+    assert_eq!(queue.handled_count().await.unwrap(), 1);
+    let again = queue.backend().add_batch_of_requests(vec!["https://a.test/done".into()], false).await.unwrap();
+    assert!(again.processed_requests[0].was_already_handled);
+}

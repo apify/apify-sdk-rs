@@ -414,7 +414,11 @@ impl RequestQueueBackend for ApifySingleRequestQueue {
             let mut state = self.state.lock();
             for mut request in new_requests {
                 let Some(processed) = processed_by_key.get(request.unique_key.as_str()) else { continue };
-                if processed.was_already_handled {
+                // Added as handled (with `handledAt`): kept out of the head.
+                if processed.was_already_handled || request.handled_at.is_some() {
+                    if !processed.was_already_present {
+                        state.estimated_handled += 1;
+                    }
                     state.handled.insert(processed.request_id.clone());
                     continue;
                 }

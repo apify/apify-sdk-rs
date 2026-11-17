@@ -9,6 +9,7 @@ mod request_queue_shared;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use apify_client::models::Extra;
 use apify_client::{ApifyClient, ApifyClientError};
@@ -20,6 +21,7 @@ use crawlee::core::errors::StorageError;
 use crawlee::core::storage::backend::{
     DatasetBackend, KeyValueStoreBackend, RequestQueueBackend, StorageBackend, StorageKind,
 };
+use crawlee::core::{SpillingOptions, SpillingRequestQueueBackend};
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -33,6 +35,10 @@ pub use self::request_queue::RequestQueueAccess;
 pub const DEFAULT_STORAGE_ALIAS: &str = "__default__";
 /// The record of the default key-value store holding a run's alias → storage id mapping.
 const ALIAS_MAPPING_RECORD_KEY: &str = "__STORAGE_ALIASES_MAPPING";
+/// The record of the default key-value store that says the run's default request queue moved from
+/// memory to the platform: a run that resumes (after a migration or a resurrection) opens the
+/// platform queue directly.
+pub const REQUEST_QUEUE_SPILLED_KEY: &str = "CRAWLEE_REQUEST_QUEUE_SPILLED";
 /// The longest client key the request queue API accepts.
 const MAX_CLIENT_KEY_LENGTH: usize = 32;
 
@@ -91,6 +97,7 @@ struct OpenedStorages {
 
 /// Forgets a dropped storage, so that opening it again opens (or creates) it anew. Aliases keep
 /// their storage, as in JS.
+#[derive(Clone)]
 pub(crate) struct DropHook {
     opened: Weak<Mutex<OpenedStorages>>,
     kind: StorageKind,
@@ -122,6 +129,9 @@ impl DropHook {
 ///   an unnamed storage of its own. On the platform the aliases are remembered in the
 ///   `__STORAGE_ALIASES_MAPPING` record of the default key-value store, so a migrated run
 ///   reopens the same storages.
+///
+/// With [`spill_default_request_queue_after`](Self::spill_default_request_queue_after), the run's
+/// default request queue starts in memory and moves to the platform later (see there).
 pub struct ApifyStorageBackend {
     client: ApifyClient,
     configuration: Arc<Configuration>,
@@ -133,6 +143,9 @@ pub struct ApifyStorageBackend {
     opened: Arc<Mutex<OpenedStorages>>,
     prefetched_stores: Arc<key_value_store::PrefetchedStores>,
     prefetched_datasets: Arc<prefetch::Prefetched<String, crawlee::core::storage::backend::DatasetInfo>>,
+    spill_default_request_queue_after: Option<Duration>,
+    /// The default request queue, while it is (or was) in memory.
+    spilling_queue: Mutex<Option<Arc<SpillingRequestQueueBackend>>>,
 }
 
 #[derive(Default)]
@@ -178,6 +191,8 @@ impl ApifyStorageBackend {
             opened: Arc::default(),
             prefetched_stores: Arc::default(),
             prefetched_datasets: Arc::default(),
+            spill_default_request_queue_after: None,
+            spilling_queue: Mutex::new(None),
         }
     }
 
@@ -201,6 +216,110 @@ impl ApifyStorageBackend {
     pub fn request_queue_access(mut self, access: RequestQueueAccess) -> Self {
         self.request_queue_access = access;
         self
+    }
+
+    /// Keeps the run's default request queue in memory for `after`, and then moves it to the
+    /// platform (a crawlee-rs `SpillingRequestQueueBackend`), so that a short run makes no request
+    /// queue API calls. `None` (the default here; [`InitOptions`](crate::InitOptions) sets 30 s):
+    /// the platform queue from the start.
+    ///
+    /// Only on the platform, and only for the default queue consumed by one client
+    /// ([`RequestQueueAccess::Single`]): named and aliased queues, and shared ones, which other
+    /// clients read, are on the platform from the start. At the switch, the handled requests are
+    /// added to the platform queue as handled, so a resumed run still deduplicates them, the
+    /// pending ones in their order, and those in progress finish there. Then the
+    /// [`REQUEST_QUEUE_SPILLED_KEY`] record is written to the default key-value store; a run that
+    /// finds it (after a migration or a resurrection) opens the platform queue directly.
+    /// [`spill_request_queue`](Self::spill_request_queue) moves the queue at once.
+    pub fn spill_default_request_queue_after(mut self, after: Option<Duration>) -> Self {
+        self.spill_default_request_queue_after = after;
+        self
+    }
+
+    /// The key of the record that says the default queue moved to the platform, when the default
+    /// queue starts in memory: [`Actor::init`](crate::Actor::init) reads it ahead.
+    pub(crate) fn spill_marker_key(&self) -> Option<&'static str> {
+        (self.spill_default_request_queue_after.is_some()
+            && self.configuration.is_at_home
+            && self.request_queue_access == RequestQueueAccess::Single)
+            .then_some(REQUEST_QUEUE_SPILLED_KEY)
+    }
+
+    /// Moves the default request queue from memory to the platform now, if it is in memory: before
+    /// the run migrates or ends, so that no request is lost.
+    pub async fn spill_request_queue(&self) -> StorageResult<()> {
+        let queue = self.spilling_queue.lock().clone();
+        match queue {
+            Some(queue) => queue.spill().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Moves the default request queue to the platform if its time in memory is over. A queue
+    /// checks that on each call, this is for one that nobody calls.
+    pub async fn spill_request_queue_if_due(&self) -> StorageResult<()> {
+        let queue = self.spilling_queue.lock().clone();
+        if let Some(queue) = queue {
+            queue.spill_if_due().await?;
+        }
+        Ok(())
+    }
+
+    /// The requests of the default queue that are in memory and not handled: what would be lost
+    /// if the process ended now.
+    pub fn unhandled_requests_in_memory(&self) -> usize {
+        self.spilling_queue.lock().as_ref().map_or(0, |queue| queue.unhandled_in_memory())
+    }
+
+    /// The platform queue `id`, as this backend opens it.
+    fn platform_request_queue(&self, id: &str) -> Arc<dyn RequestQueueBackend> {
+        let drop_hook = self.drop_hook(StorageKind::RequestQueue, id);
+        let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
+        match self.request_queue_access {
+            RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client, drop_hook)),
+            RequestQueueAccess::Shared => {
+                Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client, drop_hook))
+            }
+        }
+    }
+
+    /// The default queue `id` in memory, moving to the platform after `after`, unless the run
+    /// moved it already (the marker record), or whether it did cannot be read.
+    async fn spilling_request_queue(&self, id: &str, after: Duration) -> Option<Arc<SpillingRequestQueueBackend>> {
+        let store_id = self.configuration.default_key_value_store_id.clone();
+        if store_id.is_empty() {
+            return None;
+        }
+        let store = self.client.key_value_store(store_id.clone());
+        let read = || key_value_store::get_record(&store, REQUEST_QUEUE_SPILLED_KEY);
+        let key = (store_id.clone(), REQUEST_QUEUE_SPILLED_KEY.to_owned());
+        match self.prefetched_stores.records.take_or(&key, read).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                tracing::debug!("The default request queue was moved to the platform before, opening it there");
+                return None;
+            }
+            Err(err) => {
+                // The platform queue then, which holds whatever was committed.
+                tracing::warn!("Failed to read whether the default request queue was moved to the platform: {err}");
+                return None;
+            }
+        }
+
+        let target = self.platform_request_queue(id);
+        let options = SpillingOptions { spill_after: Some(after), max_requests: None };
+        let (marker_store, prefetched, queue_id) = (store, self.prefetched_stores.clone(), id.to_owned());
+        let queue = SpillingRequestQueueBackend::new(move || std::future::ready(Ok(target.clone())), options)
+            .with_id(id)
+            .on_spilled(move || {
+                let (store, prefetched, key) = (marker_store.clone(), prefetched.clone(), key.clone());
+                let marker = serde_json::json!({ "requestQueueId": queue_id, "spilledAt": crawlee::core::now_iso() });
+                async move {
+                    prefetched.records.forget(&key);
+                    store.set_record_json(REQUEST_QUEUE_SPILLED_KEY, &marker).await.map_err(backend_error)
+                }
+            });
+        Some(Arc::new(queue))
     }
 
     pub fn client(&self) -> &ApifyClient {
@@ -395,16 +514,23 @@ impl StorageBackend for ApifyStorageBackend {
         id: &StorageIdentifier,
     ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
         let id = self.resolve_id(id, StorageKind::RequestQueue).await?;
-        let mut opened = self.opened.lock();
-        let backend = opened.request_queues.entry(id.clone()).or_insert_with(|| {
-            let drop_hook = self.drop_hook(StorageKind::RequestQueue, &id);
-            let client = self.client.request_queue(id).with_client_key(self.client_key.clone());
-            match self.request_queue_access {
-                RequestQueueAccess::Single => Arc::new(request_queue::ApifySingleRequestQueue::new(client, drop_hook)),
-                RequestQueueAccess::Shared => {
-                    Arc::new(request_queue_shared::ApifySharedRequestQueue::new(client, drop_hook))
-                }
+        if let Some(opened) = self.opened.lock().request_queues.get(&id) {
+            return Ok(opened.clone());
+        }
+        let spilling = match self.spill_default_request_queue_after {
+            Some(after) if self.spill_marker_key().is_some() && id == self.configuration.default_request_queue_id => {
+                self.spilling_request_queue(&id, after).await
             }
+            _ => None,
+        };
+        let mut opened = self.opened.lock();
+        // Another call may have opened it meanwhile.
+        let backend = opened.request_queues.entry(id.clone()).or_insert_with(|| match spilling {
+            Some(spilling) => {
+                *self.spilling_queue.lock() = Some(spilling.clone());
+                spilling
+            }
+            None => self.platform_request_queue(&id),
         });
         Ok(backend.clone())
     }

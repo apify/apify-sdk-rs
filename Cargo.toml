@@ -60,8 +60,5 @@ tower-http = { version = "0.6", features = ["decompression-br", "decompression-g
 # Decodes the request bodies the client compresses.
 zstd = "0.13"
 
-[lints.rust]
-unsafe_code = "forbid"
-
 [lints.clippy]
 all = { level = "warn", priority = -1 }

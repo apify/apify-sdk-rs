@@ -655,8 +655,12 @@ impl Actor {
             }
             // Items buffered by listeners.
             state().push_buffer.flush().await;
-            // Requests left in the default queue in memory, for a resurrected run.
-            if let Some(platform_storage) = &state().platform_storage
+            // Requests left in the default queue in memory by a failing run, for a resurrected run
+            // to carry on. A run that succeeds left them on purpose (it stopped or aborted its
+            // crawl), and a run that times out or migrates moved them on the `aborting` or
+            // `migrating` event.
+            if options.exit_code != 0
+                && let Some(platform_storage) = &state().platform_storage
                 && platform_storage.unhandled_requests_in_memory() > 0
                 && let Err(err) = platform_storage.spill_request_queue().await
             {

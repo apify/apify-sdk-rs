@@ -807,7 +807,8 @@ async fn init_makes_its_calls_at_once_and_reads_records_ahead() {
     api.put_record(DEFAULT_STORE, "INPUT", br#"{"greeting":"hi"}"#, "application/json; charset=utf-8");
     api.put_record(DEFAULT_STORE, "STATE", br#"{"count":1}"#, "application/json; charset=utf-8");
     let slow = Duration::from_millis(500);
-    // The run, for its pricing, the storages and the records: one after another, they would take 3 s.
+    // The run, for its pricing, the storages, the listing of the store's keys and the records: one
+    // after another, they would take 3.5 s. A record the store holds is read once it is listed.
     api.delay("GET /v2/actor-runs/run-1", slow);
     api.delay("GET /v2/key-value-stores", slow);
     api.delay("GET /v2/datasets", slow);
@@ -822,7 +823,9 @@ async fn init_makes_its_calls_at_once_and_reads_records_ahead() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let elapsed: u64 =
         stdout.split("ELAPSED ").nth(1).and_then(|rest| rest.split_whitespace().next()).unwrap().parse().unwrap();
-    assert!(elapsed < 1000, "init and the reads took {elapsed} ms:\n{stdout}");
+    // The listing, then the record: the two round trips the reads wait for, the rest made meanwhile.
+    assert!(elapsed < 1500, "init and the reads took {elapsed} ms:\n{stdout}");
+    assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/keys"), 1);
     assert_eq!(api.count_calls("GET /v2/key-value-stores/default-store/records/INPUT"), 1);
     assert_eq!(api.count_calls("GET /v2/datasets/default-dataset"), 1);
     assert_eq!(queue_calls(&api), [QUEUE_CHECK], "checked once, and the queue kept in memory:\n{stdout}");

@@ -66,9 +66,11 @@ These differences exist to make runs cheaper or faster.
   `init` starts reading the metadata of the default dataset and key-value store (which opening
   them reads), the input record, the tracked child runs and the records of
   `InitOptions::prefetch_records` in the background, and the first read of each takes what was
-  read. What is written through the SDK before it is read (a record, items of the dataset) is
-  read again; what another client changes in the meantime is not. The JS SDK reads each when
-  asked.
+  read. The records other than the input are read after one listing of the store's keys, and
+  only when listed: the first read of one that is not is `None` without an API call (each is
+  read when the store cannot be listed or holds over 1,000 keys, one page of the listing). What is written through the
+  SDK before it is read (a record, items of the dataset) is read again; what another client
+  changes in the meantime is not. The JS SDK reads each when asked.
 - **Status messages can be set in the background.** `Actor::set_status_message_in_background` is
   `Actor.setStatusMessage(...)` without `await`: the message is logged at once and the run updated
   later. Updates are sent one at a time in the order they were made, and an update is dropped when

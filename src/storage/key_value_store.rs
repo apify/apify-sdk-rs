@@ -11,6 +11,7 @@ use crawlee::core::storage::backend::{
     KeyValueStoreListKeysResult, KeyValueStoreRecord,
 };
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::prefetch::Prefetched;
@@ -34,21 +35,67 @@ pub(crate) struct PrefetchedStores {
     pub(crate) records: Prefetched<(String, String), Option<KeyValueStoreRecord>>,
 }
 
+/// The keys of a store, listed once for all the records read ahead of it; `None` when they could
+/// not be listed, or the store holds too many to list.
+type Listing = Arc<tokio::sync::OnceCell<Option<HashSet<String>>>>;
+
+/// The keys the listing reads, in one page: the most the API returns at once. A store holding more
+/// has its records read one by one (in parallel), rather than listed page after page.
+const LISTING_PAGE_SIZE: i64 = 1000;
+
 impl PrefetchedStores {
     /// Starts reading the metadata of the store of `client` (whose id is `store_id`) and its
-    /// records `keys`.
+    /// records `keys`: `read_at_once` (the input, which a run nearly always has) at once, the others
+    /// once a listing of the store's keys finds them there. Those it does not find are read as
+    /// missing without asking the API: in a fresh run, most records read ahead are (state an
+    /// earlier container of the run would have saved). When the store cannot be listed, or holds
+    /// more keys than one page of the listing ([`LISTING_PAGE_SIZE`]), each record is read.
     pub(crate) fn prefetch<'a>(
         &self,
         client: &KeyValueStoreClient,
         store_id: &str,
         keys: impl IntoIterator<Item = &'a str>,
+        read_at_once: Option<&str>,
     ) {
         let store = client.clone();
         self.metadata.start(store_id.to_owned(), async move { get_metadata(&store).await });
+        let listing = Listing::default();
         for key in keys {
-            let (store, owned_key) = (client.clone(), key.to_owned());
-            self.records
-                .start((store_id.to_owned(), key.to_owned()), async move { get_record(&store, &owned_key).await });
+            let (store, owned_key, listing) = (client.clone(), key.to_owned(), listing.clone());
+            let listed = read_at_once != Some(key);
+            self.records.start((store_id.to_owned(), key.to_owned()), async move {
+                // The first of these reads lists the keys, and the others wait for that listing.
+                if listed
+                    && let Some(keys) = listing.get_or_init(|| list_all_keys(&store)).await
+                    && !keys.contains(&owned_key)
+                {
+                    return Ok(None);
+                }
+                get_record(&store, &owned_key).await
+            });
+        }
+    }
+}
+
+/// All the keys of the store of `client`, or `None` when it holds more than one page of them
+/// ([`LISTING_PAGE_SIZE`]) or the listing fails.
+///
+/// The listing is complete: on the Apify platform, a record is stored before its write is
+/// answered, and listed from then on (unlike a request queue's head, which lags behind), so the
+/// records an earlier container of the run wrote are listed.
+async fn list_all_keys(client: &KeyValueStoreClient) -> Option<HashSet<String>> {
+    let options = ListKeysOptions { limit: Some(LISTING_PAGE_SIZE), ..ListKeysOptions::default() };
+    match client.list_keys(options).await {
+        Ok(page) if page.is_truncated => {
+            tracing::debug!(
+                "The key-value store holds more than {LISTING_PAGE_SIZE} keys, reading each record instead"
+            );
+            None
+        }
+        Ok(page) => Some(page.items.into_iter().map(|item| item.key).collect()),
+        Err(err) => {
+            tracing::debug!("Listing the keys of the key-value store failed, reading each record instead: {err}");
+            None
         }
     }
 }

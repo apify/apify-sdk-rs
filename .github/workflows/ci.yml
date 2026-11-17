@@ -19,6 +19,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Dependencies on master
+        run: ./scripts/check-git-deps.sh
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo clippy --all-targets --features cpu-profile

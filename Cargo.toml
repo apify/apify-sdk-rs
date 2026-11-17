@@ -10,8 +10,10 @@ authors = ["Apify Technologies s.r.o."]
 publish = false
 
 [dependencies]
-# Pinned revisions: neither crate is released in the versions this SDK needs.
-crawlee = { git = "https://github.com/apify-projects/crawlee-rs", rev = "6c92758" }
+# crawlee-rs's master: it is not released in the version this SDK needs. `Cargo.lock` holds the
+# commit (`cargo update -p crawlee` moves it). To try a crawlee-rs branch, point `branch` at it, and
+# back at `master` once that branch is merged, before merging (CI fails on any other branch).
+crawlee = { git = "https://github.com/apify-projects/crawlee-rs", branch = "master" }
 # The client's own transport (reqwest 0.12) is compiled without TLS and not used: requests go through
 # `client::ReqwestBackend` on the reqwest version crawlee-rs uses.
 apify-client = { version = "=0.17.0", default-features = false, features = ["zstd"] }

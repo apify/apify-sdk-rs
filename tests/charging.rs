@@ -104,6 +104,9 @@ async fn multi_tenant_manager(api: &FakeApi, pricing_infos: Value, charged_event
         actor_run_id: Some("run-1".to_owned()),
         actor_id: Some("actor-1".to_owned()),
         meta_origin: Some("STANDBY".to_owned()),
+        // What the platform sets in multi-tenant runs; detection must not stop at this empty snapshot.
+        actor_pricing_info: Some("{}".to_owned()),
+        charged_event_counts: Some("{}".to_owned()),
         ..Configuration::default()
     };
     let client = apify::new_client(&configuration, None, Default::default());

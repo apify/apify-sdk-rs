@@ -331,6 +331,24 @@ async fn a_migrating_run_saves_its_state_and_reboots() {
     assert!(saved < reboot, "the state is saved before the reboot: {calls:?}");
 }
 
+/// apify-sdk-js#827: a reboot waits for hanging listeners only up to its timeout, tells the
+/// `PersistState` listeners that the run migrates, and can be retried after a failure.
+#[tokio::test]
+async fn a_failed_reboot_can_be_retried_and_does_not_wait_for_hanging_listeners() {
+    use axum::http::StatusCode;
+    let api = FakeApi::start().await;
+    api.fail_next("POST /v2/actor-runs/run-1/reboot", 1, StatusCode::BAD_REQUEST);
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = run_child("reboot-retry", &platform_env(&api, None), dir.path()).await;
+    assert_exit(&output, 0);
+    assert_eq!(api.count_calls("POST /v2/actor-runs/run-1/reboot"), 2);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PERSIST_STATE is_migrating=true"), "{stdout}");
+    assert!(stdout.contains("FIRST_REBOOT_FAILED"), "{stdout}");
+    assert!(stdout.contains("LISTENERS_NOT_AWAITED"), "the hanging listener is not waited for: {stdout}");
+}
+
 fn queue_calls(api: &FakeApi) -> Vec<String> {
     api.calls().into_iter().filter(|call| call.contains("/v2/request-queues")).collect()
 }
@@ -1021,7 +1039,8 @@ fn child() {
     } else {
         tokio::runtime::Runtime::new().unwrap()
     };
-    runtime.block_on(async move {
+    // On the heap: the scenarios make one large future, too large for the test thread's stack.
+    runtime.block_on(Box::pin(async move {
         match scenario.as_str() {
             "log" => {
                 tracing::debug!(target: "apify::client", "made at the start");
@@ -1088,6 +1107,29 @@ fn child() {
                     let without_name = apify::CallOptions { abort_with_parent: true, ..apify::CallOptions::default() };
                     assert!(Actor::start("user/c", None::<&Value>, without_name).await.is_err());
                     tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(())
+                })
+                .await
+            }
+            "reboot-retry" => {
+                Actor::main(|| async move {
+                    use crawlee::core::{Event, EventKind};
+                    let events = Actor::events();
+                    events.on(EventKind::PersistState, |event| async move {
+                        if let Event::PersistState { is_migrating } = event {
+                            println!("PERSIST_STATE is_migrating={is_migrating}");
+                        }
+                    });
+                    events.on(EventKind::Migrating, |_| tokio::time::sleep(Duration::from_secs(3)));
+                    let options = apify::RebootOptions { timeout: Duration::from_millis(300), ..Default::default() };
+                    let started = std::time::Instant::now();
+                    if Actor::reboot_with(options.clone()).await.is_err() {
+                        println!("FIRST_REBOOT_FAILED");
+                    }
+                    if started.elapsed() < Duration::from_secs(2) {
+                        println!("LISTENERS_NOT_AWAITED");
+                    }
+                    Actor::reboot_with(options).await?;
                     Ok(())
                 })
                 .await
@@ -1622,6 +1664,6 @@ fn child() {
             }
             other => panic!("unknown scenario {other}"),
         }
-    });
+    }));
     unreachable!("the Actor exits the process");
 }

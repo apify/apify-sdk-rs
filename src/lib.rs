@@ -29,7 +29,8 @@ pub mod storage;
 pub mod url_filters;
 
 pub use crate::actor::{
-    Actor, ActorListenerId, ExitOptions, InitError, InitOptions, OpenOptions, StatusMessageOptions, exit_codes,
+    Actor, ActorListenerId, ExitOptions, InitError, InitOptions, OpenOptions, RebootOptions, StatusMessageOptions,
+    exit_codes,
 };
 pub use crate::child_runs::{ChildRunInfo, TrackedChildRun};
 pub use crate::client::{RateLimitCounter, new_client};

@@ -340,11 +340,18 @@ impl ChargingManager {
                 .map(|counts| counts.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect())
                 .unwrap_or_default()
         };
+        let is_standby = configuration.meta_origin.as_deref() == Some("STANDBY");
         if let (Some(pricing), Some(charged)) = (&configuration.actor_pricing_info, &configuration.charged_event_counts)
         {
             let pricing: Value = serde_json::from_str(pricing)?;
-            let charged: Value = serde_json::from_str(charged)?;
-            return Ok((pricing, counts(Some(&charged)), configuration.max_total_charge_usd, false));
+            // Multi-tenant runs get an empty snapshot (`{}`). Only the run tells them apart from
+            // free Server Actor runs.
+            let is_multi_tenant_candidate =
+                pricing.get("pricingModel").is_none() && configuration.is_at_home && is_standby;
+            if !is_multi_tenant_candidate {
+                let charged: Value = serde_json::from_str(charged)?;
+                return Ok((pricing, counts(Some(&charged)), configuration.max_total_charge_usd, false));
+            }
         }
         if configuration.is_at_home {
             if configuration.actor_run_id.is_none() {
@@ -354,7 +361,6 @@ impl ChargingManager {
             }
             // A Server Actor run lives long enough to make fetching the Actor worth it up front:
             // a multi-tenant one needs it, and it is fetched at the same time as the run.
-            let is_standby = configuration.meta_origin.as_deref() == Some("STANDBY");
             let (run, actor) = tokio::join!(self.current_run(), async {
                 if is_standby { Some(self.current_actor().await) } else { None }
             });

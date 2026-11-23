@@ -108,6 +108,22 @@ pub struct ExitOptions {
     pub timeout: Duration,
 }
 
+/// Options of [`Actor::reboot_with`].
+#[derive(Clone, Debug)]
+pub struct RebootOptions {
+    /// How long to wait for the `PersistState` and `Migrating` listeners before rebooting. Default 30 s.
+    pub timeout: Duration,
+    /// How long to wait for the container to stop after the reboot call. Default
+    /// [`Configuration::metamorph_after_sleep`](crate::Configuration::metamorph_after_sleep).
+    pub after_sleep: Option<Duration>,
+}
+
+impl Default for RebootOptions {
+    fn default() -> Self {
+        RebootOptions { timeout: Duration::from_secs(30), after_sleep: None }
+    }
+}
+
 impl ExitOptions {
     /// The options as the payload of [`Event::Exit`], which crawlee-rs defines.
     fn to_event_options(&self) -> crawlee::core::ExitOptions {
@@ -769,8 +785,17 @@ impl Actor {
     }
 
     /// Reboots the run on the platform (a new container, same run), after its state was saved.
-    /// Does nothing off the platform.
+    /// Does nothing off the platform. See [`Actor::reboot_with`].
     pub async fn reboot() -> Result<(), apify_client::ApifyClientError> {
+        Self::reboot_with(RebootOptions::default()).await
+    }
+
+    /// Reboots the run on the platform (a new container, same run). Does nothing off the platform.
+    ///
+    /// First, it emits `PersistState` (with `is_migrating: true`) and `Migrating`, and waits for
+    /// the listeners for at most [`RebootOptions::timeout`]. When the reboot call fails, a later
+    /// call can try again.
+    pub async fn reboot_with(options: RebootOptions) -> Result<(), apify_client::ApifyClientError> {
         let configuration = &state().configuration;
         if !configuration.is_at_home {
             tracing::warn!("Actor::reboot() is only supported when running on the Apify platform.");
@@ -780,18 +805,32 @@ impl Actor {
             tracing::debug!("Actor is already rebooting, skipping the additional reboot call.");
             return Ok(());
         }
-        // The container is killed: save the state and pause the crawlers first.
+        // The container is killed: save the state and pause the crawlers first. A listener that
+        // panics only ends its own task.
         let events = Self::events();
-        events.emit(Event::PersistState { is_migrating: false });
+        events.emit(Event::PersistState { is_migrating: true });
         events.emit(Event::Migrating);
-        events.wait_for_all_listeners_to_complete().await;
+        if tokio::time::timeout(options.timeout, events.wait_for_all_listeners_to_complete()).await.is_err() {
+            tracing::warn!(
+                timeout_secs = options.timeout.as_secs_f64(),
+                "Pre-reboot event listeners did not finish in time, proceeding with the reboot"
+            );
+        }
 
-        let run_id = configuration
-            .actor_run_id
-            .clone()
-            .ok_or_else(|| apify_client::ApifyClientError::InvalidArgument("ACTOR_RUN_ID is not set".to_owned()))?;
-        state().client.run(run_id).reboot().await?;
-        tokio::time::sleep(configuration.metamorph_after_sleep).await;
+        let result = async {
+            let run_id = configuration
+                .actor_run_id
+                .clone()
+                .ok_or_else(|| apify_client::ApifyClientError::InvalidArgument("ACTOR_RUN_ID is not set".to_owned()))?;
+            state().client.run(run_id).reboot().await
+        }
+        .await;
+        if let Err(err) = result {
+            // A failed reboot can be retried.
+            state().rebooting.store(false, Ordering::Release);
+            return Err(err);
+        }
+        tokio::time::sleep(options.after_sleep.unwrap_or(configuration.metamorph_after_sleep)).await;
         Ok(())
     }
 
